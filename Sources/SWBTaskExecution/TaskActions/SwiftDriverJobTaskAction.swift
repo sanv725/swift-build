@@ -87,13 +87,19 @@ package enum SwiftCacheProbeResult<Compilation> {
 }
 
 package struct SwiftCacheOutputManifest: Sendable, Equatable {
+    package enum FileKind: String, Sendable, Equatable {
+        case regularFile
+    }
+
     package struct Entry: Sendable, Equatable {
         package let ordinal: Int
+        package let fileKind: FileKind
         package let byteCount: Int64
         package let digest: ByteString
 
-        package init(ordinal: Int, byteCount: Int64, digest: ByteString) {
+        package init(ordinal: Int, fileKind: FileKind, byteCount: Int64, digest: ByteString) {
             self.ordinal = ordinal
+            self.fileKind = fileKind
             self.byteCount = byteCount
             self.digest = digest
         }
@@ -915,8 +921,10 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             // Accelerator modes promise that the fresh frontend is authoritative.
             // Honor cancellation at the final boundary after any shadow outputs
             // have been scrubbed, without changing the upstream stock path.
-            if acceleratorPolicy.mode.isAcceleratorEnabled,
-               _Concurrency.Task<Never, Never>.isCancelled {
+            if Self.shouldCancelBeforeFrontend(
+                mode: acceleratorPolicy.mode,
+                isCancelled: _Concurrency.Task<Never, Never>.isCancelled
+            ) {
                 observationOutcome = .cancelled
                 return .cancelled
             }
@@ -1035,10 +1043,13 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         compilations.reserveCapacity(cacheKeys.count)
         for cacheKey in cacheKeys {
             if isCancelled() { throw CancellationError() }
-            guard let compilation = try operations.queryLocalCacheKey(cacheKey) else {
+            let queriedCompilation = try operations.queryLocalCacheKey(cacheKey)
+            if isCancelled() { throw CancellationError() }
+            guard let compilation = queriedCompilation else {
                 return .miss(.missingKey)
             }
             let outputs = try operations.cachedOutputs(for: compilation)
+            if isCancelled() { throw CancellationError() }
             guard !outputs.isEmpty, outputs.allSatisfy(\.isMaterialized) else {
                 return .miss(.nonMaterializedOutput)
             }
@@ -1056,10 +1067,13 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         commandLine: [String],
         isCancelled: () -> Bool = { false }
     ) throws {
+        if isCancelled() { throw CancellationError() }
         let instance = try operations.createReplayInstance(commandLine: Array(commandLine.dropFirst()))
+        if isCancelled() { throw CancellationError() }
         for compilation in compilations {
             if isCancelled() { throw CancellationError() }
             _ = try operations.replayCompilation(compilation, using: instance)
+            if isCancelled() { throw CancellationError() }
         }
     }
 
@@ -1091,10 +1105,15 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         return false
     }
 
-    package static func makeOutputManifest(_ paths: [Path], fs: any FSProxy) throws -> SwiftCacheOutputManifest {
+    package static func makeOutputManifest(
+        _ paths: [Path],
+        fs: any FSProxy,
+        isCancelled: () -> Bool = { false }
+    ) throws -> SwiftCacheOutputManifest {
         var entries: [SwiftCacheOutputManifest.Entry] = []
         entries.reserveCapacity(paths.count)
         for (ordinal, path) in paths.enumerated() {
+            if isCancelled() { throw CancellationError() }
             guard fs.exists(path) else {
                 throw SwiftCacheOutputError.missingOutput
             }
@@ -1102,18 +1121,26 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 throw SwiftCacheOutputError.unsupportedOutput
             }
             let bytes = try fs.read(path)
+            if isCancelled() { throw CancellationError() }
             let hash = SHA256Context()
             hash.add(bytes: bytes)
-            entries.append(.init(ordinal: ordinal, byteCount: Int64(bytes.count), digest: hash.signature))
+            entries.append(.init(ordinal: ordinal, fileKind: .regularFile, byteCount: Int64(bytes.count), digest: hash.signature))
         }
+        if isCancelled() { throw CancellationError() }
         return SwiftCacheOutputManifest(entries: entries)
     }
 
     /// Scrubs the complete planned output list, including outputs that replay did
     /// not report writing. A failed removal is a correctness failure, not fallback.
-    package static func scrubOutputs(_ paths: [Path], fs: any FSProxy) throws {
+    package static func scrubOutputs(
+        _ paths: [Path],
+        fs: any FSProxy,
+        isCancelled: () -> Bool = { false }
+    ) throws {
         var failed = false
+        var cancelled = isCancelled()
         for path in paths where fs.exists(path) || isSymlink(path, fs: fs) {
+            cancelled = cancelled || isCancelled()
             do {
                 try fs.remove(path)
             } catch {
@@ -1123,9 +1150,13 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             if fs.exists(path) || isSymlink(path, fs: fs) {
                 failed = true
             }
+            cancelled = cancelled || isCancelled()
         }
         if failed {
             throw SwiftCacheOutputError.scrubFailed
+        }
+        if cancelled || isCancelled() {
+            throw CancellationError()
         }
     }
 
@@ -1165,7 +1196,15 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             // incomplete replay could make a stale file look like a cache hit.
             let preScrubTimer = ElapsedTimer()
             do {
-                try scrubOutputs(plannedOutputs, fs: fs)
+                try scrubOutputs(plannedOutputs, fs: fs, isCancelled: isCancelled)
+            } catch is CancellationError {
+                return .init(
+                    outcome: .cancelled,
+                    lookupDurationNS: lookupDurationNS,
+                    scrubDurationNS: preScrubTimer.elapsedTime().nanoseconds,
+                    scrubSucceeded: true,
+                    cachedOutputCount: outputCount
+                )
             } catch {
                 return .init(
                     outcome: .scrubFailure,
@@ -1202,7 +1241,9 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             if outcome == .verificationReady && !isCancelled() {
                 let manifestTimer = ElapsedTimer()
                 do {
-                    shadowManifest = try makeOutputManifest(plannedOutputs, fs: fs)
+                    shadowManifest = try makeOutputManifest(plannedOutputs, fs: fs, isCancelled: isCancelled)
+                } catch is CancellationError {
+                    outcome = .cancelled
                 } catch {
                     outcome = .manifestError
                 }
@@ -1217,7 +1258,19 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
 
             let scrubTimer = ElapsedTimer()
             do {
-                try scrubOutputs(plannedOutputs, fs: fs)
+                try scrubOutputs(plannedOutputs, fs: fs, isCancelled: isCancelled)
+            } catch is CancellationError {
+                totalScrubDurationNS += scrubTimer.elapsedTime().nanoseconds
+                return .init(
+                    outcome: .cancelled,
+                    lookupDurationNS: lookupDurationNS,
+                    replayDurationNS: replayDurationNS,
+                    manifestDurationNS: manifestDurationNS,
+                    scrubDurationNS: totalScrubDurationNS,
+                    scrubSucceeded: true,
+                    cachedOutputCount: outputCount,
+                    shadowManifest: nil
+                )
             } catch {
                 totalScrubDurationNS += scrubTimer.elapsedTime().nanoseconds
                 return .init(
@@ -1291,6 +1344,13 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
     /// reach the authoritative frontend, including when policy-excluded.
     package static func usesStockCacheReplayPath(mode: SwiftBuildAcceleratorCacheMode) -> Bool {
         mode == .stock
+    }
+
+    package static func shouldCancelBeforeFrontend(
+        mode: SwiftBuildAcceleratorCacheMode,
+        isCancelled: Bool
+    ) -> Bool {
+        mode.isAcceleratorEnabled && isCancelled
     }
 
     private static func isSymlink(_ path: Path, fs: any FSProxy) -> Bool {

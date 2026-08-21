@@ -10,22 +10,22 @@
 //
 //===----------------------------------------------------------------------===//
 
-import SWBCore
+package import SWBCore
 import SWBProtocol
 public import SWBUtil
 
 public struct SwiftDriverJobTaskKey: Serializable, CustomDebugStringConvertible {
-    let identifier: String
-    let variant: String
-    let arch: String
-    let driverJobKey: LibSwiftDriver.JobKey
-    let driverJobSignature: ByteString
-    let isUsingWholeModuleOptimization: Bool
-    let compilerLocation: LibSwiftDriver.CompilerLocation
-    let casOptions: CASOptions?
-    let acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy
+    package let identifier: String
+    package let variant: String
+    package let arch: String
+    package let driverJobKey: LibSwiftDriver.JobKey
+    package let driverJobSignature: ByteString
+    package let isUsingWholeModuleOptimization: Bool
+    package let compilerLocation: LibSwiftDriver.CompilerLocation
+    package let casOptions: CASOptions?
+    package let acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy
 
-    init(identifier: String, variant: String, arch: String, driverJobKey: LibSwiftDriver.JobKey, driverJobSignature: ByteString, isUsingWholeModuleOptimization: Bool, compilerLocation: LibSwiftDriver.CompilerLocation, casOptions: CASOptions?, acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy) {
+    package init(identifier: String, variant: String, arch: String, driverJobKey: LibSwiftDriver.JobKey, driverJobSignature: ByteString, isUsingWholeModuleOptimization: Bool, compilerLocation: LibSwiftDriver.CompilerLocation, casOptions: CASOptions?, acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy) {
         self.identifier = identifier
         self.variant = variant
         self.arch = arch
@@ -70,14 +70,14 @@ public struct SwiftDriverJobTaskKey: Serializable, CustomDebugStringConvertible 
 }
 
 public struct SwiftDriverExplicitDependencyJobTaskKey: Serializable, CustomDebugStringConvertible {
-    let arch: String
-    let driverJobKey: LibSwiftDriver.JobKey
-    let driverJobSignature: ByteString
-    let compilerLocation: LibSwiftDriver.CompilerLocation
-    let casOptions: CASOptions?
-    let acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy
+    package let arch: String
+    package let driverJobKey: LibSwiftDriver.JobKey
+    package let driverJobSignature: ByteString
+    package let compilerLocation: LibSwiftDriver.CompilerLocation
+    package let casOptions: CASOptions?
+    package let acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy
 
-    init(arch: String, driverJobKey: LibSwiftDriver.JobKey, driverJobSignature: ByteString, compilerLocation: LibSwiftDriver.CompilerLocation, casOptions: CASOptions?, acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy) {
+    package init(arch: String, driverJobKey: LibSwiftDriver.JobKey, driverJobSignature: ByteString, compilerLocation: LibSwiftDriver.CompilerLocation, casOptions: CASOptions?, acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy) {
         self.arch = arch
         self.driverJobKey = driverJobKey
         self.driverJobSignature = driverJobSignature
@@ -112,14 +112,14 @@ public struct SwiftDriverExplicitDependencyJobTaskKey: Serializable, CustomDebug
     }
 }
 
-struct SwiftDriverJobDynamicTaskPayload: TaskPayload {
-    let serializedDiagnosticInfo: [SerializedDiagnosticInfo]
-    let isUsingWholeModuleOptimization: Bool
-    let compilerLocation: LibSwiftDriver.CompilerLocation
-    let casOptions: CASOptions?
-    let acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy
+package struct SwiftDriverJobDynamicTaskPayload: TaskPayload {
+    package let serializedDiagnosticInfo: [SerializedDiagnosticInfo]
+    package let isUsingWholeModuleOptimization: Bool
+    package let compilerLocation: LibSwiftDriver.CompilerLocation
+    package let casOptions: CASOptions?
+    package let acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy
 
-    init(serializedDiagnosticInfo: [SerializedDiagnosticInfo], isUsingWholeModuleOptimization: Bool, compilerLocation: LibSwiftDriver.CompilerLocation, casOptions: CASOptions?, acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy) {
+    package init(serializedDiagnosticInfo: [SerializedDiagnosticInfo], isUsingWholeModuleOptimization: Bool, compilerLocation: LibSwiftDriver.CompilerLocation, casOptions: CASOptions?, acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy) {
         self.serializedDiagnosticInfo = serializedDiagnosticInfo
         self.isUsingWholeModuleOptimization = isUsingWholeModuleOptimization
         self.compilerLocation = compilerLocation
@@ -127,7 +127,7 @@ struct SwiftDriverJobDynamicTaskPayload: TaskPayload {
         self.acceleratorCachePolicy = acceleratorCachePolicy
     }
 
-    init(from deserializer: any Deserializer) throws {
+    package init(from deserializer: any Deserializer) throws {
         try deserializer.beginAggregate(5)
         self.serializedDiagnosticInfo = try deserializer.deserialize()
         self.isUsingWholeModuleOptimization = try deserializer.deserialize()
@@ -136,7 +136,7 @@ struct SwiftDriverJobDynamicTaskPayload: TaskPayload {
         self.acceleratorCachePolicy = try deserializer.deserialize()
     }
 
-    func serialize<T>(to serializer: T) where T : Serializer {
+    package func serialize<T>(to serializer: T) where T : Serializer {
         serializer.serializeAggregate(5) {
             serializer.serialize(serializedDiagnosticInfo)
             serializer.serialize(isUsingWholeModuleOptimization)

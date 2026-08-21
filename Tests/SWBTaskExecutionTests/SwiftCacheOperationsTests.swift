@@ -127,6 +127,7 @@ fileprivate struct SwiftCacheOperationsTests {
 
         let baseline = try SwiftDriverJobTaskAction.makeOutputManifest([first, second], fs: fs)
         #expect(baseline.entries.map(\.ordinal) == [0, 1])
+        #expect(baseline.entries.map(\.fileKind) == [.regularFile, .regularFile])
         #expect(baseline.entries.map(\.byteCount) == [5, 6])
         #expect(baseline.totalBytes == 11)
         #expect(baseline.mismatchCount(comparedTo: baseline) == 0)
@@ -468,6 +469,79 @@ fileprivate struct SwiftCacheOperationsTests {
         #expect(!SwiftDriverJobTaskAction.usesStockCacheReplayPath(mode: .observe))
         #expect(!SwiftDriverJobTaskAction.usesStockCacheReplayPath(mode: .verify))
         #expect(!SwiftDriverJobTaskAction.usesStockCacheReplayPath(mode: .trust))
+    }
+
+    @Test
+    func cancellationIsObservedAtEveryInjectableCacheBoundary() throws {
+        let operations = TestSwiftCacheOperations(
+            queries: ["one": .hit(1), "two": .hit(2)],
+            outputs: [
+                1: [.init(kindName: "object", isMaterialized: true)],
+                2: [.init(kindName: "module", isMaterialized: true)],
+            ]
+        )
+
+        #expect(throws: CancellationError.self) {
+            try SwiftDriverJobTaskAction.probeCache(
+                operations: operations,
+                cacheKeys: ["one", "two"],
+                isCancelled: { operations.queriedKeys.count == 1 }
+            )
+        }
+        #expect(operations.queriedKeys == ["one"])
+
+        operations.resetCalls()
+        #expect(throws: CancellationError.self) {
+            try SwiftDriverJobTaskAction.replayCache(
+                operations: operations,
+                compilations: [1],
+                commandLine: ["swift-frontend", "-c"],
+                isCancelled: { true }
+            )
+        }
+        #expect(operations.replayCommandLine == nil, "cancellation must be checked before replay-instance creation")
+
+        operations.resetCalls()
+        #expect(throws: CancellationError.self) {
+            try SwiftDriverJobTaskAction.replayCache(
+                operations: operations,
+                compilations: [1, 2],
+                commandLine: ["swift-frontend", "-c"],
+                isCancelled: { operations.replayedCompilations.count == 1 }
+            )
+        }
+        #expect(operations.replayedCompilations == [1])
+
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let fs = localFS
+        let first = temporaryDirectory.path.join("first.o")
+        let second = temporaryDirectory.path.join("second.swiftmodule")
+        try fs.write(first, contents: ByteString(encodingAsUTF8: "first"))
+        try fs.write(second, contents: ByteString(encodingAsUTF8: "second"))
+
+        var manifestChecks = 0
+        #expect(throws: CancellationError.self) {
+            try SwiftDriverJobTaskAction.makeOutputManifest([first, second], fs: fs) {
+                manifestChecks += 1
+                return manifestChecks == 2
+            }
+        }
+
+        var scrubChecks = 0
+        #expect(throws: CancellationError.self) {
+            try SwiftDriverJobTaskAction.scrubOutputs([first, second], fs: fs) {
+                scrubChecks += 1
+                return scrubChecks == 2
+            }
+        }
+        #expect(!fs.exists(first))
+        #expect(!fs.exists(second), "cancellation must not leave later shadow outputs behind")
+
+        #expect(!SwiftDriverJobTaskAction.shouldCancelBeforeFrontend(mode: .stock, isCancelled: true))
+        #expect(!SwiftDriverJobTaskAction.shouldCancelBeforeFrontend(mode: .observe, isCancelled: false))
+        #expect(SwiftDriverJobTaskAction.shouldCancelBeforeFrontend(mode: .observe, isCancelled: true))
+        #expect(SwiftDriverJobTaskAction.shouldCancelBeforeFrontend(mode: .verify, isCancelled: true))
+        #expect(!SwiftDriverJobTaskAction.shouldCancelBeforeFrontend(mode: .trust, isCancelled: true))
     }
 
     @Test
