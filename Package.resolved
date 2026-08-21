@@ -1,0 +1,69 @@
+{
+  "originHash" : "d6c150afd2ae95384fceeaf112f6b443d71884cf41eb319f0c7d51299e19ac23",
+  "pins" : [
+    {
+      "identity" : "swift-argument-parser",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-argument-parser.git",
+      "state" : {
+        "revision" : "6a52f3251125d74daf04fcbd5e6f08a75d074382",
+        "version" : "1.8.2"
+      }
+    },
+    {
+      "identity" : "swift-driver",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/swiftlang/swift-driver.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "9c56fe27a7a8af40c4e8967caae1fb4cd932502c"
+      }
+    },
+    {
+      "identity" : "swift-llbuild",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/swiftlang/swift-llbuild.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "3e472c2b8feb5bf3fdfd206a195b5712654a5371"
+      }
+    },
+    {
+      "identity" : "swift-system",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-system.git",
+      "state" : {
+        "revision" : "869129b7bf4ecc57b97d0193ad29690ca2134750",
+        "version" : "1.8.1"
+      }
+    },
+    {
+      "identity" : "swift-toolchain-sqlite",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/swiftlang/swift-toolchain-sqlite",
+      "state" : {
+        "revision" : "cc7ea00f730c2234a332cd264c6e5cdbb6c4f971",
+        "version" : "1.0.12"
+      }
+    },
+    {
+      "identity" : "swift-tools-protocols",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/swiftlang/swift-tools-protocols.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "83613c7dcacb5fa560669f0730fc7b07b637a263"
+      }
+    },
+    {
+      "identity" : "swift-tools-support-core",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/swiftlang/swift-tools-support-core.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "c574915fe88e942e4c4c93376f022daa2ecf05f9"
+      }
+    }
+  ],
+  "version" : 3
+}

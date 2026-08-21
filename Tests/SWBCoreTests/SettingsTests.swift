@@ -1903,17 +1903,22 @@ import SWBTestSupport
             }
 
             let scope = settings.globalScope
+            let expectedTargetTriples = try tripleStrings(for: expectedArchs)
+            let expectedModuleOnlyTargetTriples = try tripleStrings(for: expectedModuleOnlyArchs)
+            let originalTargetTriples = try tripleStrings(for: archs)
+            let originalModuleOnlyTargetTriples = try tripleStrings(for: moduleOnlyArchs)
+
             #expect(scope.evaluate(BuiltinMacros.ARCHS) == expectedArchs)
-            try #expect(scope.evaluate(BuiltinMacros.TARGET_TRIPLES) == tripleStrings(for: expectedArchs))
+            #expect(scope.evaluate(BuiltinMacros.TARGET_TRIPLES) == expectedTargetTriples)
             #expect(scope.evaluate(BuiltinMacros.SWIFT_MODULE_ONLY_ARCHS) == expectedModuleOnlyArchs)
-            try #expect(scope.evaluate(BuiltinMacros.SWIFT_MODULE_ONLY_TARGET_TRIPLES) == tripleStrings(for: expectedModuleOnlyArchs))
+            #expect(scope.evaluate(BuiltinMacros.SWIFT_MODULE_ONLY_TARGET_TRIPLES) == expectedModuleOnlyTargetTriples)
 
             #expect(scope.evaluate(BuiltinMacros.ARCHS_ORIGINAL) == archs)
             #expect(scope.evaluate(BuiltinMacros.__ARCHS__) == archs)
-            try #expect(scope.evaluate(BuiltinMacros.TARGET_TRIPLES_ORIGINAL) == tripleStrings(for: archs))
+            #expect(scope.evaluate(BuiltinMacros.TARGET_TRIPLES_ORIGINAL) == originalTargetTriples)
             #expect(scope.evaluate(BuiltinMacros.SWIFT_MODULE_ONLY_ARCHS_ORIGINAL) == moduleOnlyArchs)
             #expect(scope.evaluate(BuiltinMacros.__SWIFT_MODULE_ONLY_ARCHS__) == moduleOnlyArchs)
-            try #expect(scope.evaluate(BuiltinMacros.SWIFT_MODULE_ONLY_TARGET_TRIPLES_ORIGINAL) == tripleStrings(for: moduleOnlyArchs))
+            #expect(scope.evaluate(BuiltinMacros.SWIFT_MODULE_ONLY_TARGET_TRIPLES_ORIGINAL) == originalModuleOnlyTargetTriples)
         }
 
         // Test empty SWIFT_MODULE_ONLY_ARCHS archs is a no-op.
