@@ -22,7 +22,7 @@ import SystemPackage
 package import SWBBuildSystem
 package import SWBCore
 package import SWBProtocol
-import SWBTaskExecution
+package import SWBTaskExecution
 package import SWBUtil
 import Synchronization
 
@@ -143,7 +143,7 @@ package final class AcceleratorTraceWriter: @unchecked Sendable {
 
     private struct Event: Encodable, Sendable {
         let schemaMajor = 1
-        let schemaMinor = 0
+        let schemaMinor = 1
         let event: String
         let buildID: String
         let sequence: UInt64
@@ -176,6 +176,7 @@ package final class AcceleratorTraceWriter: @unchecked Sendable {
         var nextTaskID = 1
         var nextTargetID = 1
         var nextNodeID = 1
+        var nextLookupID = 1
         var taskIDs: [String: String] = [:]
         var targetIDs: [String: String] = [:]
         var nodeIDs: [String: String] = [:]
@@ -196,6 +197,10 @@ package final class AcceleratorTraceWriter: @unchecked Sendable {
     private let sink: any AcceleratorTraceSink
     private let clock: @Sendable () -> UInt64
     private let originNS: UInt64
+    /// Per-trace key: raw compiler cache keys never enter the trace queue, and
+    /// identities cannot be correlated across traces until an installation-key
+    /// facility is deliberately introduced.
+    private let cacheIdentityHMACKey: [UInt8]
     private let state = SWBMutex(State())
     private let queue = SWBQueue(label: "SWBBuildService.AcceleratorTraceWriter", qos: .utility, autoreleaseFrequency: .workItem)
     private let encoder = JSONEncoder(outputFormatting: [.withoutEscapingSlashes])
@@ -251,6 +256,7 @@ package final class AcceleratorTraceWriter: @unchecked Sendable {
         self.sink = sink
         self.clock = clock
         self.originNS = clock()
+        self.cacheIdentityHMACKey = Self.makeCacheIdentityHMACKey()
     }
 
     deinit {
@@ -333,6 +339,57 @@ package final class AcceleratorTraceWriter: @unchecked Sendable {
                 "termination_kind": .string(Self.terminationKind(result)),
             ]),
         ])
+    }
+
+    package func cacheObservations(
+        taskIdentifier: TaskIdentifier,
+        task: any ExecutableTask,
+        observations: [TaskCacheObservation]
+    ) {
+        guard !observations.isEmpty else { return }
+        ensureTaskDeclared(taskIdentifier: taskIdentifier, task: task, isDynamic: task.isDynamic)
+        let traceTaskID = taskID(for: taskIdentifier)
+
+        for observation in observations {
+            // Collection-time privacy boundary: only the keyed identity is
+            // captured by the asynchronous Event value.
+            let keyIdentity = cacheKeyIdentity(for: observation.cacheKeys)
+            if !observation.cacheKeys.isEmpty && keyIdentity == nil {
+                state.withLock { $0.droppedEventCount &+= 1 }
+                continue
+            }
+            let lookupID = nextLookupID()
+            emit(event: "cache_observation", payload: [
+                "task_id": .string(traceTaskID),
+                "cache_kind": .string("compiler"),
+                "tier": .string("local_disk"),
+                "source": .string("swift"),
+                "lookup_id": .string(lookupID),
+                "mode": .string(observation.mode.rawValue),
+                "eligibility": .string(observation.eligibility.rawValue),
+                "exclusion_reason": observation.exclusionReason.map { .string($0.rawValue) } ?? .null,
+                "outcome": .string(observation.outcome.rawValue),
+                "key_identity": keyIdentity.map(AcceleratorTraceValue.string) ?? .null,
+                "key_identity_scope": .string("trace"),
+                "key_count": .integer(observation.keyCount),
+                "timings": .object([
+                    "lookup_duration_ns": observation.lookupDurationNS.map(AcceleratorTraceValue.unsigned) ?? .null,
+                    "materialization_duration_ns": observation.materializationDurationNS.map(AcceleratorTraceValue.unsigned) ?? .null,
+                    "verification_duration_ns": observation.verificationDurationNS.map(AcceleratorTraceValue.unsigned) ?? .null,
+                    "scrub_duration_ns": observation.scrubDurationNS.map(AcceleratorTraceValue.unsigned) ?? .null,
+                    "compiler_duration_ns": observation.compilerDurationNS.map(AcceleratorTraceValue.unsigned) ?? .null,
+                ]),
+                "outputs": .object([
+                    "count": observation.outputCount.map(AcceleratorTraceValue.integer) ?? .null,
+                    "bytes": observation.outputBytes.map(AcceleratorTraceValue.unsigned) ?? .null,
+                    "compared_bytes": observation.comparedBytes.map(AcceleratorTraceValue.unsigned) ?? .null,
+                    "mismatch_count": observation.mismatchCount.map(AcceleratorTraceValue.integer) ?? .null,
+                ]),
+                "scrub_outcome": .string(observation.scrubOutcome.rawValue),
+                "fallback_reason": observation.fallbackReason.map { .string($0.rawValue) } ?? .null,
+                "final_disposition": .string(observation.finalDisposition.rawValue),
+            ])
+        }
     }
 
     package func taskUpToDate(taskIdentifier: TaskIdentifier, task: any ExecutableTask, reason: UpToDateReason) {
@@ -707,8 +764,93 @@ package final class AcceleratorTraceWriter: @unchecked Sendable {
         }
     }
 
+    private static func makeCacheIdentityHMACKey() -> [UInt8] {
+        var generator = SystemRandomNumberGenerator()
+        return (0..<32).map { _ in UInt8.random(in: UInt8.min...UInt8.max, using: &generator) }
+    }
+
+    private func cacheKeyIdentity(for cacheKeys: [String]) -> String? {
+        guard !cacheKeys.isEmpty else { return nil }
+        var material: [UInt8] = []
+        for cacheKey in cacheKeys.sorted() {
+            let bytes = Array(cacheKey.utf8)
+            var count = UInt64(bytes.count).bigEndian
+            Swift.withUnsafeBytes(of: &count) { material.append(contentsOf: $0) }
+            material.append(contentsOf: bytes)
+        }
+        guard let digest = Self.hmacSHA256(key: cacheIdentityHMACKey, message: material) else { return nil }
+        return "hmac-sha256:\(Self.hexString(digest))"
+    }
+
+    private static func hmacSHA256(key: [UInt8], message: [UInt8]) -> [UInt8]? {
+        let blockSize = 64
+        var normalizedKey: [UInt8]
+        if key.count > blockSize {
+            guard let digest = sha256Bytes(key) else { return nil }
+            normalizedKey = digest
+        } else {
+            normalizedKey = key
+        }
+        if normalizedKey.count < blockSize {
+            normalizedKey.append(contentsOf: repeatElement(UInt8(0), count: blockSize - normalizedKey.count))
+        }
+
+        let innerPad = normalizedKey.map { $0 ^ 0x36 }
+        let outerPad = normalizedKey.map { $0 ^ 0x5c }
+        guard let innerDigest = sha256Bytes(innerPad + message) else { return nil }
+        return sha256Bytes(outerPad + innerDigest)
+    }
+
+    private static func sha256Bytes(_ bytes: [UInt8]) -> [UInt8]? {
+        let context = SHA256Context()
+        context.add(bytes: bytes)
+        let hexBytes = context.signature.bytes
+        guard hexBytes.count.isMultiple(of: 2) else { return nil }
+        var digest: [UInt8] = []
+        digest.reserveCapacity(hexBytes.count / 2)
+        for index in stride(from: 0, to: hexBytes.count, by: 2) {
+            guard let high = hexNibble(hexBytes[index]), let low = hexNibble(hexBytes[index + 1]) else { return nil }
+            digest.append((high << 4) | low)
+        }
+        return digest
+    }
+
+    private static func hexNibble(_ byte: UInt8) -> UInt8? {
+        switch byte {
+        case 48...57:
+            return byte - 48
+        case 97...102:
+            return byte - 97 + 10
+        case 65...70:
+            return byte - 65 + 10
+        default:
+            return nil
+        }
+    }
+
+    private static func hexString(_ bytes: [UInt8]) -> String {
+        let digits = Array("0123456789abcdef".utf8)
+        var result: [UInt8] = []
+        result.reserveCapacity(bytes.count * 2)
+        for byte in bytes {
+            result.append(digits[Int(byte >> 4)])
+            result.append(digits[Int(byte & 0x0f)])
+        }
+        return String(decoding: result, as: UTF8.self)
+    }
+
     private func markTaskDeclared(rawKey: String) -> Bool {
         state.withLock { $0.declaredTasks.insert(rawKey).inserted }
+    }
+
+    /// Returns a fresh opaque identifier for one cache observation. Stable key
+    /// correlation, when available, is represented separately by key_identity.
+    private func nextLookupID() -> String {
+        return state.withLock { state in
+            let identifier = "l\(state.nextLookupID)"
+            state.nextLookupID += 1
+            return identifier
+        }
     }
 
     private func isTaskDeclared(rawKey: String) -> Bool {

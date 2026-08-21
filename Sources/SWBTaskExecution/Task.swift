@@ -597,6 +597,155 @@ public protocol TaskExecutionDelegate
 package protocol BuildOutputDelegate: TargetDiagnosticProducingDelegate {
 }
 
+/// A task-local, compiler-cache observation captured without changing the
+/// client/service protocol. Raw cache keys remain in process and are converted
+/// to keyed identities by the trace writer before an event is enqueued.
+package struct TaskCacheObservation: Equatable, Sendable {
+    package enum Mode: String, Equatable, Sendable {
+        case stock
+        case observe
+        case verify
+        case trust
+    }
+
+    package enum Eligibility: String, Equatable, Sendable {
+        case eligible
+        case ineligible
+        case unknown
+    }
+
+    package enum Outcome: String, Equatable, Sendable {
+        case miss
+        case wouldHit = "would_hit"
+        case verifyMatch = "verify_match"
+        case verifyMismatch = "verify_mismatch"
+        case unavailable
+        case cacheError = "cache_error"
+        case cancelled
+        case excluded
+    }
+
+    /// Closed taxonomy mirroring the planning-time eligibility policy plus
+    /// fixed runtime validation failures. Arbitrary diagnostic text and paths
+    /// cannot cross this boundary.
+    package enum ExclusionReason: String, Equatable, Sendable {
+        case unsupportedXcode = "unsupported_xcode"
+        case unsupportedHostArchitecture = "unsupported_host_architecture"
+        case unsupportedConfiguration = "unsupported_configuration"
+        case unsupportedPlatform = "unsupported_platform"
+        case unsupportedArchitecture = "unsupported_architecture"
+        case unsupportedAction = "unsupported_action"
+        case unsupportedCompilationMode = "unsupported_compilation_mode"
+        case wholeModuleOptimization = "whole_module_optimization"
+        case indexing
+        case previews
+        case mixedLanguageSources = "mixed_language_sources"
+        case bridgingHeader = "bridging_header"
+        case customBuildRule = "custom_build_rule"
+        case runScript = "run_script"
+        case macroPlugin = "macro_plugin"
+        case integratedDriverDisabled = "integrated_driver_disabled"
+        case explicitModulesDisabled = "explicit_modules_disabled"
+        case toolchainUnsupported = "toolchain_unsupported"
+        case cachePluginEnabled = "cache_plugin_enabled"
+        case remoteCacheEnabled = "remote_cache_enabled"
+        case cacheUnavailable = "cache_unavailable"
+        case emptyCacheKeys = "empty_cache_keys"
+        case missingOutputs = "missing_outputs"
+        case unsupportedOutput = "unsupported_output"
+    }
+
+    package enum FallbackReason: String, Equatable, Sendable {
+        case noCAS = "no_cas"
+        case queryError = "query_error"
+        case replayError = "replay_error"
+        case manifestError = "manifest_error"
+        case scrubFailure = "scrub_failure"
+        case mismatch
+    }
+
+    package enum ScrubOutcome: String, Equatable, Sendable {
+        case notRun = "not_run"
+        case succeeded
+        case failed
+    }
+
+    package enum FinalDisposition: String, Equatable, Sendable {
+        case executed
+        case verifiedThenExecuted = "verified_then_executed"
+        case cacheReplayed = "cache_replayed"
+    }
+
+    /// One compiler job can have multiple cache keys. Their raw values must
+    /// never be written to the redacted trace.
+    package let cacheKeys: [String]
+    package let keyCount: Int
+    package let mode: Mode
+    package let eligibility: Eligibility
+    package let exclusionReason: ExclusionReason?
+    package let outcome: Outcome
+    package let lookupDurationNS: UInt64?
+    package let materializationDurationNS: UInt64?
+    package let verificationDurationNS: UInt64?
+    package let scrubDurationNS: UInt64?
+    package let compilerDurationNS: UInt64?
+    package let scrubOutcome: ScrubOutcome
+    package let outputCount: Int?
+    package let outputBytes: UInt64?
+    package let mismatchCount: Int?
+    package let comparedBytes: UInt64?
+    package let fallbackReason: FallbackReason?
+    package let finalDisposition: FinalDisposition
+
+    package init(
+        cacheKeys: [String] = [],
+        keyCount: Int? = nil,
+        mode: Mode,
+        eligibility: Eligibility,
+        exclusionReason: ExclusionReason? = nil,
+        outcome: Outcome,
+        lookupDurationNS: UInt64? = nil,
+        materializationDurationNS: UInt64? = nil,
+        verificationDurationNS: UInt64? = nil,
+        scrubDurationNS: UInt64? = nil,
+        compilerDurationNS: UInt64? = nil,
+        scrubOutcome: ScrubOutcome = .notRun,
+        outputCount: Int? = nil,
+        outputBytes: UInt64? = nil,
+        mismatchCount: Int? = nil,
+        comparedBytes: UInt64? = nil,
+        fallbackReason: FallbackReason? = nil,
+        finalDisposition: FinalDisposition
+    ) {
+        self.cacheKeys = cacheKeys
+        self.keyCount = keyCount ?? cacheKeys.count
+        self.mode = mode
+        self.eligibility = eligibility
+        self.exclusionReason = exclusionReason
+        self.outcome = outcome
+        self.lookupDurationNS = lookupDurationNS
+        self.materializationDurationNS = materializationDurationNS
+        self.verificationDurationNS = verificationDurationNS
+        self.scrubDurationNS = scrubDurationNS
+        self.compilerDurationNS = compilerDurationNS
+        self.scrubOutcome = scrubOutcome
+        self.outputCount = outputCount
+        self.outputBytes = outputBytes
+        self.mismatchCount = mismatchCount
+        self.comparedBytes = comparedBytes
+        self.fallbackReason = fallbackReason
+        self.finalDisposition = finalDisposition
+    }
+}
+
+/// Kept separate from the public `TaskOutputDelegate` protocol so the
+/// observation side channel remains package-internal. Non-service delegates
+/// automatically take the default no-op path below.
+package protocol TaskCacheObservationSink: AnyObject {
+    var cacheObservations: [TaskCacheObservation] { get }
+    func recordCacheObservation(_ observation: TaskCacheObservation)
+}
+
 /// A `TaskOutputDelegate` handles output emitted by a task.
 public protocol TaskOutputDelegate: DiagnosticProducingDelegate
 {
@@ -629,6 +778,14 @@ public protocol TaskOutputDelegate: DiagnosticProducingDelegate
 
 package extension TaskOutputDelegate
 {
+    var cacheObservations: [TaskCacheObservation] {
+        (self as? any TaskCacheObservationSink)?.cacheObservations ?? []
+    }
+
+    func recordCacheObservation(_ observation: TaskCacheObservation) {
+        (self as? any TaskCacheObservationSink)?.recordCacheObservation(observation)
+    }
+
     /// Emit an error message.
     func emitError(_ message: String) {
         error(message)

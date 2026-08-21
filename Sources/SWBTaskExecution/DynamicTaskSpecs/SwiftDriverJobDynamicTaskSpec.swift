@@ -23,8 +23,9 @@ public struct SwiftDriverJobTaskKey: Serializable, CustomDebugStringConvertible 
     let isUsingWholeModuleOptimization: Bool
     let compilerLocation: LibSwiftDriver.CompilerLocation
     let casOptions: CASOptions?
+    let acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy
 
-    init(identifier: String, variant: String, arch: String, driverJobKey: LibSwiftDriver.JobKey, driverJobSignature: ByteString, isUsingWholeModuleOptimization: Bool, compilerLocation: LibSwiftDriver.CompilerLocation, casOptions: CASOptions?) {
+    init(identifier: String, variant: String, arch: String, driverJobKey: LibSwiftDriver.JobKey, driverJobSignature: ByteString, isUsingWholeModuleOptimization: Bool, compilerLocation: LibSwiftDriver.CompilerLocation, casOptions: CASOptions?, acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy) {
         self.identifier = identifier
         self.variant = variant
         self.arch = arch
@@ -33,10 +34,11 @@ public struct SwiftDriverJobTaskKey: Serializable, CustomDebugStringConvertible 
         self.isUsingWholeModuleOptimization = isUsingWholeModuleOptimization
         self.compilerLocation = compilerLocation
         self.casOptions = casOptions
+        self.acceleratorCachePolicy = acceleratorCachePolicy
     }
 
     public func serialize<T>(to serializer: T) where T : Serializer {
-        serializer.serializeAggregate(8) {
+        serializer.serializeAggregate(9) {
             serializer.serialize(identifier)
             serializer.serialize(variant)
             serializer.serialize(arch)
@@ -45,11 +47,12 @@ public struct SwiftDriverJobTaskKey: Serializable, CustomDebugStringConvertible 
             serializer.serialize(isUsingWholeModuleOptimization)
             serializer.serialize(compilerLocation)
             serializer.serialize(casOptions)
+            serializer.serialize(acceleratorCachePolicy)
         }
     }
 
     public init(from deserializer: any Deserializer) throws {
-        try deserializer.beginAggregate(8)
+        try deserializer.beginAggregate(9)
         identifier = try deserializer.deserialize()
         variant = try deserializer.deserialize()
         arch = try deserializer.deserialize()
@@ -58,10 +61,11 @@ public struct SwiftDriverJobTaskKey: Serializable, CustomDebugStringConvertible 
         isUsingWholeModuleOptimization = try deserializer.deserialize()
         compilerLocation = try deserializer.deserialize()
         casOptions = try deserializer.deserialize()
+        acceleratorCachePolicy = try deserializer.deserialize()
     }
 
     public var debugDescription: String {
-        "<SwiftDriverJob identifier=\(identifier) arch=\(arch) variant=\(variant) jobKey=\(driverJobKey) jobSignature=\(driverJobSignature) isUsingWholeModuleOptimization=\(isUsingWholeModuleOptimization) compilerLocation=\(compilerLocation) casOptions=\(String(describing: casOptions))>"
+        "<SwiftDriverJob identifier=\(identifier) arch=\(arch) variant=\(variant) jobKey=\(driverJobKey) jobSignature=\(driverJobSignature) isUsingWholeModuleOptimization=\(isUsingWholeModuleOptimization) compilerLocation=\(compilerLocation) casOptions=\(String(describing: casOptions)) acceleratorCachePolicy=\(acceleratorCachePolicy)>"
     }
 }
 
@@ -71,36 +75,40 @@ public struct SwiftDriverExplicitDependencyJobTaskKey: Serializable, CustomDebug
     let driverJobSignature: ByteString
     let compilerLocation: LibSwiftDriver.CompilerLocation
     let casOptions: CASOptions?
+    let acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy
 
-    init(arch: String, driverJobKey: LibSwiftDriver.JobKey, driverJobSignature: ByteString, compilerLocation: LibSwiftDriver.CompilerLocation, casOptions: CASOptions?) {
+    init(arch: String, driverJobKey: LibSwiftDriver.JobKey, driverJobSignature: ByteString, compilerLocation: LibSwiftDriver.CompilerLocation, casOptions: CASOptions?, acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy) {
         self.arch = arch
         self.driverJobKey = driverJobKey
         self.driverJobSignature = driverJobSignature
         self.compilerLocation = compilerLocation
         self.casOptions = casOptions
+        self.acceleratorCachePolicy = acceleratorCachePolicy
     }
 
     public func serialize<T>(to serializer: T) where T : Serializer {
-        serializer.serializeAggregate(5) {
+        serializer.serializeAggregate(6) {
             serializer.serialize(arch)
             serializer.serialize(driverJobKey)
             serializer.serialize(driverJobSignature)
             serializer.serialize(compilerLocation)
             serializer.serialize(casOptions)
+            serializer.serialize(acceleratorCachePolicy)
         }
     }
 
     public init(from deserializer: any Deserializer) throws {
-        try deserializer.beginAggregate(5)
+        try deserializer.beginAggregate(6)
         arch = try deserializer.deserialize()
         driverJobKey = try deserializer.deserialize()
         driverJobSignature = try deserializer.deserialize()
         compilerLocation = try deserializer.deserialize()
         casOptions = try deserializer.deserialize()
+        acceleratorCachePolicy = try deserializer.deserialize()
     }
 
     public var debugDescription: String {
-        "<SwiftDriverExplicitDependencyJob arch=\(arch) jobKey=\(driverJobKey) jobSignature=\(driverJobSignature) compilerLocation=\(compilerLocation) casOptions=\(String(describing: casOptions))>"
+        "<SwiftDriverExplicitDependencyJob arch=\(arch) jobKey=\(driverJobKey) jobSignature=\(driverJobSignature) compilerLocation=\(compilerLocation) casOptions=\(String(describing: casOptions)) acceleratorCachePolicy=\(acceleratorCachePolicy)>"
     }
 }
 
@@ -109,28 +117,32 @@ struct SwiftDriverJobDynamicTaskPayload: TaskPayload {
     let isUsingWholeModuleOptimization: Bool
     let compilerLocation: LibSwiftDriver.CompilerLocation
     let casOptions: CASOptions?
+    let acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy
 
-    init(serializedDiagnosticInfo: [SerializedDiagnosticInfo], isUsingWholeModuleOptimization: Bool, compilerLocation: LibSwiftDriver.CompilerLocation, casOptions: CASOptions?) {
+    init(serializedDiagnosticInfo: [SerializedDiagnosticInfo], isUsingWholeModuleOptimization: Bool, compilerLocation: LibSwiftDriver.CompilerLocation, casOptions: CASOptions?, acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy) {
         self.serializedDiagnosticInfo = serializedDiagnosticInfo
         self.isUsingWholeModuleOptimization = isUsingWholeModuleOptimization
         self.compilerLocation = compilerLocation
         self.casOptions = casOptions
+        self.acceleratorCachePolicy = acceleratorCachePolicy
     }
 
     init(from deserializer: any Deserializer) throws {
-        try deserializer.beginAggregate(4)
+        try deserializer.beginAggregate(5)
         self.serializedDiagnosticInfo = try deserializer.deserialize()
         self.isUsingWholeModuleOptimization = try deserializer.deserialize()
         self.compilerLocation = try deserializer.deserialize()
         self.casOptions = try deserializer.deserialize()
+        self.acceleratorCachePolicy = try deserializer.deserialize()
     }
 
     func serialize<T>(to serializer: T) where T : Serializer {
-        serializer.serializeAggregate(4) {
+        serializer.serializeAggregate(5) {
             serializer.serialize(serializedDiagnosticInfo)
             serializer.serialize(isUsingWholeModuleOptimization)
             serializer.serialize(compilerLocation)
             serializer.serialize(casOptions)
+            serializer.serialize(acceleratorCachePolicy)
         }
     }
 }
@@ -149,6 +161,7 @@ final class SwiftDriverJobDynamicTaskSpec: DynamicTaskSpec {
         let isUsingWholeModuleOptimization: Bool
         let compilerLocation: LibSwiftDriver.CompilerLocation
         let casOpts: CASOptions?
+        let acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy
         let taskOutputPaths: [Path]
         switch dynamicTask.taskKey {
         case .swiftDriverJob(let key):
@@ -186,6 +199,7 @@ final class SwiftDriverJobDynamicTaskSpec: DynamicTaskSpec {
             isUsingWholeModuleOptimization = key.isUsingWholeModuleOptimization
             compilerLocation = key.compilerLocation
             casOpts = key.casOptions
+            acceleratorCachePolicy = key.acceleratorCachePolicy
             // Not tracking outputs for regular driver jobs yet due to
             // ObjC header duplicate producer issue (rdar://88393903).
             taskOutputPaths = []
@@ -203,6 +217,7 @@ final class SwiftDriverJobDynamicTaskSpec: DynamicTaskSpec {
             isUsingWholeModuleOptimization = false
             compilerLocation = key.compilerLocation
             casOpts = key.casOptions
+            acceleratorCachePolicy = key.acceleratorCachePolicy
             taskOutputPaths = job.outputs
         default:
             fatalError("Unexpected dynamic task: \(dynamicTask)")
@@ -214,7 +229,8 @@ final class SwiftDriverJobDynamicTaskSpec: DynamicTaskSpec {
                             serializedDiagnosticInfo: serializedDiagnosticInfo,
                             isUsingWholeModuleOptimization: isUsingWholeModuleOptimization,
                             compilerLocation: compilerLocation,
-                            casOptions: casOpts
+                            casOptions: casOpts,
+                            acceleratorCachePolicy: acceleratorCachePolicy
                         ),
                     forTarget: forTarget,
                     ruleInfo: ruleInfo,

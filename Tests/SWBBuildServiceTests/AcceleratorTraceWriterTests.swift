@@ -19,6 +19,7 @@ import SWBBuildService
 import SWBCore
 import SWBProtocol
 import SWBTestSupport
+import SWBTaskExecution
 import SWBUtil
 
 @Suite fileprivate struct AcceleratorTraceWriterTests {
@@ -82,7 +83,7 @@ import SWBUtil
         #expect(events.count == 1)
         let event = try #require(events.first)
         #expect(event["schema_major"] as? Int == 1)
-        #expect(event["schema_minor"] as? Int == 0)
+        #expect(event["schema_minor"] as? Int == 1)
         #expect(event["event"] as? String == "probe")
         #expect(event["build_id"] as? String == testBuildID.uuidString.lowercased())
         #expect(event["sequence"] as? Int == 1)
@@ -211,6 +212,90 @@ import SWBUtil
         #expect(debugPayload.keys.filter { $0 != "debug" }.allSatisfy { key in
             !String(describing: debugPayload[key]).contains(secret)
         })
+    }
+
+    @Test func cacheObservationRedactsRawKeysAndPreservesBoundedFields() throws {
+        let rawKey = "llvmcas://private-key-/Users/example/Secret.swift"
+        let secondRawKey = "cas-id-private-module-target-environment"
+        let distinctRawKey = "distinct-private-cache-key"
+        let taskIdentifier = TaskIdentifier(rawValue: "/Users/example/private-project/Secret.swift")
+        let task = OutputParserMockTask(basenames: [], exec: "swift-frontend")
+        let sink = TestAcceleratorTraceSink()
+        let writer = makeWriter(sink: sink, privacyMode: .redacted)
+        let observation = TaskCacheObservation(
+            cacheKeys: [rawKey, secondRawKey],
+            mode: .verify,
+            eligibility: .eligible,
+            outcome: .verifyMatch,
+            lookupDurationNS: 11,
+            materializationDurationNS: 12,
+            verificationDurationNS: 13,
+            scrubDurationNS: 14,
+            compilerDurationNS: 15,
+            scrubOutcome: .succeeded,
+            outputCount: 2,
+            outputBytes: 100,
+            mismatchCount: 0,
+            comparedBytes: 100,
+            finalDisposition: .verifiedThenExecuted
+        )
+
+        writer.cacheObservations(taskIdentifier: taskIdentifier, task: task, observations: [observation])
+        writer.cacheObservations(
+            taskIdentifier: taskIdentifier,
+            task: task,
+            observations: [TaskCacheObservation(
+                cacheKeys: [secondRawKey, rawKey],
+                mode: .observe,
+                eligibility: .ineligible,
+                exclusionReason: .unsupportedOutput,
+                outcome: .excluded,
+                finalDisposition: .executed
+            )]
+        )
+        writer.cacheObservations(
+            taskIdentifier: taskIdentifier,
+            task: task,
+            observations: [TaskCacheObservation(
+                cacheKeys: [distinctRawKey],
+                mode: .observe,
+                eligibility: .eligible,
+                outcome: .miss,
+                finalDisposition: .executed
+            )]
+        )
+        writer.flushForTesting()
+
+        #expect(!sink.string.contains(rawKey))
+        #expect(!sink.string.contains(secondRawKey))
+        #expect(!sink.string.contains(distinctRawKey))
+        #expect(!sink.string.contains("Secret.swift"))
+        let observations = try sink.events().filter { $0["event"] as? String == "cache_observation" }
+        #expect(observations.count == 3)
+        let firstPayload = try #require(observations.first?["payload"] as? [String: Any])
+        let secondPayload = try #require(observations.dropFirst().first?["payload"] as? [String: Any])
+        let thirdPayload = try #require(observations.last?["payload"] as? [String: Any])
+        #expect(observations.allSatisfy { $0["schema_major"] as? Int == 1 })
+        #expect(observations.allSatisfy { $0["schema_minor"] as? Int == 1 })
+        let firstIdentity = try #require(firstPayload["key_identity"] as? String)
+        let firstLookupID = try #require(firstPayload["lookup_id"] as? String)
+        #expect(firstIdentity.hasPrefix("hmac-sha256:"))
+        #expect(firstIdentity == secondPayload["key_identity"] as? String)
+        #expect(firstLookupID == "l1")
+        #expect(secondPayload["lookup_id"] as? String == "l2")
+        #expect(thirdPayload["lookup_id"] as? String == "l3")
+        #expect(firstPayload["source"] as? String == "swift")
+        #expect(firstPayload["exclusion_reason"] is NSNull)
+        #expect(secondPayload["exclusion_reason"] as? String == "unsupported_output")
+        #expect(firstPayload["key_count"] as? Int == 2)
+        #expect(firstPayload["mode"] as? String == "verify")
+        #expect(firstPayload["outcome"] as? String == "verify_match")
+        #expect(firstPayload["final_disposition"] as? String == "verified_then_executed")
+        let timings = try #require(firstPayload["timings"] as? [String: Any])
+        #expect(timings["lookup_duration_ns"] as? Int == 11)
+        let outputs = try #require(firstPayload["outputs"] as? [String: Any])
+        #expect(outputs["count"] as? Int == 2)
+        #expect(outputs["mismatch_count"] as? Int == 0)
     }
 
     @Test func finishIsTerminalAndClosesAfterDraining() throws {

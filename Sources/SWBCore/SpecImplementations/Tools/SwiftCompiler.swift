@@ -362,6 +362,148 @@ public struct SwiftLocalizationPayload: Serializable, Sendable {
     }
 }
 
+public enum SwiftBuildAcceleratorCacheMode: String, Codable, Sendable, Serializable {
+    case stock
+    case observe
+    case verify
+    case trust
+
+    /// Parses the per-build opt-in setting. `trust` is deliberately represented in
+    /// the internal state model but cannot be selected by this implementation.
+    public static func externallySelectedMode(_ value: String) -> Self {
+        switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "observe":
+            return .observe
+        case "verify":
+            return .verify
+        case "trust":
+            // `trust` is intentionally unselectable until verification has proved
+            // the cache safe. Treating it as observe guarantees a fresh compile.
+            return .observe
+        default:
+            return .stock
+        }
+    }
+
+    public var isAcceleratorEnabled: Bool {
+        self == .observe || self == .verify
+    }
+
+    public func serialize<T: Serializer>(to serializer: T) {
+        serializer.serialize(rawValue)
+    }
+
+    public init(from deserializer: any Deserializer) throws {
+        let rawValue: String = try deserializer.deserialize()
+        guard let value = Self(rawValue: rawValue) else {
+            throw DeserializerError.incorrectType("Unknown Swift build accelerator cache mode '\(rawValue)'")
+        }
+        self = value
+    }
+}
+
+public enum SwiftBuildAcceleratorCacheExclusionReason: String, Codable, Sendable, Serializable {
+    case unsupportedXcode
+    case unsupportedHostArchitecture
+    case unsupportedConfiguration
+    case unsupportedPlatform
+    case unsupportedArchitecture
+    case unsupportedAction
+    case unsupportedCompilationMode
+    case wholeModuleOptimization
+    case indexing
+    case previews
+    case mixedLanguageSources
+    case bridgingHeader
+    case customBuildRule
+    case runScript
+    case macroPlugin
+    case integratedDriverDisabled
+    case explicitModulesDisabled
+    case toolchainUnsupported
+    case cachePluginEnabled
+    case remoteCacheEnabled
+    case cacheUnavailable
+    case emptyCacheKeys
+    case missingOutputs
+    case unsupportedOutput
+
+    public func serialize<T: Serializer>(to serializer: T) {
+        serializer.serialize(rawValue)
+    }
+
+    public init(from deserializer: any Deserializer) throws {
+        let rawValue: String = try deserializer.deserialize()
+        guard let value = Self(rawValue: rawValue) else {
+            throw DeserializerError.incorrectType("Unknown Swift build accelerator exclusion reason '\(rawValue)'")
+        }
+        self = value
+    }
+}
+
+public enum SwiftBuildAcceleratorCacheEligibility: Sendable, Serializable, Equatable, Codable {
+    case eligible
+    case excluded(SwiftBuildAcceleratorCacheExclusionReason)
+
+    public func serialize<T: Serializer>(to serializer: T) {
+        serializer.serializeAggregate(2) {
+            switch self {
+            case .eligible:
+                serializer.serialize(0)
+                serializer.serializeNil()
+            case .excluded(let reason):
+                serializer.serialize(1)
+                serializer.serialize(reason)
+            }
+        }
+    }
+
+    public init(from deserializer: any Deserializer) throws {
+        try deserializer.beginAggregate(2)
+        let code: Int = try deserializer.deserialize()
+        switch code {
+        case 0:
+            guard deserializer.deserializeNil() else {
+                throw DeserializerError.deserializationFailed("Unexpected reason for eligible accelerator cache policy")
+            }
+            self = .eligible
+        case 1:
+            self = .excluded(try deserializer.deserialize())
+        default:
+            throw DeserializerError.incorrectType("Unknown accelerator cache eligibility code \(code)")
+        }
+    }
+}
+
+public struct SwiftBuildAcceleratorCachePolicy: Sendable, Serializable, Equatable, Codable {
+    public let mode: SwiftBuildAcceleratorCacheMode
+    public let eligibility: SwiftBuildAcceleratorCacheEligibility
+
+    public static let stock = Self(mode: .stock, eligibility: .eligible)
+
+    public init(mode: SwiftBuildAcceleratorCacheMode, eligibility: SwiftBuildAcceleratorCacheEligibility) {
+        self.mode = mode
+        self.eligibility = eligibility
+    }
+
+    public var shouldProbe: Bool {
+        mode.isAcceleratorEnabled && eligibility == .eligible
+    }
+
+    public func serialize<T: Serializer>(to serializer: T) {
+        serializer.serializeAggregate(2) {
+            serializer.serialize(mode)
+            serializer.serialize(eligibility)
+        }
+    }
+
+    public init(from deserializer: any Deserializer) throws {
+        try deserializer.beginAggregate(2)
+        mode = try deserializer.deserialize()
+        eligibility = try deserializer.deserialize()
+    }
+}
+
 public struct SwiftDriverPayload: Serializable, TaskPayload, Encodable {
     public let uniqueID: String
     public let compilerLocation: LibSwiftDriver.CompilerLocation
@@ -378,6 +520,7 @@ public struct SwiftDriverPayload: Serializable, TaskPayload, Encodable {
     public let ruleInfo: [String]
     public let isUsingWholeModuleOptimization: Bool
     public let casOptions: CASOptions?
+    public let acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy
     public let reportRequiredTargetDependencies: BooleanWarningLevel
     public let linkerResponseFilePath: Path?
     public let linkerResponseFileFormat: ResponseFileFormat
@@ -386,7 +529,7 @@ public struct SwiftDriverPayload: Serializable, TaskPayload, Encodable {
     public let scannerDiagnosticsOutputPath: Path?
     public let diagnosticAttachmentInfo: LibclangDiagnosticAttachmentInfo?
 
-    internal init(uniqueID: String, compilerLocation: LibSwiftDriver.CompilerLocation, moduleName: String, outputPrefix: String, tempDirPath: Path, explicitModulesTempDirPath: Path, variant: String, architecture: String, cohortArchitectures: [String], eagerCompilationEnabled: Bool, explicitModulesEnabled: Bool, commandLine: [String], ruleInfo: [String], isUsingWholeModuleOptimization: Bool, casOptions: CASOptions?, reportRequiredTargetDependencies: BooleanWarningLevel, linkerResponseFilePath: Path?, linkerResponseFileFormat: ResponseFileFormat, dependencyFilteringRootPath: Path?, verifyScannerDependencies: Bool, scannerDiagnosticsOutputPath: Path?, diagnosticAttachmentInfo: LibclangDiagnosticAttachmentInfo?) {
+    internal init(uniqueID: String, compilerLocation: LibSwiftDriver.CompilerLocation, moduleName: String, outputPrefix: String, tempDirPath: Path, explicitModulesTempDirPath: Path, variant: String, architecture: String, cohortArchitectures: [String], eagerCompilationEnabled: Bool, explicitModulesEnabled: Bool, commandLine: [String], ruleInfo: [String], isUsingWholeModuleOptimization: Bool, casOptions: CASOptions?, acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy, reportRequiredTargetDependencies: BooleanWarningLevel, linkerResponseFilePath: Path?, linkerResponseFileFormat: ResponseFileFormat, dependencyFilteringRootPath: Path?, verifyScannerDependencies: Bool, scannerDiagnosticsOutputPath: Path?, diagnosticAttachmentInfo: LibclangDiagnosticAttachmentInfo?) {
         self.uniqueID = uniqueID
         self.compilerLocation = compilerLocation
         self.moduleName = moduleName
@@ -402,6 +545,7 @@ public struct SwiftDriverPayload: Serializable, TaskPayload, Encodable {
         self.ruleInfo = ruleInfo
         self.isUsingWholeModuleOptimization = isUsingWholeModuleOptimization
         self.casOptions = casOptions
+        self.acceleratorCachePolicy = acceleratorCachePolicy
         self.reportRequiredTargetDependencies = reportRequiredTargetDependencies
         self.linkerResponseFilePath = linkerResponseFilePath
         self.linkerResponseFileFormat = linkerResponseFileFormat
@@ -412,7 +556,7 @@ public struct SwiftDriverPayload: Serializable, TaskPayload, Encodable {
     }
 
     public init(from deserializer: any Deserializer) throws {
-        try deserializer.beginAggregate(22)
+        try deserializer.beginAggregate(23)
         self.uniqueID = try deserializer.deserialize()
         self.compilerLocation = try deserializer.deserialize()
         self.moduleName = try deserializer.deserialize()
@@ -428,6 +572,7 @@ public struct SwiftDriverPayload: Serializable, TaskPayload, Encodable {
         self.ruleInfo = try deserializer.deserialize()
         self.isUsingWholeModuleOptimization = try deserializer.deserialize()
         self.casOptions = try deserializer.deserialize()
+        self.acceleratorCachePolicy = try deserializer.deserialize()
         self.reportRequiredTargetDependencies = try deserializer.deserialize()
         self.linkerResponseFilePath = try deserializer.deserialize()
         self.linkerResponseFileFormat = try deserializer.deserialize()
@@ -438,7 +583,7 @@ public struct SwiftDriverPayload: Serializable, TaskPayload, Encodable {
     }
 
     public func serialize<T>(to serializer: T) where T : Serializer {
-        serializer.serializeAggregate(22) {
+        serializer.serializeAggregate(23) {
             serializer.serialize(self.uniqueID)
             serializer.serialize(self.compilerLocation)
             serializer.serialize(self.moduleName)
@@ -454,6 +599,7 @@ public struct SwiftDriverPayload: Serializable, TaskPayload, Encodable {
             serializer.serialize(self.ruleInfo)
             serializer.serialize(self.isUsingWholeModuleOptimization)
             serializer.serialize(self.casOptions)
+            serializer.serialize(self.acceleratorCachePolicy)
             serializer.serialize(self.reportRequiredTargetDependencies)
             serializer.serialize(self.linkerResponseFilePath)
             serializer.serialize(self.linkerResponseFileFormat)
@@ -1014,8 +1160,8 @@ public final class SwiftCompilerSpec : CompilerSpec, SpecIdentifierType, SwiftDi
         }
     }
 
-    private func swiftCachingEnabled(_ cbc: CommandBuildContext, _ delegate: any TaskGenerationDelegate, _ moduleName: String, _ useIntegratedDriver: Bool, _ explicitModuleBuildEnabled: Bool, _ disabledPCHCompile: Bool) async -> Bool {
-        guard cbc.scope.evaluate(BuiltinMacros.SWIFT_ENABLE_COMPILE_CACHE) else {
+    private func swiftCachingEnabled(_ cbc: CommandBuildContext, _ delegate: any TaskGenerationDelegate, _ moduleName: String, _ useIntegratedDriver: Bool, _ explicitModuleBuildEnabled: Bool, _ disabledPCHCompile: Bool, requested: Bool) async -> Bool {
+        guard requested else {
             return false
         }
         if cbc.scope.evaluate(BuiltinMacros.INDEX_ENABLE_BUILD_ARENA) {
@@ -1400,9 +1546,74 @@ public final class SwiftCompilerSpec : CompilerSpec, SpecIdentifierType, SwiftDi
                 }
             }
 
+            // Compute this semantic output before cache policy and driver job
+            // lowering. Response-file lowering may hide the frontend option from
+            // the eventual dynamic task command line.
+            let objcHeaderFilePath: Path?
+            if compilationMode.emitObjCHeader {
+                let objcHeaderFileName = cbc.scope.evaluate(BuiltinMacros.SWIFT_OBJC_INTERFACE_HEADER_NAME)
+                objcHeaderFilePath = objcHeaderFileName.isEmpty ? nil : objectFileDir.join(objcHeaderFileName)
+            } else {
+                objcHeaderFilePath = nil
+            }
+
             let useIntegratedDriver = integratedDriverEnabled(scope: cbc.scope)
             let explicitModuleBuildEnabled = await swiftExplicitModuleBuildEnabled(cbc.producer, cbc.scope, delegate)
-            let isCachingEnabled = await swiftCachingEnabled(cbc, delegate, moduleName, useIntegratedDriver, explicitModuleBuildEnabled, args.contains("-disable-bridging-pch"))
+            var acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy = {
+                let rawMode = cbc.scope.evaluate(BuiltinMacros.SWIFT_BUILD_ACCELERATOR_CACHE_MODE)
+                let mode = SwiftBuildAcceleratorCacheMode.externallySelectedMode(rawMode)
+                if rawMode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == SwiftBuildAcceleratorCacheMode.trust.rawValue {
+                    delegate.warning("SWIFT_BUILD_ACCELERATOR_CACHE_MODE=trust is reserved and unavailable; using observe mode")
+                }
+                guard mode.isAcceleratorEnabled else {
+                    return .stock
+                }
+
+                func excluded(_ reason: SwiftBuildAcceleratorCacheExclusionReason) -> SwiftBuildAcceleratorCachePolicy {
+                    .init(mode: mode, eligibility: .excluded(reason))
+                }
+
+                guard cbc.scope.evaluate(BuiltinMacros.XCODE_VERSION_ACTUAL) == "2630" else { return excluded(.unsupportedXcode) }
+                guard cbc.scope.evaluate(BuiltinMacros.NATIVE_ARCH_ACTUAL) == "arm64" else { return excluded(.unsupportedHostArchitecture) }
+                guard cbc.scope.evaluate(BuiltinMacros.CONFIGURATION) == "Debug" else { return excluded(.unsupportedConfiguration) }
+                guard cbc.scope.evaluate(BuiltinMacros.PLATFORM_NAME) == "iphonesimulator" else { return excluded(.unsupportedPlatform) }
+                guard arch == "arm64" else { return excluded(.unsupportedArchitecture) }
+                guard cbc.scope.evaluate(BuiltinMacros.ACTION) == "build" else { return excluded(.unsupportedAction) }
+                guard case .compile = compilationMode else { return excluded(.unsupportedCompilationMode) }
+                guard !isUsingWholeModuleOptimization else { return excluded(.wholeModuleOptimization) }
+                guard !cbc.scope.evaluate(BuiltinMacros.INDEX_ENABLE_BUILD_ARENA) else { return excluded(.indexing) }
+                guard cbc.scope.previewStyle == nil else { return excluded(.previews) }
+                // Generated Objective-C headers can be shared across driver jobs;
+                // verify replay must never write or scrub them.
+                guard mode != .verify || objcHeaderFilePath == nil else { return excluded(.unsupportedOutput) }
+                guard cbc.scope.evaluate(BuiltinMacros.SWIFT_OBJC_BRIDGING_HEADER).isEmpty else { return excluded(.bridgingHeader) }
+                guard cbc.producer.swiftMacroImplementationDescriptors?.isEmpty != false else { return excluded(.macroPlugin) }
+                guard useIntegratedDriver else { return excluded(.integratedDriverDisabled) }
+                guard explicitModuleBuildEnabled else { return excluded(.explicitModulesDisabled) }
+                guard toolSpecInfo.hasFeature(DiscoveredSwiftCompilerToolSpecInfo.FeatureFlag.compilationCaching.rawValue) else { return excluded(.toolchainUnsupported) }
+                guard !cbc.scope.evaluate(BuiltinMacros.COMPILATION_CACHE_ENABLE_PLUGIN) else { return excluded(.cachePluginEnabled) }
+                guard cbc.scope.evaluate(BuiltinMacros.COMPILATION_CACHE_REMOTE_SERVICE_PATH).isEmpty else { return excluded(.remoteCacheEnabled) }
+
+                if let target = cbc.producer.configuredTarget?.target as? StandardTarget {
+                    if !target.buildRules.isEmpty { return excluded(.customBuildRule) }
+                    if target.buildPhases.contains(where: { $0 is ShellScriptBuildPhase }) { return excluded(.runScript) }
+                    if let sources = target.sourcesBuildPhase,
+                       let cFamilyType = cbc.producer.lookupFileType(identifier: "sourcecode.c"),
+                       sources.containsFiles(ofType: cFamilyType, cbc.producer, cbc.producer, cbc.scope, cbc.producer.filePathResolver) {
+                        return excluded(.mixedLanguageSources)
+                    }
+                    switch target.predominantSourceCodeLanguage {
+                    case .c, .objectiveC, .cPlusPlus, .objectiveCPlusPlus, .other:
+                        return excluded(.mixedLanguageSources)
+                    case .swift, .undefined:
+                        break
+                    }
+                }
+
+                return .init(mode: mode, eligibility: .eligible)
+            }()
+            let cacheRequested = cbc.scope.evaluate(BuiltinMacros.SWIFT_ENABLE_COMPILE_CACHE) || acceleratorCachePolicy.shouldProbe
+            let isCachingEnabled = await swiftCachingEnabled(cbc, delegate, moduleName, useIntegratedDriver, explicitModuleBuildEnabled, args.contains("-disable-bridging-pch"), requested: cacheRequested)
             if await cbc.producer.shouldUseSDKStatCache() && toolSpecInfo.toolFeatures.has(.vfsstatcache) && !isCachingEnabled {
                 let cachePath = Path(cbc.scope.evaluate(BuiltinMacros.SDK_STAT_CACHE_PATH))
                 args.append(contentsOf: ["-Xcc", "-ivfsstatcache", "-Xcc", cachePath.str])
@@ -1488,7 +1699,17 @@ public final class SwiftCompilerSpec : CompilerSpec, SpecIdentifierType, SwiftDi
                     }
                 }
             } catch {
-                delegate.error(error.localizedDescription)
+                if acceleratorCachePolicy.shouldProbe
+                    && !cbc.scope.evaluate(BuiltinMacros.COMPILATION_CACHE_ENABLE_STRICT_CAS_ERRORS) {
+                    delegate.warning("Swift accelerator cache setup is unavailable; compiling without cache observation")
+                    acceleratorCachePolicy = .init(
+                        mode: acceleratorCachePolicy.mode,
+                        eligibility: .excluded(.cacheUnavailable)
+                    )
+                } else {
+                    // Preserve stock and strict CAS setup diagnostics and failure.
+                    delegate.error(error.localizedDescription)
+                }
                 casOptions = nil
             }
 
@@ -1709,13 +1930,6 @@ public final class SwiftCompilerSpec : CompilerSpec, SpecIdentifierType, SwiftDi
             }
 
             // Instruct the compiler to emit the ObjC header file.
-            let objcHeaderFilePath: Path?
-            if compilationMode.emitObjCHeader {
-                let objcHeaderFileName = cbc.scope.evaluate(BuiltinMacros.SWIFT_OBJC_INTERFACE_HEADER_NAME)
-                objcHeaderFilePath = objcHeaderFileName.isEmpty ? nil : objectFileDir.join(objcHeaderFileName)
-            } else {
-                objcHeaderFilePath = nil
-            }
             if let objcHeaderFilePath {
                 args += ["-emit-objc-header", "-emit-objc-header-path", objcHeaderFilePath.str]
                 moduleOutputPaths.append(objcHeaderFilePath)
@@ -1999,7 +2213,7 @@ public final class SwiftCompilerSpec : CompilerSpec, SpecIdentifierType, SwiftDi
                 previewPayload: previewPayload,
                 localizationPayload: localizationPayload,
                 numExpectedCompileSubtasks: isUsingWholeModuleOptimization ? 1 : cbc.inputs.count,
-                driverPayload: await driverPayload(uniqueID: String(args.hashValue), scope: cbc.scope, delegate: delegate, compilationMode: compilationMode, isUsingWholeModuleOptimization: isUsingWholeModuleOptimization, args: args, tempDirPath: objectFileDir, explicitModulesTempDirPath: cbc.scope.evaluate(BuiltinMacros.SWIFT_EXPLICIT_MODULES_OUTPUT_PATH), variant: variant, arch: arch + compilationMode.moduleBaseNameSuffix, cohortArchs: cohortArchs, commandLine: ["builtin-SwiftDriver", "--"] + args, ruleInfo: ruleInfo(compilationMode.ruleNameIntegratedDriver, targetName), casOptions: casOptions, scannerDiagnosticsOutputPath: scannerDiagnosticsPath, linkerResponseFilePath: moduleLinkerArgsPath),
+                driverPayload: await driverPayload(uniqueID: String(args.hashValue), scope: cbc.scope, delegate: delegate, compilationMode: compilationMode, isUsingWholeModuleOptimization: isUsingWholeModuleOptimization, args: args, tempDirPath: objectFileDir, explicitModulesTempDirPath: cbc.scope.evaluate(BuiltinMacros.SWIFT_EXPLICIT_MODULES_OUTPUT_PATH), variant: variant, arch: arch + compilationMode.moduleBaseNameSuffix, cohortArchs: cohortArchs, commandLine: ["builtin-SwiftDriver", "--"] + args, ruleInfo: ruleInfo(compilationMode.ruleNameIntegratedDriver, targetName), casOptions: casOptions, acceleratorCachePolicy: acceleratorCachePolicy, scannerDiagnosticsOutputPath: scannerDiagnosticsPath, linkerResponseFilePath: moduleLinkerArgsPath),
                 previewStyle: cbc.scope.previewStyle
             )
 
@@ -2211,7 +2425,7 @@ public final class SwiftCompilerSpec : CompilerSpec, SpecIdentifierType, SwiftDi
             }
         }
 
-        func driverPayload(uniqueID: String, scope: MacroEvaluationScope, delegate: any TaskGenerationDelegate, compilationMode: SwiftCompilationMode, isUsingWholeModuleOptimization: Bool, args: [String], tempDirPath: Path, explicitModulesTempDirPath: Path, variant: String, arch: String, cohortArchs: [String], commandLine: [String], ruleInfo: [String], casOptions: CASOptions?, scannerDiagnosticsOutputPath: Path?, linkerResponseFilePath: Path?) async -> SwiftDriverPayload? {
+        func driverPayload(uniqueID: String, scope: MacroEvaluationScope, delegate: any TaskGenerationDelegate, compilationMode: SwiftCompilationMode, isUsingWholeModuleOptimization: Bool, args: [String], tempDirPath: Path, explicitModulesTempDirPath: Path, variant: String, arch: String, cohortArchs: [String], commandLine: [String], ruleInfo: [String], casOptions: CASOptions?, acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy, scannerDiagnosticsOutputPath: Path?, linkerResponseFilePath: Path?) async -> SwiftDriverPayload? {
             guard integratedDriverEnabled(scope: scope) else {
                 return nil
             }
@@ -2231,7 +2445,7 @@ public final class SwiftCompilerSpec : CompilerSpec, SpecIdentifierType, SwiftDi
             let verifyScannerDependencies = explicitModuleBuildEnabled && cbc.scope.evaluate(BuiltinMacros.SWIFT_DEPENDENCY_REGISTRATION_MODE) == .verifySwiftDependencyScanner
             let diagnosticAttachmentInfo = LibclangDiagnosticAttachmentInfo.attachmentInfo(scope: scope)
 
-            return SwiftDriverPayload(uniqueID: uniqueID, compilerLocation: compilerLocation, moduleName: scope.evaluate(BuiltinMacros.SWIFT_MODULE_NAME), outputPrefix: scope.evaluate(BuiltinMacros.TARGET_NAME) + compilationMode.moduleBaseNameSuffix, tempDirPath: tempDirPath, explicitModulesTempDirPath: explicitModulesTempDirPath, variant: variant, architecture: arch, cohortArchitectures: cohortArchs, eagerCompilationEnabled: eagerCompilationEnabled(args: args, scope: scope, compilationMode: compilationMode, isUsingWholeModuleOptimization: isUsingWholeModuleOptimization), explicitModulesEnabled: explicitModuleBuildEnabled, commandLine: commandLine, ruleInfo: ruleInfo, isUsingWholeModuleOptimization: isUsingWholeModuleOptimization, casOptions: casOptions, reportRequiredTargetDependencies: scope.evaluate(BuiltinMacros.DIAGNOSE_MISSING_TARGET_DEPENDENCIES), linkerResponseFilePath: linkerResponseFilePath, linkerResponseFileFormat: cbc.scope.evaluate(BuiltinMacros.LINKER_RESPONSE_FILE_FORMAT), dependencyFilteringRootPath: cbc.producer.sdk?.path, verifyScannerDependencies: verifyScannerDependencies, scannerDiagnosticsOutputPath: scannerDiagnosticsOutputPath, diagnosticAttachmentInfo: diagnosticAttachmentInfo)
+            return SwiftDriverPayload(uniqueID: uniqueID, compilerLocation: compilerLocation, moduleName: scope.evaluate(BuiltinMacros.SWIFT_MODULE_NAME), outputPrefix: scope.evaluate(BuiltinMacros.TARGET_NAME) + compilationMode.moduleBaseNameSuffix, tempDirPath: tempDirPath, explicitModulesTempDirPath: explicitModulesTempDirPath, variant: variant, architecture: arch, cohortArchitectures: cohortArchs, eagerCompilationEnabled: eagerCompilationEnabled(args: args, scope: scope, compilationMode: compilationMode, isUsingWholeModuleOptimization: isUsingWholeModuleOptimization), explicitModulesEnabled: explicitModuleBuildEnabled, commandLine: commandLine, ruleInfo: ruleInfo, isUsingWholeModuleOptimization: isUsingWholeModuleOptimization, casOptions: casOptions, acceleratorCachePolicy: acceleratorCachePolicy, reportRequiredTargetDependencies: scope.evaluate(BuiltinMacros.DIAGNOSE_MISSING_TARGET_DEPENDENCIES), linkerResponseFilePath: linkerResponseFilePath, linkerResponseFileFormat: cbc.scope.evaluate(BuiltinMacros.LINKER_RESPONSE_FILE_FORMAT), dependencyFilteringRootPath: cbc.producer.sdk?.path, verifyScannerDependencies: verifyScannerDependencies, scannerDiagnosticsOutputPath: scannerDiagnosticsOutputPath, diagnosticAttachmentInfo: diagnosticAttachmentInfo)
         }
 
         func constructSwiftResponseFileTask(path: Path) {

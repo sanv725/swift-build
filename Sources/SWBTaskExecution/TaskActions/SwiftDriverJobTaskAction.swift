@@ -17,6 +17,205 @@ public import SWBUtil
 public import SWBLLBuild
 import SWBProtocol
 
+package struct SwiftCacheCachedOutput: Sendable, Equatable {
+    package let kindName: String
+    package let isMaterialized: Bool
+
+    package init(kindName: String, isMaterialized: Bool) {
+        self.kindName = kindName
+        self.isMaterialized = isMaterialized
+    }
+}
+
+package struct SwiftCacheReplayStreams: Sendable, Equatable {
+    package let standardOutput: String
+    package let standardError: String
+
+    package init(standardOutput: String, standardError: String) {
+        self.standardOutput = standardOutput
+        self.standardError = standardError
+    }
+}
+
+/// The narrow adapter used by accelerator observe/verify. It keeps opaque
+/// Swift Driver CAS wrapper types out of state-machine tests.
+package protocol SwiftCacheOperations {
+    associatedtype Compilation
+    associatedtype ReplayInstance
+
+    func queryLocalCacheKey(_ key: String) throws -> Compilation?
+    func cachedOutputs(for compilation: Compilation) throws -> [SwiftCacheCachedOutput]
+    func createReplayInstance(commandLine: [String]) throws -> ReplayInstance
+    func replayCompilation(_ compilation: Compilation, using instance: ReplayInstance) throws -> SwiftCacheReplayStreams
+}
+
+package struct SwiftCASCacheOperations: SwiftCacheOperations {
+    package let databases: SwiftCASDatabases
+
+    package init(databases: SwiftCASDatabases) {
+        self.databases = databases
+    }
+
+    package func queryLocalCacheKey(_ key: String) throws -> SwiftCachedCompilation? {
+        try databases.queryLocalCacheKey(key)
+    }
+
+    package func cachedOutputs(for compilation: SwiftCachedCompilation) throws -> [SwiftCacheCachedOutput] {
+        try compilation.getOutputs().map {
+            SwiftCacheCachedOutput(kindName: $0.kindName, isMaterialized: $0.isMaterialized)
+        }
+    }
+
+    package func createReplayInstance(commandLine: [String]) throws -> SwiftCacheReplayInstance {
+        try databases.createReplayInstance(cmd: commandLine)
+    }
+
+    package func replayCompilation(_ compilation: SwiftCachedCompilation, using instance: SwiftCacheReplayInstance) throws -> SwiftCacheReplayStreams {
+        let result = try databases.replayCompilation(instance: instance, compilation: compilation)
+        return try SwiftCacheReplayStreams(standardOutput: result.getStdOut(), standardError: result.getStdErr())
+    }
+}
+
+package enum SwiftCacheProbeMissReason: Sendable, Equatable {
+    case missingKey
+    case nonMaterializedOutput
+}
+
+package enum SwiftCacheProbeResult<Compilation> {
+    case hit(compilations: [Compilation], outputCount: Int)
+    case miss(SwiftCacheProbeMissReason)
+}
+
+package struct SwiftCacheOutputManifest: Sendable, Equatable {
+    package struct Entry: Sendable, Equatable {
+        package let ordinal: Int
+        package let byteCount: Int64
+        package let digest: ByteString
+
+        package init(ordinal: Int, byteCount: Int64, digest: ByteString) {
+            self.ordinal = ordinal
+            self.byteCount = byteCount
+            self.digest = digest
+        }
+    }
+
+    package let entries: [Entry]
+
+    package var totalBytes: Int64 {
+        entries.reduce(0) { $0 + $1.byteCount }
+    }
+
+    package init(entries: [Entry]) {
+        self.entries = entries
+    }
+
+    package func mismatchCount(comparedTo other: Self) -> Int {
+        let sharedMismatchCount = zip(entries, other.entries).reduce(into: 0) {
+            if $1.0 != $1.1 { $0 += 1 }
+        }
+        return sharedMismatchCount + abs(entries.count - other.entries.count)
+    }
+}
+
+package enum SwiftCacheOutputError: Error, Sendable, Equatable {
+    case missingOutput
+    case unsupportedOutput
+    case scrubFailed
+}
+
+package enum SwiftAcceleratorCachePreparationOutcome: Sendable, Equatable {
+    case unavailable
+    case cancelled
+    case miss
+    case wouldHit
+    case verificationReady
+    case queryError
+    case replayError
+    case manifestError
+    case scrubFailure
+
+    package var shouldExecuteFrontend: Bool {
+        self != .scrubFailure && self != .cancelled
+    }
+}
+
+package struct SwiftAcceleratorCachePreparation: Sendable, Equatable {
+    package let outcome: SwiftAcceleratorCachePreparationOutcome
+    package let lookupDurationNS: UInt64
+    package let replayDurationNS: UInt64?
+    package let manifestDurationNS: UInt64?
+    package let scrubDurationNS: UInt64?
+    package let scrubSucceeded: Bool?
+    package let cachedOutputCount: Int?
+    package let shadowManifest: SwiftCacheOutputManifest?
+
+    package init(
+        outcome: SwiftAcceleratorCachePreparationOutcome,
+        lookupDurationNS: UInt64,
+        replayDurationNS: UInt64? = nil,
+        manifestDurationNS: UInt64? = nil,
+        scrubDurationNS: UInt64? = nil,
+        scrubSucceeded: Bool? = nil,
+        cachedOutputCount: Int? = nil,
+        shadowManifest: SwiftCacheOutputManifest? = nil
+    ) {
+        self.outcome = outcome
+        self.lookupDurationNS = lookupDurationNS
+        self.replayDurationNS = replayDurationNS
+        self.manifestDurationNS = manifestDurationNS
+        self.scrubDurationNS = scrubDurationNS
+        self.scrubSucceeded = scrubSucceeded
+        self.cachedOutputCount = cachedOutputCount
+        self.shadowManifest = shadowManifest
+    }
+}
+
+package struct SwiftAcceleratorCacheComparison: Sendable, Equatable {
+    package let freshManifest: SwiftCacheOutputManifest?
+    package let mismatchCount: Int
+    package let comparedBytes: UInt64
+    package let durationNS: UInt64
+
+    package var isMatch: Bool {
+        freshManifest != nil && mismatchCount == 0
+    }
+}
+
+private enum AcceleratorCacheControlFlow: Error {
+    case fallback
+}
+
+private extension TaskCacheObservation.ExclusionReason {
+    init(_ reason: SwiftBuildAcceleratorCacheExclusionReason) {
+        switch reason {
+        case .unsupportedXcode: self = .unsupportedXcode
+        case .unsupportedHostArchitecture: self = .unsupportedHostArchitecture
+        case .unsupportedConfiguration: self = .unsupportedConfiguration
+        case .unsupportedPlatform: self = .unsupportedPlatform
+        case .unsupportedArchitecture: self = .unsupportedArchitecture
+        case .unsupportedAction: self = .unsupportedAction
+        case .unsupportedCompilationMode: self = .unsupportedCompilationMode
+        case .wholeModuleOptimization: self = .wholeModuleOptimization
+        case .indexing: self = .indexing
+        case .previews: self = .previews
+        case .mixedLanguageSources: self = .mixedLanguageSources
+        case .bridgingHeader: self = .bridgingHeader
+        case .customBuildRule: self = .customBuildRule
+        case .runScript: self = .runScript
+        case .macroPlugin: self = .macroPlugin
+        case .integratedDriverDisabled: self = .integratedDriverDisabled
+        case .explicitModulesDisabled: self = .explicitModulesDisabled
+        case .toolchainUnsupported: self = .toolchainUnsupported
+        case .cachePluginEnabled: self = .cachePluginEnabled
+        case .remoteCacheEnabled: self = .remoteCacheEnabled
+        case .cacheUnavailable: self = .cacheUnavailable
+        case .emptyCacheKeys: self = .emptyCacheKeys
+        case .missingOutputs: self = .missingOutputs
+        case .unsupportedOutput: self = .unsupportedOutput
+        }
+    }
+}
+
 public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTaskAction {
     public override class var toolIdentifier: String {
         "swift-driver-job-execution"
@@ -205,7 +404,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                                             plannedJob: LibSwiftDriver.PlannedBuild.PlannedSwiftDriverJob,
                                             identifier: String?,
                                             compilerLocation: LibSwiftDriver.CompilerLocation,
-                                            casOptions: CASOptions?) -> DynamicTaskKey {
+                                            casOptions: CASOptions?,
+                                            acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy) -> DynamicTaskKey {
         let key: DynamicTaskKey
         if plannedJob.driverJob.categorizer.isExplicitDependencyBuild {
             key = .swiftDriverExplicitDependencyJob(SwiftDriverExplicitDependencyJobTaskKey(
@@ -213,7 +413,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 driverJobKey: plannedJob.key,
                 driverJobSignature: plannedJob.signature,
                 compilerLocation: compilerLocation,
-                casOptions: casOptions))
+                casOptions: casOptions,
+                acceleratorCachePolicy: acceleratorCachePolicy))
         } else {
             guard let variant else {
                 fatalError("Expected variant for non-explicit-module job: \(plannedJob.driverJob.descriptionForLifecycle)")
@@ -229,7 +430,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 driverJobSignature: plannedJob.signature,
                 isUsingWholeModuleOptimization: isUsingWholeModuleOptimization,
                 compilerLocation: compilerLocation,
-                casOptions: casOptions))
+                casOptions: casOptions,
+                acceleratorCachePolicy: acceleratorCachePolicy))
         }
         return key
     }
@@ -267,7 +469,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                                                         plannedJob: dependency,
                                                         identifier: jobID,
                                                         compilerLocation: payload.compilerLocation,
-                                                        casOptions: payload.casOptions)
+                                                        casOptions: payload.casOptions,
+                                                        acceleratorCachePolicy: payload.acceleratorCachePolicy)
                 let taskID = jobTaskIDBase + UInt(index)
                 state.openDependencies.insert(taskID)
                 dynamicExecutionDelegate.requestDynamicTask(
@@ -497,38 +700,256 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
 
             let delegate = OutputCapturingDelegate(plannedBuild: plannedBuild, driverJob: driverJob, arguments: options.commandLine, environment: environment, outputDelegate: outputDelegate)
 
-            let cas: SwiftCASDatabases?
-            if let casOpts = payload.casOptions {
-                let swiftModuleDependencyGraph = dynamicExecutionDelegate.operationContext.swiftModuleDependencyGraph
-                cas = try swiftModuleDependencyGraph.getCASDatabases(casOptions: casOpts, compilerLocation: payload.compilerLocation)
+            let acceleratorPolicy = payload.acceleratorCachePolicy
+            let cacheKeys = driverJob.driverJob.cacheKeys
+            let plannedOutputs = driverJob.driverJob.outputs
+            let observationMode: TaskCacheObservation.Mode = switch acceleratorPolicy.mode {
+            case .stock: .stock
+            case .observe: .observe
+            case .verify: .verify
+            case .trust: .trust
+            }
+            var observationEligibility: TaskCacheObservation.Eligibility = acceleratorPolicy.eligibility == .eligible ? .eligible : .ineligible
+            var observationExclusionReason: TaskCacheObservation.ExclusionReason?
+            if case .excluded(let reason) = acceleratorPolicy.eligibility {
+                observationExclusionReason = .init(reason)
+            }
+            var observationOutcome: TaskCacheObservation.Outcome = observationExclusionReason == nil ? .miss : .excluded
+            var observationFallback: TaskCacheObservation.FallbackReason?
+            var lookupDurationNS: UInt64?
+            var materializationDurationNS: UInt64?
+            var verificationDurationNS: UInt64?
+            var scrubDurationNS: UInt64?
+            var compilerDurationNS: UInt64?
+            var scrubOutcome: TaskCacheObservation.ScrubOutcome = .notRun
+            var observedOutputCount: Int?
+            var observedOutputBytes: UInt64?
+            var mismatchCount: Int?
+            var comparedBytes: UInt64?
+            var finalDisposition: TaskCacheObservation.FinalDisposition = .executed
+            var shadowManifest: SwiftCacheOutputManifest?
 
-                let casKey = ClangCachingPruneDataTaskKey(
-                    path: payload.compilerLocation.compilerOrLibraryPath,
-                    casOptions: casOpts
-                )
-                dynamicExecutionDelegate.operationContext.compilationCachingDataPruner.pruneCAS(
-                    cas!,
-                    key: casKey,
-                    activityReporter: dynamicExecutionDelegate,
-                    fileSystem: executionDelegate.fs
-                )
+            defer {
+                if acceleratorPolicy.mode.isAcceleratorEnabled {
+                    outputDelegate.recordCacheObservation(.init(
+                        cacheKeys: cacheKeys,
+                        mode: observationMode,
+                        eligibility: observationEligibility,
+                        exclusionReason: observationExclusionReason,
+                        outcome: observationOutcome,
+                        lookupDurationNS: lookupDurationNS,
+                        materializationDurationNS: materializationDurationNS,
+                        verificationDurationNS: verificationDurationNS,
+                        scrubDurationNS: scrubDurationNS,
+                        compilerDurationNS: compilerDurationNS,
+                        scrubOutcome: scrubOutcome,
+                        outputCount: observedOutputCount,
+                        outputBytes: observedOutputBytes,
+                        mismatchCount: mismatchCount,
+                        comparedBytes: comparedBytes,
+                        fallbackReason: observationFallback,
+                        finalDisposition: finalDisposition
+                    ))
+                }
+            }
+
+            var cas: SwiftCASDatabases?
+            if Self.usesStockCacheReplayPath(mode: acceleratorPolicy.mode) {
+                // Keep the upstream cache creation, pruning, replay, counters, and
+                // diagnostics path unchanged when the accelerator is disabled.
+                if let casOpts = payload.casOptions {
+                    let swiftModuleDependencyGraph = dynamicExecutionDelegate.operationContext.swiftModuleDependencyGraph
+                    cas = try swiftModuleDependencyGraph.getCASDatabases(casOptions: casOpts, compilerLocation: payload.compilerLocation)
+
+                    let casKey = ClangCachingPruneDataTaskKey(
+                        path: payload.compilerLocation.compilerOrLibraryPath,
+                        casOptions: casOpts
+                    )
+                    dynamicExecutionDelegate.operationContext.compilationCachingDataPruner.pruneCAS(
+                        cas!,
+                        key: casKey,
+                        activityReporter: dynamicExecutionDelegate,
+                        fileSystem: executionDelegate.fs
+                    )
+                } else {
+                    cas = nil
+                }
+
+                if let db = cas,
+                   let casOpts = payload.casOptions,
+                   try await Self.replayCachedCommand(cas: db,
+                                                      plannedJob: driverJob,
+                                                      commandLine: options.commandLine,
+                                                      dynamicExecutionDelegate: dynamicExecutionDelegate,
+                                                      outputDelegate: outputDelegate,
+                                                      casOptions: casOpts,
+                                                      reportCacheKeys: executionDelegate.enableTaskCacheKeyReporting) {
+                        return .succeeded
+                }
+            } else if !acceleratorPolicy.shouldProbe {
+                observationEligibility = .ineligible
+                observationOutcome = .excluded
+            } else if acceleratorPolicy.mode == .verify,
+                      Self.hasSharedObjectiveCHeaderOutput(commandLine: options.commandLine, plannedOutputs: plannedOutputs) {
+                observationEligibility = .ineligible
+                observationExclusionReason = .unsupportedOutput
+                observationOutcome = .excluded
+            } else if cacheKeys.isEmpty {
+                observationEligibility = .ineligible
+                observationExclusionReason = .emptyCacheKeys
+                observationOutcome = .excluded
+            } else if plannedOutputs.isEmpty {
+                observationEligibility = .ineligible
+                observationExclusionReason = .missingOutputs
+                observationOutcome = .excluded
             } else {
-                cas = nil
+                do {
+                    try Self.validateOutputDestinations(plannedOutputs, fs: executionDelegate.fs)
+                } catch {
+                    observationEligibility = .ineligible
+                    observationExclusionReason = .unsupportedOutput
+                    observationOutcome = .excluded
+                }
+
+                if observationEligibility == .eligible {
+                    do {
+                        guard let casOpts = payload.casOptions else {
+                            observationOutcome = .unavailable
+                            observationFallback = .noCAS
+                            throw AcceleratorCacheControlFlow.fallback
+                        }
+                        let swiftModuleDependencyGraph = dynamicExecutionDelegate.operationContext.swiftModuleDependencyGraph
+                        guard let database = try swiftModuleDependencyGraph.getCASDatabases(casOptions: casOpts, compilerLocation: payload.compilerLocation) else {
+                            observationOutcome = .unavailable
+                            observationFallback = .noCAS
+                            if casOpts.enableStrictCASErrors {
+                                throw StubError.error("Swift accelerator cache is unavailable under strict CAS policy")
+                            }
+                            throw AcceleratorCacheControlFlow.fallback
+                        }
+                        cas = database
+
+                        let casKey = ClangCachingPruneDataTaskKey(
+                            path: payload.compilerLocation.compilerOrLibraryPath,
+                            casOptions: casOpts
+                        )
+                        dynamicExecutionDelegate.operationContext.compilationCachingDataPruner.pruneCAS(
+                            database,
+                            key: casKey,
+                            activityReporter: dynamicExecutionDelegate,
+                            fileSystem: executionDelegate.fs
+                        )
+
+                        let preparation = Self.prepareAcceleratorCache(
+                            mode: acceleratorPolicy.mode,
+                            operations: SwiftCASCacheOperations(databases: database),
+                            cacheKeys: cacheKeys,
+                            plannedOutputs: plannedOutputs,
+                            commandLine: options.commandLine,
+                            fs: executionDelegate.fs,
+                            isCancelled: { _Concurrency.Task<Never, Never>.isCancelled }
+                        )
+                        lookupDurationNS = preparation.lookupDurationNS
+                        materializationDurationNS = preparation.replayDurationNS
+                        verificationDurationNS = preparation.manifestDurationNS
+                        scrubDurationNS = preparation.scrubDurationNS
+                        observedOutputCount = preparation.shadowManifest?.entries.count ?? preparation.cachedOutputCount
+                        if let totalBytes = preparation.shadowManifest?.totalBytes {
+                            observedOutputBytes = UInt64(totalBytes)
+                        }
+                        if let scrubSucceeded = preparation.scrubSucceeded {
+                            scrubOutcome = scrubSucceeded ? .succeeded : .failed
+                        }
+
+                        switch preparation.outcome {
+                        case .unavailable:
+                            observationOutcome = .unavailable
+                            observationFallback = .noCAS
+                        case .cancelled:
+                            observationOutcome = .cancelled
+                        case .miss:
+                            observationOutcome = .miss
+                        case .wouldHit:
+                            observationOutcome = .wouldHit
+                        case .verificationReady:
+                            observationOutcome = .wouldHit
+                            shadowManifest = preparation.shadowManifest
+                        case .queryError:
+                            observationOutcome = .cacheError
+                            observationFallback = .queryError
+                        case .replayError:
+                            observationOutcome = .cacheError
+                            observationFallback = .replayError
+                        case .manifestError:
+                            observationOutcome = .cacheError
+                            observationFallback = .manifestError
+                        case .scrubFailure:
+                            observationOutcome = .cacheError
+                            observationFallback = .scrubFailure
+                        }
+
+                        if Self.cachePreparationIsFatal(preparation.outcome, strictCASErrors: casOpts.enableStrictCASErrors) {
+                            if preparation.outcome == .scrubFailure {
+                                outputDelegate.error("Swift accelerator cache replay outputs could not be scrubbed safely")
+                            } else {
+                                outputDelegate.error("Swift accelerator cache operation failed under strict CAS policy")
+                            }
+                            return .failed
+                        }
+                        if preparation.outcome == .cancelled {
+                            return .cancelled
+                        }
+                    } catch AcceleratorCacheControlFlow.fallback {
+                        // Cache-only failures are deliberately handled by the fresh
+                        // compiler execution below.
+                    } catch {
+                        observationOutcome = .unavailable
+                        observationFallback = .noCAS
+                        if payload.casOptions?.enableStrictCASErrors == true {
+                            throw error
+                        }
+                    }
+                }
             }
 
-            if let db = cas,
-               let casOpts = payload.casOptions,
-               try await Self.replayCachedCommand(cas: db,
-                                                  plannedJob: driverJob,
-                                                  commandLine: options.commandLine,
-                                                  dynamicExecutionDelegate: dynamicExecutionDelegate,
-                                                  outputDelegate: outputDelegate,
-                                                  casOptions: casOpts,
-                                                  reportCacheKeys: executionDelegate.enableTaskCacheKeyReporting) {
-                    return .succeeded
+            // Accelerator modes promise that the fresh frontend is authoritative.
+            // Honor cancellation at the final boundary after any shadow outputs
+            // have been scrubbed, without changing the upstream stock path.
+            if acceleratorPolicy.mode.isAcceleratorEnabled,
+               _Concurrency.Task<Never, Never>.isCancelled {
+                observationOutcome = .cancelled
+                return .cancelled
             }
 
-            try await spawn(commandLine: options.commandLine, environment: environment, workingDirectory: task.workingDirectory, dynamicExecutionDelegate: dynamicExecutionDelegate, clientDelegate: clientDelegate, processDelegate: delegate)
+            let compilerTimer = ElapsedTimer()
+            do {
+                try await spawn(commandLine: options.commandLine, environment: environment, workingDirectory: task.workingDirectory, dynamicExecutionDelegate: dynamicExecutionDelegate, clientDelegate: clientDelegate, processDelegate: delegate)
+                compilerDurationNS = compilerTimer.elapsedTime().nanoseconds
+            } catch {
+                compilerDurationNS = compilerTimer.elapsedTime().nanoseconds
+                throw error
+            }
+
+            if delegate.commandResult == .succeeded, let shadowManifest {
+                finalDisposition = .verifiedThenExecuted
+                let comparison = Self.compareFreshOutputs(shadowManifest: shadowManifest, plannedOutputs: plannedOutputs, fs: executionDelegate.fs)
+                verificationDurationNS = (verificationDurationNS ?? 0) + comparison.durationNS
+                mismatchCount = comparison.mismatchCount
+                comparedBytes = comparison.comparedBytes
+                if let freshManifest = comparison.freshManifest {
+                    observedOutputCount = freshManifest.entries.count
+                    observedOutputBytes = UInt64(freshManifest.totalBytes)
+                }
+                if comparison.isMatch {
+                    observationOutcome = .verifyMatch
+                } else {
+                    observationOutcome = .verifyMismatch
+                    observationFallback = comparison.freshManifest == nil ? .manifestError : .mismatch
+                    outputDelegate.warning("Swift accelerator cache verification found \(comparison.mismatchCount) output mismatch(es); fresh compiler outputs were retained")
+                }
+            } else if delegate.commandResult == .cancelled {
+                observationOutcome = .cancelled
+            }
 
             // Generate crash reproducoer.
             if delegate.wasSignaled {
@@ -598,6 +1019,283 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             showEnvironment: false,
             reason: .wasCompilationCachingQuery)
         return true
+    }
+
+    package static func probeCache<Operations: SwiftCacheOperations>(
+        operations: Operations,
+        cacheKeys: [String],
+        isCancelled: () -> Bool = { false }
+    ) throws -> SwiftCacheProbeResult<Operations.Compilation> {
+        guard !cacheKeys.isEmpty else {
+            return .miss(.missingKey)
+        }
+
+        var compilations: [Operations.Compilation] = []
+        var outputCount = 0
+        compilations.reserveCapacity(cacheKeys.count)
+        for cacheKey in cacheKeys {
+            if isCancelled() { throw CancellationError() }
+            guard let compilation = try operations.queryLocalCacheKey(cacheKey) else {
+                return .miss(.missingKey)
+            }
+            let outputs = try operations.cachedOutputs(for: compilation)
+            guard !outputs.isEmpty, outputs.allSatisfy(\.isMaterialized) else {
+                return .miss(.nonMaterializedOutput)
+            }
+            outputCount += outputs.count
+            compilations.append(compilation)
+        }
+        return .hit(compilations: compilations, outputCount: outputCount)
+    }
+
+    /// Replays in compiler-key order and intentionally discards cached streams.
+    /// Fresh compiler execution remains the only user-visible diagnostic source.
+    package static func replayCache<Operations: SwiftCacheOperations>(
+        operations: Operations,
+        compilations: [Operations.Compilation],
+        commandLine: [String],
+        isCancelled: () -> Bool = { false }
+    ) throws {
+        let instance = try operations.createReplayInstance(commandLine: Array(commandLine.dropFirst()))
+        for compilation in compilations {
+            if isCancelled() { throw CancellationError() }
+            _ = try operations.replayCompilation(compilation, using: instance)
+        }
+    }
+
+    package static func validateOutputDestinations(_ paths: [Path], fs: any FSProxy) throws {
+        guard !paths.isEmpty, Set(paths).count == paths.count, paths.allSatisfy(\.isAbsolute) else {
+            throw SwiftCacheOutputError.unsupportedOutput
+        }
+        for path in paths where fs.exists(path) || isSymlink(path, fs: fs) {
+            guard !isSymlink(path, fs: fs), try fs.getFileInfo(path).isFile else {
+                throw SwiftCacheOutputError.unsupportedOutput
+            }
+        }
+    }
+
+    /// Generated Objective-C headers may be shared by multiple Swift driver
+    /// jobs. Verify mode must not replay or scrub such an output.
+    package static func hasSharedObjectiveCHeaderOutput(
+        commandLine: [String],
+        plannedOutputs: [Path]
+    ) -> Bool {
+        guard commandLine.count > 1 else { return false }
+        let outputSet = Set(plannedOutputs)
+        for index in commandLine.indices.dropLast() where commandLine[index] == "-emit-objc-header-path" {
+            let path = Path(commandLine[commandLine.index(after: index)])
+            if path.isAbsolute, outputSet.contains(path) {
+                return true
+            }
+        }
+        return false
+    }
+
+    package static func makeOutputManifest(_ paths: [Path], fs: any FSProxy) throws -> SwiftCacheOutputManifest {
+        var entries: [SwiftCacheOutputManifest.Entry] = []
+        entries.reserveCapacity(paths.count)
+        for (ordinal, path) in paths.enumerated() {
+            guard fs.exists(path) else {
+                throw SwiftCacheOutputError.missingOutput
+            }
+            guard !isSymlink(path, fs: fs), try fs.getFileInfo(path).isFile else {
+                throw SwiftCacheOutputError.unsupportedOutput
+            }
+            let bytes = try fs.read(path)
+            let hash = SHA256Context()
+            hash.add(bytes: bytes)
+            entries.append(.init(ordinal: ordinal, byteCount: Int64(bytes.count), digest: hash.signature))
+        }
+        return SwiftCacheOutputManifest(entries: entries)
+    }
+
+    /// Scrubs the complete planned output list, including outputs that replay did
+    /// not report writing. A failed removal is a correctness failure, not fallback.
+    package static func scrubOutputs(_ paths: [Path], fs: any FSProxy) throws {
+        var failed = false
+        for path in paths where fs.exists(path) || isSymlink(path, fs: fs) {
+            do {
+                try fs.remove(path)
+            } catch {
+                failed = true
+                continue
+            }
+            if fs.exists(path) || isSymlink(path, fs: fs) {
+                failed = true
+            }
+        }
+        if failed {
+            throw SwiftCacheOutputError.scrubFailed
+        }
+    }
+
+    package static func prepareAcceleratorCache<Operations: SwiftCacheOperations>(
+        mode: SwiftBuildAcceleratorCacheMode,
+        operations: Operations,
+        cacheKeys: [String],
+        plannedOutputs: [Path],
+        commandLine: [String],
+        fs: any FSProxy,
+        isCancelled: () -> Bool = { false }
+    ) -> SwiftAcceleratorCachePreparation {
+        if isCancelled() {
+            return .init(outcome: .cancelled, lookupDurationNS: 0)
+        }
+        let lookupTimer = ElapsedTimer()
+        let probe: SwiftCacheProbeResult<Operations.Compilation>
+        do {
+            probe = try probeCache(operations: operations, cacheKeys: cacheKeys, isCancelled: isCancelled)
+        } catch is CancellationError {
+            return .init(outcome: .cancelled, lookupDurationNS: lookupTimer.elapsedTime().nanoseconds)
+        } catch {
+            return .init(outcome: .queryError, lookupDurationNS: lookupTimer.elapsedTime().nanoseconds)
+        }
+        let lookupDurationNS = lookupTimer.elapsedTime().nanoseconds
+        if isCancelled() {
+            return .init(outcome: .cancelled, lookupDurationNS: lookupDurationNS)
+        }
+
+        switch probe {
+        case .miss:
+            return .init(outcome: .miss, lookupDurationNS: lookupDurationNS)
+        case .hit(_, let outputCount) where mode == .observe:
+            return .init(outcome: .wouldHit, lookupDurationNS: lookupDurationNS, cachedOutputCount: outputCount)
+        case .hit(let compilations, let outputCount):
+            // Remove every valid preexisting output before replay. Otherwise an
+            // incomplete replay could make a stale file look like a cache hit.
+            let preScrubTimer = ElapsedTimer()
+            do {
+                try scrubOutputs(plannedOutputs, fs: fs)
+            } catch {
+                return .init(
+                    outcome: .scrubFailure,
+                    lookupDurationNS: lookupDurationNS,
+                    scrubDurationNS: preScrubTimer.elapsedTime().nanoseconds,
+                    scrubSucceeded: false,
+                    cachedOutputCount: outputCount
+                )
+            }
+            var totalScrubDurationNS = preScrubTimer.elapsedTime().nanoseconds
+            if isCancelled() {
+                return .init(
+                    outcome: .cancelled,
+                    lookupDurationNS: lookupDurationNS,
+                    scrubDurationNS: totalScrubDurationNS,
+                    scrubSucceeded: true,
+                    cachedOutputCount: outputCount
+                )
+            }
+
+            var outcome: SwiftAcceleratorCachePreparationOutcome = .verificationReady
+            var shadowManifest: SwiftCacheOutputManifest?
+            let replayTimer = ElapsedTimer()
+            do {
+                try replayCache(operations: operations, compilations: compilations, commandLine: commandLine, isCancelled: isCancelled)
+            } catch is CancellationError {
+                outcome = .cancelled
+            } catch {
+                outcome = .replayError
+            }
+            let replayDurationNS = replayTimer.elapsedTime().nanoseconds
+
+            var manifestDurationNS: UInt64?
+            if outcome == .verificationReady && !isCancelled() {
+                let manifestTimer = ElapsedTimer()
+                do {
+                    shadowManifest = try makeOutputManifest(plannedOutputs, fs: fs)
+                } catch {
+                    outcome = .manifestError
+                }
+                manifestDurationNS = manifestTimer.elapsedTime().nanoseconds
+                if isCancelled() {
+                    outcome = .cancelled
+                    shadowManifest = nil
+                }
+            } else if outcome == .verificationReady {
+                outcome = .cancelled
+            }
+
+            let scrubTimer = ElapsedTimer()
+            do {
+                try scrubOutputs(plannedOutputs, fs: fs)
+            } catch {
+                totalScrubDurationNS += scrubTimer.elapsedTime().nanoseconds
+                return .init(
+                    outcome: .scrubFailure,
+                    lookupDurationNS: lookupDurationNS,
+                    replayDurationNS: replayDurationNS,
+                    manifestDurationNS: manifestDurationNS,
+                    scrubDurationNS: totalScrubDurationNS,
+                    scrubSucceeded: false,
+                    cachedOutputCount: outputCount,
+                    shadowManifest: nil
+                )
+            }
+            totalScrubDurationNS += scrubTimer.elapsedTime().nanoseconds
+            return .init(
+                outcome: outcome,
+                lookupDurationNS: lookupDurationNS,
+                replayDurationNS: replayDurationNS,
+                manifestDurationNS: manifestDurationNS,
+                scrubDurationNS: totalScrubDurationNS,
+                scrubSucceeded: true,
+                cachedOutputCount: outputCount,
+                shadowManifest: shadowManifest
+            )
+        }
+    }
+
+    package static func compareFreshOutputs(
+        shadowManifest: SwiftCacheOutputManifest,
+        plannedOutputs: [Path],
+        fs: any FSProxy
+    ) -> SwiftAcceleratorCacheComparison {
+        let timer = ElapsedTimer()
+        do {
+            let freshManifest = try makeOutputManifest(plannedOutputs, fs: fs)
+            return .init(
+                freshManifest: freshManifest,
+                mismatchCount: shadowManifest.mismatchCount(comparedTo: freshManifest),
+                comparedBytes: UInt64(min(shadowManifest.totalBytes, freshManifest.totalBytes)),
+                durationNS: timer.elapsedTime().nanoseconds
+            )
+        } catch {
+            return .init(
+                freshManifest: nil,
+                mismatchCount: max(1, plannedOutputs.count),
+                comparedBytes: 0,
+                durationNS: timer.elapsedTime().nanoseconds
+            )
+        }
+    }
+
+    package static func cachePreparationIsFatal(
+        _ outcome: SwiftAcceleratorCachePreparationOutcome,
+        strictCASErrors: Bool
+    ) -> Bool {
+        if outcome == .scrubFailure {
+            return true
+        }
+        guard strictCASErrors else {
+            return false
+        }
+        switch outcome {
+        case .unavailable, .queryError, .replayError, .manifestError:
+            return true
+        case .cancelled, .miss, .wouldHit, .verificationReady, .scrubFailure:
+            return false
+        }
+    }
+
+    /// Upstream replay is reserved for stock mode. Observe and verify always
+    /// reach the authoritative frontend, including when policy-excluded.
+    package static func usesStockCacheReplayPath(mode: SwiftBuildAcceleratorCacheMode) -> Bool {
+        mode == .stock
+    }
+
+    private static func isSymlink(_ path: Path, fs: any FSProxy) -> Bool {
+        var destinationExists = false
+        return fs.isSymlink(path, &destinationExists)
     }
 
     /// Attempts to replay a previously cached compilation, using data from the local CAS.

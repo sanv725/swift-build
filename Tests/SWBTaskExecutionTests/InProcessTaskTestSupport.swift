@@ -70,7 +70,7 @@ struct MockTaskExecutionClientDelegate: TaskExecutionClientDelegate {
     }
 }
 
-final class MockTaskOutputDelegate: TaskOutputDelegate {
+final class MockTaskOutputDelegate: TaskOutputDelegate, TaskCacheObservationSink {
     var result: SWBCore.TaskResult?
 
     let startTime = Date()
@@ -108,6 +108,7 @@ final class MockTaskOutputDelegate: TaskOutputDelegate {
         let text = OutputByteStream()
         fileprivate(set) var upToDateSubtasks: [any ExecutableTask] = []
         fileprivate(set) var cacheKeys: [(cacheKey: String, source: BuildOperationTaskCacheKeyEmitted.Source, casOptions: CASOptions)] = []
+        fileprivate(set) var cacheObservations: [TaskCacheObservation] = []
         fileprivate(set) var result: TaskResult? = nil
 
         mutating func emitError(_ message: String) {
@@ -157,6 +158,14 @@ final class MockTaskOutputDelegate: TaskOutputDelegate {
 
     var cacheKeys: [(cacheKey: String, source: BuildOperationTaskCacheKeyEmitted.Source, casOptions: CASOptions)] {
         state.state.withLock { $0.cacheKeys }
+    }
+
+    var cacheObservations: [TaskCacheObservation] {
+        state.state.withLock { $0.cacheObservations }
+    }
+
+    func recordCacheObservation(_ observation: TaskCacheObservation) {
+        state.state.withLock { $0.cacheObservations.append(observation) }
     }
 
     final class StateHolder: Sendable {

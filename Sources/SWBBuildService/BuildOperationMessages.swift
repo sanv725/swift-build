@@ -717,7 +717,7 @@ private func sendDiagnosticMessage(_ request: Request, _ diagnostic: Diagnostic,
 }
 
 /// The task output delegate, which collects the output for sending back to the service.
-private final class TaskOutputHandler: TaskOutputDelegate {
+private final class TaskOutputHandler: TaskOutputDelegate, TaskCacheObservationSink {
     private let _diagnosticsEngine = DiagnosticsEngine()
     let taskID: Int
     let taskSignature: BuildOperationTaskSignature
@@ -741,6 +741,7 @@ private final class TaskOutputHandler: TaskOutputDelegate {
 
     var counters: [BuildOperationMetrics.Counter: Int] = [:]
     var taskCounters: [BuildOperationMetrics.TaskCounter: Int] = [:]
+    private(set) var cacheObservations: [TaskCacheObservation] = []
 
     init(taskID: Int, taskSignature: BuildOperationTaskSignature, targetID: Int?, operation: any BuildSystemOperation, operationDelegate: OperationDelegate, parser: (any TaskOutputParser)?) {
         self.taskID = taskID
@@ -766,6 +767,10 @@ private final class TaskOutputHandler: TaskOutputDelegate {
 
     func incrementTaskCounter(_ counter: BuildOperationMetrics.TaskCounter, by amount: Int) {
         self.taskCounters[counter, default: 0] += amount
+    }
+
+    func recordCacheObservation(_ observation: TaskCacheObservation) {
+        cacheObservations.append(observation)
     }
 
     var diagnosticsEngine: DiagnosticProducingDelegateProtocolPrivate<DiagnosticsEngine> {
@@ -988,9 +993,10 @@ private final class TaskOutputParserHandler: TaskOutputParserDelegate {
 }
 
 /// A task output collector which simply discards any data it receives.
-private final class DiscardingTaskOutputHandler: TaskOutputDelegate {
+private final class DiscardingTaskOutputHandler: TaskOutputDelegate, TaskCacheObservationSink {
     var counters: [BuildOperationMetrics.Counter : Int] = [:]
     var taskCounters: [BuildOperationMetrics.TaskCounter : Int] = [:]
+    private(set) var cacheObservations: [TaskCacheObservation] = []
 
     private let _diagnosticsEngine = DiagnosticsEngine()
     private(set) var result: TaskResult?
@@ -1013,6 +1019,9 @@ private final class DiscardingTaskOutputHandler: TaskOutputDelegate {
     }
     func incrementCounter(_ counter: BuildOperationMetrics.Counter, by amount: Int) {}
     func incrementTaskCounter(_ counter: BuildOperationMetrics.TaskCounter, by amount: Int) {}
+    func recordCacheObservation(_ observation: TaskCacheObservation) {
+        cacheObservations.append(observation)
+    }
 }
 
 /// The build output delegate, which sends data back immediately.
@@ -1385,6 +1394,7 @@ final class OperationDelegate: BuildOperationDelegate {
     }
 
     func taskComplete(_ operation: any BuildSystemOperation, taskIdentifier: TaskIdentifier, task: any ExecutableTask, delegate taskDelegate: any TaskOutputDelegate) {
+        acceleratorTraceWriter?.cacheObservations(taskIdentifier: taskIdentifier, task: task, observations: taskDelegate.cacheObservations)
         if let delegate = taskDelegate as? TaskOutputHandler {
             let status = BuildOperationTaskEnded.Status(taskResult: delegate.result)
             acceleratorTraceWriter?.taskFinished(taskIdentifier: taskIdentifier, task: task, status: status, result: delegate.result, duration: delegate.timer.elapsedTime())

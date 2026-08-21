@@ -1169,6 +1169,7 @@ public final class BuiltinMacros {
     public static let EFFECTIVE_SWIFT_VERSION = BuiltinMacros.declareStringMacro("EFFECTIVE_SWIFT_VERSION")
     public static let SWIFT_WHOLE_MODULE_OPTIMIZATION = BuiltinMacros.declareBooleanMacro("SWIFT_WHOLE_MODULE_OPTIMIZATION")
     public static let SWIFT_ENABLE_COMPILE_CACHE = BuiltinMacros.declareBooleanMacro("SWIFT_ENABLE_COMPILE_CACHE")
+    public static let SWIFT_BUILD_ACCELERATOR_CACHE_MODE = BuiltinMacros.declareStringMacro("SWIFT_BUILD_ACCELERATOR_CACHE_MODE")
     public static let SWIFT_ENABLE_PREFIX_MAPPING = BuiltinMacros.declareBooleanMacro("SWIFT_ENABLE_PREFIX_MAPPING")
     public static let SWIFT_ENABLE_PROJECT_PREFIX_MAPPING = BuiltinMacros.declareBooleanMacro("SWIFT_ENABLE_PROJECT_PREFIX_MAPPING")
     public static let SWIFT_OTHER_PREFIX_MAPPINGS = BuiltinMacros.declareStringListMacro("SWIFT_OTHER_PREFIX_MAPPINGS")
@@ -2459,6 +2460,7 @@ public final class BuiltinMacros {
         EFFECTIVE_SWIFT_VERSION,
         SWIFT_WHOLE_MODULE_OPTIMIZATION,
         SWIFT_ENABLE_COMPILE_CACHE,
+        SWIFT_BUILD_ACCELERATOR_CACHE_MODE,
         SWIFT_ENABLE_PREFIX_MAPPING,
         SWIFT_ENABLE_PROJECT_PREFIX_MAPPING,
         SWIFT_OTHER_PREFIX_MAPPINGS,

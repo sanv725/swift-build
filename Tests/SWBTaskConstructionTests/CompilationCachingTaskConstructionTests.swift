@@ -289,4 +289,114 @@ fileprivate struct CompilationCachingTaskConstructionTests: CoreBasedTests {
             }
         }
     }
+
+    @Test(.requireSDKs(.iOS, comment: "Accelerator eligibility is intentionally limited to arm64 iOS Simulator Debug builds"))
+    func nonStrictAcceleratorCASPlanningErrorFallsBackWithoutDelegateError() async throws {
+        let testProject = try await TestProject(
+            "aProject",
+            groupTree: TestGroup("Sources", children: [TestFile("Feature.swift", fileType: "sourcecode.swift")]),
+            buildConfigurations: [
+                TestBuildConfiguration("Debug", buildSettings: [
+                    "PRODUCT_NAME": "$(TARGET_NAME)",
+                    "GENERATE_INFOPLIST_FILE": "YES",
+                    "SDKROOT": "iphonesimulator",
+                    "SUPPORTED_PLATFORMS": "iphonesimulator",
+                    "ARCHS": "arm64",
+                    "ONLY_ACTIVE_ARCH": "YES",
+                    "XCODE_VERSION_ACTUAL": "2630",
+                    "NATIVE_ARCH_ACTUAL": "arm64",
+                    "SWIFT_EXEC": swiftCompilerPath.str,
+                    "SWIFT_VERSION": swiftVersion,
+                    "SWIFT_USE_INTEGRATED_DRIVER": "YES",
+                    "SWIFT_ENABLE_EXPLICIT_MODULES": "YES",
+                    "SWIFT_ENABLE_COMPILE_CACHE": "NO",
+                    "SWIFT_BUILD_ACCELERATOR_CACHE_MODE": "observe",
+                    "COMPILATION_CACHE_ENABLE_PLUGIN": "NO",
+                    "COMPILATION_CACHE_REMOTE_SERVICE_PATH": "",
+                    "COMPILATION_CACHE_ENABLE_STRICT_CAS_ERRORS": "NO",
+                    "COMPILATION_CACHE_LIMIT_SIZE": "not-a-valid-size",
+                ]),
+            ],
+            targets: [
+                TestStandardTarget(
+                    "App",
+                    type: .application,
+                    buildConfigurations: [TestBuildConfiguration("Debug")],
+                    buildPhases: [TestSourcesBuildPhase(["Feature.swift"])],
+                    predominantSourceCodeLanguage: .swift
+                ),
+            ]
+        )
+        let tester = try await TaskConstructionTester(getCore(), TestWorkspace("aWorkspace", projects: [testProject]))
+
+        try await tester.checkBuild(runDestination: .iOSSimulator) { results in
+            results.checkWarning(.contains("Swift accelerator cache setup is unavailable; compiling without cache observation"))
+            results.checkNoErrors()
+            try results.checkTarget("App") { target in
+                try results.checkTask(.matchTarget(target), .matchRuleType("SwiftDriver Compilation")) { task in
+                    let payload = try #require((task.execTask.payload as? SwiftTaskPayload)?.driverPayload)
+                    #expect(payload.casOptions == nil)
+                    #expect(payload.acceleratorCachePolicy == .init(
+                        mode: .observe,
+                        eligibility: .excluded(.cacheUnavailable)
+                    ))
+                }
+            }
+        }
+    }
+
+    @Test(.requireSDKs(.iOS, comment: "Accelerator eligibility is intentionally limited to arm64 iOS Simulator Debug builds"))
+    func verifyExcludesGeneratedObjectiveCHeaderBeforeResponseFileLowering() async throws {
+        let testProject = try await TestProject(
+            "aProject",
+            groupTree: TestGroup("Sources", children: [TestFile("Feature.swift", fileType: "sourcecode.swift")]),
+            buildConfigurations: [
+                TestBuildConfiguration("Debug", buildSettings: [
+                    "PRODUCT_NAME": "$(TARGET_NAME)",
+                    "GENERATE_INFOPLIST_FILE": "YES",
+                    "SDKROOT": "iphonesimulator",
+                    "SUPPORTED_PLATFORMS": "iphonesimulator",
+                    "ARCHS": "arm64",
+                    "ONLY_ACTIVE_ARCH": "YES",
+                    "XCODE_VERSION_ACTUAL": "2630",
+                    "NATIVE_ARCH_ACTUAL": "arm64",
+                    "SWIFT_EXEC": swiftCompilerPath.str,
+                    "SWIFT_VERSION": swiftVersion,
+                    "SWIFT_USE_INTEGRATED_DRIVER": "YES",
+                    "SWIFT_ENABLE_EXPLICIT_MODULES": "YES",
+                    "SWIFT_ENABLE_COMPILE_CACHE": "NO",
+                    "SWIFT_BUILD_ACCELERATOR_CACHE_MODE": "verify",
+                    "SWIFT_OBJC_INTERFACE_HEADER_NAME": "App-Swift.h",
+                    "USE_SWIFT_RESPONSE_FILE": "YES",
+                    "COMPILATION_CACHE_ENABLE_PLUGIN": "NO",
+                    "COMPILATION_CACHE_REMOTE_SERVICE_PATH": "",
+                ]),
+            ],
+            targets: [
+                TestStandardTarget(
+                    "App",
+                    type: .application,
+                    buildConfigurations: [TestBuildConfiguration("Debug")],
+                    buildPhases: [TestSourcesBuildPhase(["Feature.swift"])],
+                    predominantSourceCodeLanguage: .swift
+                ),
+            ]
+        )
+        let tester = try await TaskConstructionTester(getCore(), TestWorkspace("aWorkspace", projects: [testProject]))
+
+        try await tester.checkBuild(runDestination: .iOSSimulator) { results in
+            results.checkNoErrors()
+            try results.checkTarget("App") { target in
+                try results.checkTask(.matchTarget(target), .matchRuleType("SwiftDriver Compilation")) { task in
+                    let payload = try #require((task.execTask.payload as? SwiftTaskPayload)?.driverPayload)
+                    #expect(payload.casOptions == nil)
+                    #expect(payload.acceleratorCachePolicy == .init(
+                        mode: .verify,
+                        eligibility: .excluded(.unsupportedOutput)
+                    ))
+                    #expect(task.commandLineAsStrings.contains { $0.hasPrefix("@") })
+                }
+            }
+        }
+    }
 }
