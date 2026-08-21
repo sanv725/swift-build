@@ -711,8 +711,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             targetIdentity: task.forTarget?.guid.stringValue,
             arch: arch,
             variant: variant,
-            jobKey: driverJob.key,
-            jobSignature: driverJob.signature
+            jobKey: driverJob.key
         )
         var acceleratorFaultCandidateWasProbed = false
         #endif
@@ -1504,13 +1503,14 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
     /// Returns a path-free, opaque identity for selecting one planned Swift
     /// job in a dedicated fault-injection build. The inputs are deliberately
     /// limited to stable planning identity; command lines, cache keys, and
-    /// filesystem paths are not accepted by this boundary.
+    /// filesystem paths are not accepted by this boundary. Keep this identity
+    /// stable across fresh service processes; in particular, do not add values
+    /// derived from Swift's process-seeded `hashValue`.
     package static func acceleratorFaultSelector(
         targetIdentity: String?,
         arch: String,
         variant: String?,
-        jobKey: LibSwiftDriver.JobKey,
-        jobSignature: ByteString
+        jobKey: LibSwiftDriver.JobKey
     ) -> String {
         let context = SHA256Context()
 
@@ -1522,7 +1522,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             addField(Array(value.utf8))
         }
 
-        addField("swift-build-accelerator-fault-selector-v1")
+        addField("swift-build-accelerator-fault-selector-v2")
         addField(targetIdentity ?? "explicit-dependency")
         addField(arch)
         addField(variant ?? "")
@@ -1534,7 +1534,6 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             addField("explicit")
             addField(String(index))
         }
-        addField(jobSignature.bytes)
         return String(decoding: context.signature.bytes, as: UTF8.self)
     }
     #endif

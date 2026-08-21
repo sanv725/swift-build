@@ -535,31 +535,55 @@ fileprivate struct SwiftCacheOperationsTests {
 
     @Test
     func faultSelectorIsDeterministicOpaqueAndPathFree() {
-        let signature = ByteString(encodingAsUTF8: "stable-driver-signature")
         let selector = SwiftDriverJobTaskAction.acceleratorFaultSelector(
             targetIdentity: "TARGET-GUID-/Users/private-project",
             arch: "arm64",
             variant: "normal",
-            jobKey: .targetJob(7),
-            jobSignature: signature
+            jobKey: .targetJob(7)
         )
         let repeated = SwiftDriverJobTaskAction.acceleratorFaultSelector(
             targetIdentity: "TARGET-GUID-/Users/private-project",
             arch: "arm64",
             variant: "normal",
-            jobKey: .targetJob(7),
-            jobSignature: signature
+            jobKey: .targetJob(7)
         )
         let differentJob = SwiftDriverJobTaskAction.acceleratorFaultSelector(
             targetIdentity: "TARGET-GUID-/Users/private-project",
             arch: "arm64",
             variant: "normal",
-            jobKey: .targetJob(8),
-            jobSignature: signature
+            jobKey: .targetJob(8)
+        )
+        let differentTarget = SwiftDriverJobTaskAction.acceleratorFaultSelector(
+            targetIdentity: "OTHER-TARGET-GUID",
+            arch: "arm64",
+            variant: "normal",
+            jobKey: .targetJob(7)
+        )
+        let explicitDependency = SwiftDriverJobTaskAction.acceleratorFaultSelector(
+            targetIdentity: nil,
+            arch: "arm64",
+            variant: "normal",
+            jobKey: .explicitDependencyJob(7)
+        )
+        let differentArchitecture = SwiftDriverJobTaskAction.acceleratorFaultSelector(
+            targetIdentity: "TARGET-GUID-/Users/private-project",
+            arch: "x86_64",
+            variant: "normal",
+            jobKey: .targetJob(7)
+        )
+        let differentVariant = SwiftDriverJobTaskAction.acceleratorFaultSelector(
+            targetIdentity: "TARGET-GUID-/Users/private-project",
+            arch: "arm64",
+            variant: "profile",
+            jobKey: .targetJob(7)
         )
 
         #expect(selector == repeated)
         #expect(selector != differentJob)
+        #expect(selector != differentTarget)
+        #expect(selector != explicitDependency)
+        #expect(selector != differentArchitecture)
+        #expect(selector != differentVariant)
         #expect(selector.utf8.count == 64)
         #expect(selector.utf8.allSatisfy {
             (UInt8(ascii: "0")...UInt8(ascii: "9")).contains($0)
