@@ -885,6 +885,20 @@ extension BuildOperationTaskEnded.Status {
             self = .failed
         }
     }
+
+    init(taskResult: TaskResult?) {
+        switch taskResult {
+        case let .exit(exitStatus, _):
+            self.init(exitStatus)
+        case .failedSetup:
+            self = .failed
+        case .skipped:
+            self = .succeeded
+        case nil:
+            // A task with no result after completion was cancelled.
+            self = .cancelled
+        }
+    }
 }
 
 /// An adaptor for binding custom output parsers back to the service.
@@ -979,8 +993,9 @@ private final class DiscardingTaskOutputHandler: TaskOutputDelegate {
     var taskCounters: [BuildOperationMetrics.TaskCounter : Int] = [:]
 
     private let _diagnosticsEngine = DiagnosticsEngine()
-    var result: TaskResult? { nil }
+    private(set) var result: TaskResult?
     let startTime = Date()
+    let timer = ElapsedTimer()
 
     init() {}
 
@@ -993,7 +1008,9 @@ private final class DiscardingTaskOutputHandler: TaskOutputDelegate {
     func subtaskUpToDate(_ subtask: any ExecutableTask) {}
     func previouslyBatchedSubtaskUpToDate(signature: ByteString, target: ConfiguredTarget) {}
     func emitCacheKey(_ cacheKey: String, source: BuildOperationTaskCacheKeyEmitted.Source, casOptions: CASOptions) {}
-    func updateResult(_ result: TaskResult) {}
+    func updateResult(_ result: TaskResult) {
+        self.result = result
+    }
     func incrementCounter(_ counter: BuildOperationMetrics.Counter, by amount: Int) {}
     func incrementTaskCounter(_ counter: BuildOperationMetrics.TaskCounter, by amount: Int) {}
 }
@@ -1106,8 +1123,19 @@ final class OperationDelegate: BuildOperationDelegate {
     }
 
     private var outputCollector: BuildOutputCollector?
+    private var acceleratorTraceWriter: AcceleratorTraceWriter?
 
     func buildStarted(_ operation: any BuildSystemOperation) -> any BuildOutputDelegate {
+        let acceleratorTraceWriter = AcceleratorTraceWriter.create(
+            buildID: operation.uuid,
+            activeBuildID: activeBuild.id,
+            parameters: operation.request.parameters
+        )
+        self.acceleratorTraceWriter = acceleratorTraceWriter
+        if let operation = operation as? SWBBuildSystem.BuildOperation {
+            acceleratorTraceWriter?.buildStarted(operation: operation)
+        }
+
         request.send(BuildOperationStarted(id: activeBuild.id))
         let outputCollector = BuildOutputCollector(diagnosticsDelegate: diagnosticsHandler)
         self.outputCollector = outputCollector
@@ -1131,6 +1159,7 @@ final class OperationDelegate: BuildOperationDelegate {
             }
         }
         let realStatus = status ?? taskCompletionBasedStatus
+        acceleratorTraceWriter?.buildFinished(status: realStatus, metrics: metrics)
         activeBuild.completeBuild(status: realStatus, metrics: metrics)
         return realStatus
     }
@@ -1253,6 +1282,8 @@ final class OperationDelegate: BuildOperationDelegate {
     }
 
     func taskUpToDate(_ operation: any BuildSystemOperation, taskIdentifier: TaskIdentifier, task: any ExecutableTask) {
+        acceleratorTraceWriter?.taskUpToDate(taskIdentifier: taskIdentifier, task: task, reason: .buildDatabase)
+
         guard !skipCommandLevelInformation else { return }
 
         // Ignore hidden tasks for output purposes.
@@ -1274,6 +1305,8 @@ final class OperationDelegate: BuildOperationDelegate {
     }
 
     func previouslyBatchedSubtaskUpToDate(_ operation: any BuildSystemOperation, signature: ByteString, target: ConfiguredTarget) {
+        acceleratorTraceWriter?.previouslyBatchedSubtaskUpToDate(signature: signature, target: target)
+
         guard !skipCommandLevelInformation else { return }
 
         // If this target has started, issue the notification immediately.
@@ -1287,6 +1320,8 @@ final class OperationDelegate: BuildOperationDelegate {
     }
 
     func taskStarted(_ operation: any BuildSystemOperation, taskIdentifier: TaskIdentifier, task: any ExecutableTask, dependencyInfo: CommandLineDependencyInfo?) -> any TaskOutputDelegate {
+        acceleratorTraceWriter?.taskStarted(taskIdentifier: taskIdentifier, task: task)
+
         guard !skipCommandLevelInformation else {
             return DiscardingTaskOutputHandler()
         }
@@ -1342,14 +1377,22 @@ final class OperationDelegate: BuildOperationDelegate {
     }
 
     func taskRequestedDynamicTask(_ operation: any BuildSystemOperation, requestingTask: any ExecutableTask, dynamicTaskIdentifier: TaskIdentifier) {
-        // This is tracking dynamic task dependency information, intentionally left empty for now
+        acceleratorTraceWriter?.taskRequestedDynamicTask(requestingTask: requestingTask, dynamicTaskIdentifier: dynamicTaskIdentifier)
     }
 
     func registeredDynamicTask(_ operation: any SWBBuildSystem.BuildSystemOperation, task: any SWBCore.ExecutableTask, dynamicTaskIdentifier: SWBCore.TaskIdentifier) {
-        // This is tracking dynamic task dependency information, intentionally left empty for now
+        acceleratorTraceWriter?.registeredDynamicTask(task: task, dynamicTaskIdentifier: dynamicTaskIdentifier)
     }
 
     func taskComplete(_ operation: any BuildSystemOperation, taskIdentifier: TaskIdentifier, task: any ExecutableTask, delegate taskDelegate: any TaskOutputDelegate) {
+        if let delegate = taskDelegate as? TaskOutputHandler {
+            let status = BuildOperationTaskEnded.Status(taskResult: delegate.result)
+            acceleratorTraceWriter?.taskFinished(taskIdentifier: taskIdentifier, task: task, status: status, result: delegate.result, duration: delegate.timer.elapsedTime())
+        } else if let delegate = taskDelegate as? DiscardingTaskOutputHandler {
+            let status = BuildOperationTaskEnded.Status(taskResult: delegate.result)
+            acceleratorTraceWriter?.taskFinished(taskIdentifier: taskIdentifier, task: task, status: status, result: delegate.result, duration: delegate.timer.elapsedTime())
+        }
+
         guard !skipCommandLevelInformation else { return }
 
         // We expect the task output delegate to be a TaskOutputCollector, unless we are ignoring this task.
@@ -1372,18 +1415,7 @@ final class OperationDelegate: BuildOperationDelegate {
         // Finally, send the task-did-end message.
         //
         // FIXME: It isn't clear what signalled is supposed to mean here; lift this to be more structured information.
-        let status: BuildOperationTaskEnded.Status
-        switch delegate.result {
-        case let .exit(exitStatus, _):
-            status = .init(exitStatus)
-        case .failedSetup:
-            status = .failed
-        case .skipped:
-            status = .succeeded
-        case nil:
-            // The task has been cancelled if the delegate has no result after completion
-            status = .cancelled
-        }
+        let status = BuildOperationTaskEnded.Status(taskResult: delegate.result)
 
         // Update our own status for the overall build.
         switch status {
