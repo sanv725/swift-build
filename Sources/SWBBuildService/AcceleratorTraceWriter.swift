@@ -166,6 +166,7 @@ package final class AcceleratorTraceWriter: @unchecked Sendable {
         var pending: [Event] = []
         var pendingIndex = 0
         var drainScheduled = false
+        var drainSuppressionDepth = 0
         var finishing = false
         var closed = false
         var disabled = false
@@ -186,6 +187,7 @@ package final class AcceleratorTraceWriter: @unchecked Sendable {
 
     private static let maximumDebugStringLength = 1024
     private static let drainBatchSize = 256
+    private static let estimatedEncodedEventSize = 384
 
     private let buildID: String
     private let activeBuildID: Int
@@ -196,7 +198,7 @@ package final class AcceleratorTraceWriter: @unchecked Sendable {
     private let originNS: UInt64
     private let state = SWBMutex(State())
     private let queue = SWBQueue(label: "SWBBuildService.AcceleratorTraceWriter", qos: .utility, autoreleaseFrequency: .workItem)
-    private let encoder = JSONEncoder(outputFormatting: [.sortedKeys, .withoutEscapingSlashes])
+    private let encoder = JSONEncoder(outputFormatting: [.withoutEscapingSlashes])
 
     package static func create(
         buildID: UUID,
@@ -258,26 +260,28 @@ package final class AcceleratorTraceWriter: @unchecked Sendable {
     }
 
     package func buildStarted(operation: SWBBuildSystem.BuildOperation) {
-        emit(event: "build_started", payload: [
-            "invocation_id": .string(buildID),
-            "mode": .string("observe"),
-            "action": .string(Self.action(for: parameters)),
-            "configuration": .string(Self.configurationName(for: parameters)),
-            "destination": .string(Self.destination(for: parameters)),
-            "architecture": .string(Self.architecture(for: parameters)),
-            "privacy_mode": .string(configuration.privacyMode.traceValue),
-            "planning_included": .boolean(false),
-            "ready_time_available": .boolean(false),
-            "build_description_id": .string("bd1"),
-            "declared_task_count": .integer(operation.buildDescription.taskStore.taskCount),
-            "capabilities": .array([
-                .string("execution_lifecycle"),
-                .string("static_manifest_graph"),
-                .string("dynamic_request_edges"),
-            ]),
-        ])
+        withDrainSuppressed {
+            emit(event: "build_started", payload: [
+                "invocation_id": .string(buildID),
+                "mode": .string("observe"),
+                "action": .string(Self.action(for: parameters)),
+                "configuration": .string(Self.configurationName(for: parameters)),
+                "destination": .string(Self.destination(for: parameters)),
+                "architecture": .string(Self.architecture(for: parameters)),
+                "privacy_mode": .string(configuration.privacyMode.traceValue),
+                "planning_included": .boolean(false),
+                "ready_time_available": .boolean(false),
+                "build_description_id": .string("bd1"),
+                "declared_task_count": .integer(operation.buildDescription.taskStore.taskCount),
+                "capabilities": .array([
+                    .string("execution_lifecycle"),
+                    .string("static_manifest_graph"),
+                    .string("dynamic_request_edges"),
+                ]),
+            ])
 
-        recordStaticGraph(operation: operation)
+            recordStaticGraph(operation: operation)
+        }
     }
 
     package func buildFinished(status: BuildOperationEnded.Status, metrics: BuildOperationMetrics?) {
@@ -380,6 +384,14 @@ package final class AcceleratorTraceWriter: @unchecked Sendable {
         emit(event: event, payload: payload)
     }
 
+    package func emitBatchForTesting(count: Int) {
+        withDrainSuppressed {
+            for index in 0..<count {
+                emit(event: "batch_probe", payload: ["index": .integer(index)])
+            }
+        }
+    }
+
     package var snapshotForTesting: Snapshot {
         state.withLock { state in
             Snapshot(
@@ -400,13 +412,38 @@ package final class AcceleratorTraceWriter: @unchecked Sendable {
     private func finish() {
         let shouldSchedule = state.withLock { state in
             state.finishing = true
-            guard !state.disabled, !state.closed, !state.drainScheduled else { return false }
+            guard !state.disabled, !state.closed, !state.drainScheduled, state.drainSuppressionDepth == 0 else { return false }
             state.drainScheduled = true
             return true
         }
         if shouldSchedule {
             queue.async { [self] in drain() }
         }
+    }
+
+    private func withDrainSuppressed(_ body: () -> Void) {
+        state.withLock { state in
+            state.drainSuppressionDepth += 1
+        }
+        defer {
+            let shouldSchedule = state.withLock { state in
+                guard state.drainSuppressionDepth > 0 else { return false }
+                state.drainSuppressionDepth -= 1
+                guard state.drainSuppressionDepth == 0,
+                      !state.disabled,
+                      !state.closed,
+                      !state.drainScheduled,
+                      state.pendingCount > 0 || state.finishing else {
+                    return false
+                }
+                state.drainScheduled = true
+                return true
+            }
+            if shouldSchedule {
+                queue.async { [self] in drain() }
+            }
+        }
+        body()
     }
 
     private func emit(event: String, payload: [String: AcceleratorTraceValue], terminal: Bool = false) {
@@ -428,7 +465,12 @@ package final class AcceleratorTraceWriter: @unchecked Sendable {
                 payload: payload
             )
             state.pending.append(queued)
-            if !state.drainScheduled {
+            // A large graph must be allowed to drain before the suppression
+            // scope ends so a healthy sink does not overflow solely because
+            // startup emission was coalesced.
+            let suppressionHighWaterMark = min(configuration.capacity, max(Self.drainBatchSize, configuration.capacity / 2))
+            let shouldDrainSuppressedEvents = state.drainSuppressionDepth > 0 && state.pendingCount >= suppressionHighWaterMark
+            if !state.drainScheduled && (state.drainSuppressionDepth == 0 || shouldDrainSuppressedEvents) {
                 state.drainScheduled = true
                 return (queued, true)
             }
@@ -476,6 +518,7 @@ package final class AcceleratorTraceWriter: @unchecked Sendable {
 
             do {
                 var data = Data()
+                data.reserveCapacity(batchAndClose.0.count * Self.estimatedEncodedEventSize)
                 for event in batchAndClose.0 {
                     data.append(try encoder.encode(event))
                     data.append(0x0A)

@@ -105,6 +105,36 @@ import SWBUtil
         #expect(Set(sequences).count == 512)
     }
 
+    @Test func batchedEmissionPreservesSequenceAndUsesBoundedWrites() throws {
+        let sink = TestAcceleratorTraceSink()
+        let writer = makeWriter(sink: sink)
+
+        writer.emitBatchForTesting(count: 532)
+        writer.flushForTesting()
+
+        let events = try sink.events()
+        #expect(events.count == 532)
+        #expect(events.compactMap { $0["sequence"] as? Int } == Array(1...532))
+        #expect(events.compactMap { ($0["payload"] as? [String: Any])?["index"] as? Int } == Array(0..<532))
+        #expect(sink.writeCount == 3)
+        #expect(writer.snapshotForTesting.droppedEventCount == 0)
+    }
+
+    @Test func minimumCapacityBatchedEmissionDoesNotDrop() throws {
+        let sink = TestAcceleratorTraceSink()
+        let writer = makeWriter(sink: sink, capacity: 256)
+
+        writer.emitBatchForTesting(count: 256)
+        writer.flushForTesting()
+
+        let events = try sink.events()
+        #expect(events.count == 256)
+        #expect(events.compactMap { $0["sequence"] as? Int } == Array(1...256))
+        #expect(events.compactMap { ($0["payload"] as? [String: Any])?["index"] as? Int } == Array(0..<256))
+        #expect(sink.writeCount == 1)
+        #expect(writer.snapshotForTesting.droppedEventCount == 0)
+    }
+
     @Test func overflowDropsNewestButRetainsTerminalSummary() throws {
         let sink = TestAcceleratorTraceSink(blockFirstWrite: true)
         let writer = makeWriter(sink: sink, capacity: 256)
@@ -275,6 +305,10 @@ private final class TestAcceleratorTraceSink: AcceleratorTraceSink, @unchecked S
 
     var closeCount: Int {
         state.withLock { $0.closeCount }
+    }
+
+    var writeCount: Int {
+        state.withLock { $0.writeCount }
     }
 
     func events() throws -> [[String: Any]] {
