@@ -209,6 +209,29 @@ fileprivate struct BuildTaskBehaviorTests: CoreBasedTests {
         }
     }
 
+    @Test(.requireSDKs(.host))
+    func nonDetachedTaskObservesBuildCancellation() async throws {
+        let output = MakePlannedVirtualNode("<CANCELLATION-AWARE>")
+        let action = CancellationAwareTaskAction(contents: "", output: output)
+        let taskHasStarted = action.taskHasStarted
+        let task = createTask(ruleInfo: ["cancellation-aware"], commandLine: ["true"], inputs: [], outputs: [output], action: action)
+        let tester = try await BuildOperationTester(getCore(), [task], simulated: true)
+
+        try await tester.checkBuild(runDestination: .host, body: { results in
+            results.checkCapstoneEvents(last: .buildCancelled)
+            results.checkNoDiagnostics()
+
+            let task = try #require(results.getTask(.matchRule(["cancellation-aware"])))
+            results.checkTaskResult(task, expected: .exit(exitStatus: .buildSystemCanceledTask, metrics: nil))
+        }) { operation in
+            _Concurrency.Task<Void, Never> {
+                await taskHasStarted.wait()
+                operation.cancel()
+            }
+            await operation.build()
+        }
+    }
+
     /// Stress concurrent access to the build system cache during rapid cancel
     /// then build scenarios.
     @Test(.requireSDKs(.host), .skipHostOS(.windows, "no /usr/bin/true"),
@@ -1263,6 +1286,32 @@ private final class WaitTaskAction: MockTaskAction {
         await taskWaitsForSemaphore.wait()
         outputDelegate.updateResult(.succeeded(metrics: nil))
         return .succeeded
+    }
+}
+
+private final class CancellationAwareTaskAction: MockTaskAction {
+    let taskHasStarted = WaitCondition()
+
+    override class var toolIdentifier: String {
+        "cancellation-aware-task"
+    }
+
+    override func performTaskAction(_ task: any ExecutableTask, dynamicExecutionDelegate: any DynamicTaskExecutionDelegate, executionDelegate: any TaskExecutionDelegate, clientDelegate: any TaskExecutionClientDelegate, outputDelegate: any TaskOutputDelegate) async -> CommandResult {
+        guard let cancellationDelegate = executionDelegate as? any TaskExecutionCancellationDelegate else {
+            outputDelegate.error("execution delegate does not expose package-internal cancellation state")
+            return .failed
+        }
+
+        taskHasStarted.signal()
+        let timer = ElapsedTimer()
+        while !cancellationDelegate.isCancellationRequested {
+            guard timer.elapsedTime().seconds < 5 else {
+                outputDelegate.error("timed out waiting for build cancellation")
+                return .failed
+            }
+            await _Concurrency.Task.yield()
+        }
+        return .cancelled
     }
 }
 

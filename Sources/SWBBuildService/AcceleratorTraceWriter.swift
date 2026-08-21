@@ -305,7 +305,7 @@ package final class AcceleratorTraceWriter: @unchecked Sendable {
                 "clang_misses": .integer(metrics?.counters[.clangCacheMisses] ?? 0),
             ]),
         ], terminal: true)
-        finish()
+        finish(waitForDrain: status == .cancelled)
     }
 
     package func taskStarted(taskIdentifier: TaskIdentifier, task: any ExecutableTask) {
@@ -466,7 +466,7 @@ package final class AcceleratorTraceWriter: @unchecked Sendable {
         }
     }
 
-    private func finish() {
+    private func finish(waitForDrain: Bool) {
         let shouldSchedule = state.withLock { state in
             state.finishing = true
             guard !state.disabled, !state.closed, !state.drainScheduled, state.drainSuppressionDepth == 0 else { return false }
@@ -475,6 +475,16 @@ package final class AcceleratorTraceWriter: @unchecked Sendable {
         }
         if shouldSchedule {
             queue.async { [self] in drain() }
+        }
+        if waitForDrain {
+            // Cancellation replies can make xcodebuild tear down the dedicated
+            // service immediately. Drain the terminal evidence before allowing
+            // that reply to proceed. Successful builds retain the nonblocking
+            // writer contract; trusted all-hit replay needs a separate bounded
+            // flush design before it can be enabled.
+            queue.blocking_sync { [self] in
+                drain()
+            }
         }
     }
 

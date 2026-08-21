@@ -553,6 +553,10 @@ public enum RequiredTargetDependencyReason: CustomStringConvertible {
 /// The interface used for interactions between running tasks and the controlling execution environment.
 /// A `TaskExecutionDelegate` performs operations commonly needed by a task, such as file I/O.
 /// This protocol enables task behavior to be more easily tested.
+package protocol TaskExecutionCancellationDelegate {
+    var isCancellationRequested: Bool { get }
+}
+
 public protocol TaskExecutionDelegate
 {
     /// The proxy to use for file system access.

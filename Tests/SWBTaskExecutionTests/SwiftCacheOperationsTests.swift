@@ -756,6 +756,45 @@ fileprivate struct SwiftCacheOperationsTests {
             #expect(later.outcome == expectedOutcome)
         }
     }
+
+    @Test
+    func cancellationConfigurationAndControllerFailClosed() {
+        let selector = String(repeating: "7", count: 64)
+        let valid = SwiftAcceleratorCacheCancellationConfiguration(environment: [
+            SwiftAcceleratorCacheCancellationConfiguration.environmentVariable: "v1:replay_stage:\(selector)"
+        ])
+        #expect(valid.request?.checkpoint == .replayStage)
+        #expect(valid.request?.selector == selector)
+
+        for malformed in [
+            "replay_stage:\(selector)",
+            "v2:replay_stage:\(selector)",
+            "v1:unknown:\(selector)",
+            "v1:replay_stage:\(String(repeating: "7", count: 63))",
+            "v1:replay_stage:\(String(repeating: "A", count: 64))",
+            "v1:replay_stage:\(selector):extra",
+        ] {
+            let configuration = SwiftAcceleratorCacheCancellationConfiguration(environment: [
+                SwiftAcceleratorCacheCancellationConfiguration.environmentVariable: malformed
+            ])
+            #expect(configuration.request == nil)
+        }
+
+        var childEnvironment = [
+            SwiftAcceleratorCacheCancellationConfiguration.environmentVariable: "v1:replay_stage:\(selector)",
+            "PRESERVED": "value",
+        ]
+        SwiftAcceleratorCacheCancellationConfiguration.removeControlVariable(from: &childEnvironment)
+        #expect(childEnvironment == ["PRESERVED": "value"])
+
+        let controller = SwiftAcceleratorCacheCancellationController(configuration: valid)
+        #expect(!controller.claim(selector: selector, mode: .observe, eligibility: .eligible, checkpoint: .replayStage))
+        #expect(!controller.claim(selector: selector, mode: .verify, eligibility: .excluded(.unsupportedPlatform), checkpoint: .replayStage))
+        #expect(!controller.claim(selector: String(repeating: "8", count: 64), mode: .verify, eligibility: .eligible, checkpoint: .replayStage))
+        #expect(!controller.claim(selector: selector, mode: .verify, eligibility: .eligible, checkpoint: .queryStage))
+        #expect(controller.claim(selector: selector, mode: .verify, eligibility: .eligible, checkpoint: .replayStage))
+        #expect(!controller.claim(selector: selector, mode: .verify, eligibility: .eligible, checkpoint: .replayStage))
+    }
     #endif
 
     @Test(.requireHostOS(.macOS))
@@ -901,6 +940,107 @@ fileprivate struct SwiftCacheOperationsTests {
         #expect(SwiftDriverJobTaskAction.shouldCancelBeforeFrontend(mode: .observe, isCancelled: true))
         #expect(SwiftDriverJobTaskAction.shouldCancelBeforeFrontend(mode: .verify, isCancelled: true))
         #expect(!SwiftDriverJobTaskAction.shouldCancelBeforeFrontend(mode: .trust, isCancelled: true))
+    }
+
+    @Test
+    func cooperativeCancellationPausesAtRealCacheStagesAndScrubsOutputs() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let fs = localFS
+
+        let queryOperations = TestSwiftCacheOperations(
+            queries: ["key": .hit(1)],
+            outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+        )
+        var queryCheckpoints: [SwiftAcceleratorCacheCancellationCheckpoint] = []
+        let query = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .verify,
+            operations: queryOperations,
+            cacheKeys: ["key"],
+            plannedOutputs: [temporaryDirectory.path.join("query.o")],
+            commandLine: ["swift-frontend", "-c"],
+            fs: fs,
+            pauseAtCancellationCheckpoint: { checkpoint in
+                queryCheckpoints.append(checkpoint)
+                if checkpoint == .queryStage { throw CancellationError() }
+            }
+        )
+        #expect(query.outcome == .cancelled)
+        #expect(query.scrubSucceeded == nil)
+        #expect(queryOperations.queriedKeys == ["key"])
+        #expect(queryOperations.replayCommandLine == nil)
+        #expect(queryCheckpoints == [.queryStage])
+
+        let replayOutput = temporaryDirectory.path.join("replay.o")
+        let replayOperations = TestSwiftCacheOperations(
+            queries: ["key": .hit(1)],
+            outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+        )
+        replayOperations.replaySideEffect = { _ in
+            try fs.write(replayOutput, contents: ByteString(encodingAsUTF8: "must-not-run"))
+        }
+        let replay = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .verify,
+            operations: replayOperations,
+            cacheKeys: ["key"],
+            plannedOutputs: [replayOutput],
+            commandLine: ["swift-frontend", "-c"],
+            fs: fs,
+            pauseAtCancellationCheckpoint: { checkpoint in
+                if checkpoint == .replayStage { throw CancellationError() }
+            }
+        )
+        #expect(replay.outcome == .cancelled)
+        #expect(replay.scrubSucceeded == true)
+        #expect(replayOperations.replayCommandLine == ["-c"])
+        #expect(replayOperations.replayedCompilations.isEmpty)
+        #expect(!fs.exists(replayOutput))
+
+        let materializedOutput = temporaryDirectory.path.join("materialized.o")
+        let materializedOperations = TestSwiftCacheOperations(
+            queries: ["key": .hit(1)],
+            outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+        )
+        materializedOperations.replaySideEffect = { _ in
+            try fs.write(materializedOutput, contents: ByteString(encodingAsUTF8: "cached"))
+        }
+        let materialized = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .verify,
+            operations: materializedOperations,
+            cacheKeys: ["key"],
+            plannedOutputs: [materializedOutput],
+            commandLine: ["swift-frontend", "-c"],
+            fs: fs,
+            pauseAtCancellationCheckpoint: { checkpoint in
+                if checkpoint == .postMaterialization { throw CancellationError() }
+            }
+        )
+        #expect(materialized.outcome == .cancelled)
+        #expect(materialized.scrubSucceeded == true)
+        #expect(materialized.cachedOutputCount == 1)
+        #expect(materializedOperations.replayedCompilations == [1])
+        #expect(!fs.exists(materializedOutput), "post-materialization cancellation must scrub the replayed output")
+    }
+
+    @Test
+    func cooperativeCancellationPauseIsIgnoredOutsideVerifyMode() {
+        let operations = TestSwiftCacheOperations(
+            queries: ["key": .hit(1)],
+            outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+        )
+        let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .observe,
+            operations: operations,
+            cacheKeys: ["key"],
+            plannedOutputs: [Path.temporaryDirectory.join("observe-never-replayed.o")],
+            commandLine: ["swift-frontend", "-c"],
+            fs: localFS,
+            pauseAtCancellationCheckpoint: { _ in
+                Issue.record("observe mode invoked the verify-only cancellation pause")
+                throw CancellationError()
+            }
+        )
+        #expect(preparation.outcome == .wouldHit)
+        #expect(operations.replayedCompilations.isEmpty)
     }
 
     @Test

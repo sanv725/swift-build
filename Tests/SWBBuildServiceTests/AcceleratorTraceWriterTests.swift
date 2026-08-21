@@ -304,6 +304,7 @@ import SWBUtil
 
         writer.emitForTesting(event: "before_finish")
         writer.buildFinished(status: .cancelled, metrics: nil)
+        #expect(sink.closeCount == 1, "cancelled builds must synchronously persist terminal evidence")
         writer.emitForTesting(event: "after_finish")
         writer.flushForTesting()
 

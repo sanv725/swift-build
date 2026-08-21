@@ -299,6 +299,7 @@ package final class BuildOperation: BuildSystemOperation {
     package weak var subtaskProgressReporter: (any SubtaskProgressReporter)?
 
     /// Cancellation state
+    private let cancellationRequested = Atomic(false)
     private var wasCancellationRequested = false
     private var wasAbortRequested = false
 
@@ -922,6 +923,11 @@ package final class BuildOperation: BuildSystemOperation {
 
     /// Cancel the executing build operation.
     package func cancel() {
+        // Task actions cannot safely read `wasCancellationRequested` through
+        // `queue` while `system.cancel()` synchronously waits for them. Mirror
+        // the state atomically so cooperative in-process work can stop without
+        // introducing that lock inversion.
+        cancellationRequested.store(true, ordering: .relaxed)
         queue.blocking_sync() {
             wasCancellationRequested = true
 
@@ -933,6 +939,9 @@ package final class BuildOperation: BuildSystemOperation {
     ///
     /// This is used to cancel the underlying (llbuild) build operation when "continue building after errors" is turned off.
     package func abort() {
+        // Aborting also synchronously cancels outstanding task work. Publish
+        // that request before entering `queue` for the same reason as cancel().
+        cancellationRequested.store(true, ordering: .relaxed)
         queue.blocking_sync {
             wasAbortRequested = true
 
@@ -1002,7 +1011,11 @@ package final class BuildOperation: BuildSystemOperation {
 }
 
 /// The operation itself also acts as the execution delegate for its tasks.
-extension BuildOperation: TaskExecutionDelegate {
+extension BuildOperation: TaskExecutionDelegate, TaskExecutionCancellationDelegate {
+    package var isCancellationRequested: Bool {
+        cancellationRequested.load(ordering: .relaxed)
+    }
+
     package var fs: any FSProxy {
         return delegate.fs ?? SWBUtil.localFS
     }

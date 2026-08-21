@@ -158,6 +158,15 @@ package enum SwiftAcceleratorCacheInjectedFault: String, Sendable, Equatable {
     case manifestError = "manifest_error"
 }
 
+/// A nonserialized test seam for cooperative cancellation at real cache
+/// boundaries. Environment selection is compiled only into the dedicated
+/// fault-injection service below.
+package enum SwiftAcceleratorCacheCancellationCheckpoint: String, Sendable, Equatable {
+    case queryStage = "query_stage"
+    case replayStage = "replay_stage"
+    case postMaterialization = "post_materialization"
+}
+
 private enum SwiftAcceleratorCacheInjectedError: Error {
     case injected
 }
@@ -197,7 +206,7 @@ package struct SwiftAcceleratorCacheFaultInjectionConfiguration: Sendable, Equat
         environment.removeValue(forKey: discoveryEnvironmentVariable)
     }
 
-    private static func isLowercaseSHA256(_ value: String) -> Bool {
+    package static func isLowercaseSHA256(_ value: String) -> Bool {
         value.utf8.count == 64 && value.utf8.allSatisfy {
             (UInt8(ascii: "0")...UInt8(ascii: "9")).contains($0)
                 || (UInt8(ascii: "a")...UInt8(ascii: "f")).contains($0)
@@ -227,6 +236,70 @@ package final class SwiftAcceleratorCacheFaultInjectionController: @unchecked Se
               eligibility == .eligible,
               let request = configuration.request,
               request.fault == checkpoint,
+              request.selector == selector else {
+            return false
+        }
+        return claimed.withLock { claimed in
+            guard !claimed else { return false }
+            claimed = true
+            return true
+        }
+    }
+}
+
+package struct SwiftAcceleratorCacheCancellationConfiguration: Sendable, Equatable {
+    package struct Request: Sendable, Equatable {
+        package let checkpoint: SwiftAcceleratorCacheCancellationCheckpoint
+        package let selector: String
+    }
+
+    package static let environmentVariable = "SWIFTBUILD_INTERNAL_ACCELERATOR_CACHE_CANCEL"
+
+    package let request: Request?
+
+    package init(environment: [String: String]) {
+        guard let rawRequest = environment[Self.environmentVariable] else {
+            request = nil
+            return
+        }
+        let fields = rawRequest.split(separator: ":", omittingEmptySubsequences: false)
+        guard fields.count == 3,
+              fields[0] == "v1",
+              let checkpoint = SwiftAcceleratorCacheCancellationCheckpoint(rawValue: String(fields[1])),
+              SwiftAcceleratorCacheFaultInjectionConfiguration.isLowercaseSHA256(String(fields[2])) else {
+            request = nil
+            return
+        }
+        request = .init(checkpoint: checkpoint, selector: String(fields[2]))
+    }
+
+    package static func removeControlVariable(from environment: inout [String: String]) {
+        environment.removeValue(forKey: environmentVariable)
+    }
+}
+
+package final class SwiftAcceleratorCacheCancellationController: @unchecked Sendable {
+    package static let shared = SwiftAcceleratorCacheCancellationController(
+        configuration: .init(environment: ProcessInfo.processInfo.environment)
+    )
+
+    package let configuration: SwiftAcceleratorCacheCancellationConfiguration
+    private let claimed = SWBMutex(false)
+
+    package init(configuration: SwiftAcceleratorCacheCancellationConfiguration) {
+        self.configuration = configuration
+    }
+
+    package func claim(
+        selector: String,
+        mode: SwiftBuildAcceleratorCacheMode,
+        eligibility: SwiftBuildAcceleratorCacheEligibility,
+        checkpoint: SwiftAcceleratorCacheCancellationCheckpoint
+    ) -> Bool {
+        guard mode == .verify,
+              eligibility == .eligible,
+              let request = configuration.request,
+              request.checkpoint == checkpoint,
               request.selector == selector else {
             return false
         }
@@ -706,7 +779,9 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
 
         #if SWIFT_BUILD_ACCELERATOR_FAULT_INJECTION
         let acceleratorFaultController = SwiftAcceleratorCacheFaultInjectionController.shared
+        let acceleratorCancellationController = SwiftAcceleratorCacheCancellationController.shared
         SwiftAcceleratorCacheFaultInjectionConfiguration.removeControlVariables(from: &environment)
+        SwiftAcceleratorCacheCancellationConfiguration.removeControlVariable(from: &environment)
         let acceleratorFaultSelector = Self.acceleratorFaultSelector(
             targetIdentity: task.forTarget?.guid.stringValue,
             arch: arch,
@@ -840,6 +915,10 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             var comparedBytes: UInt64?
             var finalDisposition: TaskCacheObservation.FinalDisposition = .executed
             var shadowManifest: SwiftCacheOutputManifest?
+            let isCancellationRequested = {
+                _Concurrency.Task<Never, Never>.isCancelled
+                    || (executionDelegate as? any TaskExecutionCancellationDelegate)?.isCancellationRequested == true
+            }
 
             defer {
                 if acceleratorPolicy.mode.isAcceleratorEnabled {
@@ -867,7 +946,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 if acceleratorFaultController.configuration.discoveryEnabled,
                    acceleratorFaultCandidateWasProbed {
                     outputDelegate.note(
-                        "Swift accelerator cache fault candidate selector=\(acceleratorFaultSelector) outcome=\(observationOutcome.rawValue)"
+                        "Swift accelerator cache fault candidate selector=\(acceleratorFaultSelector) outcome=\(observationOutcome.rawValue) key_count=\(cacheKeys.count) planned_output_count=\(plannedOutputs.count)"
                     )
                 }
                 #endif
@@ -970,8 +1049,37 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                                 checkpoint: checkpoint
                             )
                         }
+                        let pauseAtCancellationCheckpoint: ((SwiftAcceleratorCacheCancellationCheckpoint) throws -> Void)? = { checkpoint in
+                            guard acceleratorCancellationController.claim(
+                                selector: acceleratorFaultSelector,
+                                mode: acceleratorPolicy.mode,
+                                eligibility: acceleratorPolicy.eligibility,
+                                checkpoint: checkpoint
+                            ) else {
+                                return
+                            }
+
+                            outputDelegate.emitOutput(
+                                ByteString(encodingAsUTF8: "Swift accelerator cache cancellation ready checkpoint=\(checkpoint.rawValue) selector=\(acceleratorFaultSelector)\n")
+                            )
+                            let deadline = Date().addingTimeInterval(120)
+                            while !isCancellationRequested(), Date() < deadline {
+                                Thread.sleep(forTimeInterval: 0.005)
+                            }
+                            guard isCancellationRequested() else {
+                                outputDelegate.emitOutput(
+                                    ByteString(encodingAsUTF8: "Swift accelerator cache cancellation hold timeout checkpoint=\(checkpoint.rawValue) selector=\(acceleratorFaultSelector)\n")
+                                )
+                                throw SwiftAcceleratorCacheInjectedError.injected
+                            }
+                            outputDelegate.emitOutput(
+                                ByteString(encodingAsUTF8: "Swift accelerator cache cancellation observed checkpoint=\(checkpoint.rawValue) selector=\(acceleratorFaultSelector)\n")
+                            )
+                            throw CancellationError()
+                        }
                         #else
                         let claimInjectedFault: ((SwiftAcceleratorCacheInjectedFault) -> Bool)? = nil
+                        let pauseAtCancellationCheckpoint: ((SwiftAcceleratorCacheCancellationCheckpoint) throws -> Void)? = nil
                         #endif
 
                         let preparation = Self.prepareAcceleratorCache(
@@ -982,7 +1090,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                             commandLine: options.commandLine,
                             fs: executionDelegate.fs,
                             claimInjectedFault: claimInjectedFault,
-                            isCancelled: { _Concurrency.Task<Never, Never>.isCancelled }
+                            pauseAtCancellationCheckpoint: pauseAtCancellationCheckpoint,
+                            isCancelled: isCancellationRequested
                         )
                         lookupDurationNS = preparation.lookupDurationNS
                         materializationDurationNS = preparation.replayDurationNS
@@ -1052,7 +1161,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             // have been scrubbed, without changing the upstream stock path.
             if Self.shouldCancelBeforeFrontend(
                 mode: acceleratorPolicy.mode,
-                isCancelled: _Concurrency.Task<Never, Never>.isCancelled
+                isCancelled: isCancellationRequested()
             ) {
                 observationOutcome = .cancelled
                 return .cancelled
@@ -1194,10 +1303,13 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         operations: Operations,
         compilations: [Operations.Compilation],
         commandLine: [String],
+        pauseBeforeMaterialization: (() throws -> Void)? = nil,
         isCancelled: () -> Bool = { false }
     ) throws {
         if isCancelled() { throw CancellationError() }
         let instance = try operations.createReplayInstance(commandLine: Array(commandLine.dropFirst()))
+        if isCancelled() { throw CancellationError() }
+        try pauseBeforeMaterialization?()
         if isCancelled() { throw CancellationError() }
         for compilation in compilations {
             if isCancelled() { throw CancellationError() }
@@ -1298,6 +1410,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         fs: any FSProxy,
         injectedFault: SwiftAcceleratorCacheInjectedFault? = nil,
         claimInjectedFault: ((SwiftAcceleratorCacheInjectedFault) -> Bool)? = nil,
+        pauseAtCancellationCheckpoint: ((SwiftAcceleratorCacheCancellationCheckpoint) throws -> Void)? = nil,
         isCancelled: () -> Bool = { false }
     ) -> SwiftAcceleratorCachePreparation {
         if isCancelled() {
@@ -1306,6 +1419,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         // The runtime controller already enforces this boundary. Keep the
         // nonserialized test seam equally narrow if it is called directly.
         let activeInjectedFault = mode == .verify ? injectedFault : nil
+        let activeCancellationPause = mode == .verify ? pauseAtCancellationCheckpoint : nil
         let claimAtCheckpoint: (SwiftAcceleratorCacheInjectedFault) -> Bool = { checkpoint in
             activeInjectedFault == checkpoint || (mode == .verify && claimInjectedFault?(checkpoint) == true)
         }
@@ -1316,6 +1430,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 throw SwiftAcceleratorCacheInjectedError.injected
             }
             probe = try probeCache(operations: operations, cacheKeys: cacheKeys, isCancelled: isCancelled)
+            try activeCancellationPause?(.queryStage)
         } catch is CancellationError {
             return .init(outcome: .cancelled, lookupDurationNS: lookupTimer.elapsedTime().nanoseconds)
         } catch {
@@ -1372,7 +1487,16 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 if claimAtCheckpoint(.replayError) {
                     throw SwiftAcceleratorCacheInjectedError.injected
                 }
-                try replayCache(operations: operations, compilations: compilations, commandLine: commandLine, isCancelled: isCancelled)
+                try replayCache(
+                    operations: operations,
+                    compilations: compilations,
+                    commandLine: commandLine,
+                    pauseBeforeMaterialization: {
+                        try activeCancellationPause?(.replayStage)
+                    },
+                    isCancelled: isCancelled
+                )
+                try activeCancellationPause?(.postMaterialization)
             } catch is CancellationError {
                 outcome = .cancelled
             } catch {
