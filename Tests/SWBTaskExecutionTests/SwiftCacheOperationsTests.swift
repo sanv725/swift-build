@@ -760,11 +760,25 @@ fileprivate struct SwiftCacheOperationsTests {
     @Test
     func cancellationConfigurationAndControllerFailClosed() {
         let selector = String(repeating: "7", count: 64)
+        let readyDirectory = Path.temporaryDirectory.join("swift-cache-cancel-ready")
         let valid = SwiftAcceleratorCacheCancellationConfiguration(environment: [
-            SwiftAcceleratorCacheCancellationConfiguration.environmentVariable: "v1:replay_stage:\(selector)"
+            SwiftAcceleratorCacheCancellationConfiguration.environmentVariable: "v1:replay_stage:\(selector)",
+            SwiftAcceleratorCacheCancellationConfiguration.readyDirectoryEnvironmentVariable: readyDirectory.str,
         ])
         #expect(valid.request?.checkpoint == .replayStage)
         #expect(valid.request?.selector == selector)
+        #expect(valid.request?.readyDirectory == readyDirectory)
+
+        let missingReadyDirectory = SwiftAcceleratorCacheCancellationConfiguration(environment: [
+            SwiftAcceleratorCacheCancellationConfiguration.environmentVariable: "v1:replay_stage:\(selector)"
+        ])
+        #expect(missingReadyDirectory.request == nil)
+
+        let relativeReadyDirectory = SwiftAcceleratorCacheCancellationConfiguration(environment: [
+            SwiftAcceleratorCacheCancellationConfiguration.environmentVariable: "v1:replay_stage:\(selector)",
+            SwiftAcceleratorCacheCancellationConfiguration.readyDirectoryEnvironmentVariable: "relative",
+        ])
+        #expect(relativeReadyDirectory.request == nil)
 
         for malformed in [
             "replay_stage:\(selector)",
@@ -775,16 +789,18 @@ fileprivate struct SwiftCacheOperationsTests {
             "v1:replay_stage:\(selector):extra",
         ] {
             let configuration = SwiftAcceleratorCacheCancellationConfiguration(environment: [
-                SwiftAcceleratorCacheCancellationConfiguration.environmentVariable: malformed
+                SwiftAcceleratorCacheCancellationConfiguration.environmentVariable: malformed,
+                SwiftAcceleratorCacheCancellationConfiguration.readyDirectoryEnvironmentVariable: readyDirectory.str,
             ])
             #expect(configuration.request == nil)
         }
 
         var childEnvironment = [
             SwiftAcceleratorCacheCancellationConfiguration.environmentVariable: "v1:replay_stage:\(selector)",
+            SwiftAcceleratorCacheCancellationConfiguration.readyDirectoryEnvironmentVariable: readyDirectory.str,
             "PRESERVED": "value",
         ]
-        SwiftAcceleratorCacheCancellationConfiguration.removeControlVariable(from: &childEnvironment)
+        SwiftAcceleratorCacheCancellationConfiguration.removeControlVariables(from: &childEnvironment)
         #expect(childEnvironment == ["PRESERVED": "value"])
 
         let controller = SwiftAcceleratorCacheCancellationController(configuration: valid)
@@ -794,6 +810,81 @@ fileprivate struct SwiftCacheOperationsTests {
         #expect(!controller.claim(selector: selector, mode: .verify, eligibility: .eligible, checkpoint: .queryStage))
         #expect(controller.claim(selector: selector, mode: .verify, eligibility: .eligible, checkpoint: .replayStage))
         #expect(!controller.claim(selector: selector, mode: .verify, eligibility: .eligible, checkpoint: .replayStage))
+    }
+
+    @Test(.requireHostOS(.macOS))
+    func cancellationReadyMarkerIsExclusiveDeterministicAndPrivate() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let readyDirectory = temporaryDirectory.path.join("ready")
+        try localFS.createDirectory(readyDirectory)
+        let selector = String(repeating: "8", count: 64)
+        let markerPath = SwiftAcceleratorCacheCancellationReadyMarker.path(
+            directory: readyDirectory,
+            checkpoint: .postMaterialization,
+            selector: selector
+        )
+        let expectedContents = ByteString(
+            encodingAsUTF8: "schema\tswift-build-cache-cancel-ready-v1\ncheckpoint\tpost_materialization\nselector\t\(selector)\n"
+        )
+
+        let publishedPath = try SwiftAcceleratorCacheCancellationReadyMarker.publish(
+            directory: readyDirectory,
+            checkpoint: .postMaterialization,
+            selector: selector,
+            fs: localFS
+        )
+        #expect(publishedPath == markerPath)
+        #expect(try localFS.read(markerPath) == expectedContents)
+        #expect(try localFS.isFile(markerPath))
+        #expect(!localFS.isSymlink(markerPath))
+        #expect(try localFS.getFilePermissions(markerPath) == 0o600)
+
+        #expect(throws: (any Error).self) {
+            try SwiftAcceleratorCacheCancellationReadyMarker.publish(
+                directory: readyDirectory,
+                checkpoint: .postMaterialization,
+                selector: selector,
+                fs: localFS
+            )
+        }
+        #expect(try localFS.read(markerPath) == expectedContents)
+    }
+
+    @Test(.requireHostOS(.macOS))
+    func cancellationReadyMarkerRejectsSymlinksWithoutTouchingVictim() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let readyDirectory = temporaryDirectory.path.join("ready")
+        let victim = temporaryDirectory.path.join("victim")
+        try localFS.createDirectory(readyDirectory)
+        try localFS.write(victim, contents: ByteString(encodingAsUTF8: "victim"))
+        let selector = String(repeating: "9", count: 64)
+        let markerPath = SwiftAcceleratorCacheCancellationReadyMarker.path(
+            directory: readyDirectory,
+            checkpoint: .queryStage,
+            selector: selector
+        )
+        try localFS.symlink(markerPath, target: victim)
+
+        #expect(throws: (any Error).self) {
+            try SwiftAcceleratorCacheCancellationReadyMarker.publish(
+                directory: readyDirectory,
+                checkpoint: .queryStage,
+                selector: selector,
+                fs: localFS
+            )
+        }
+        #expect(try localFS.read(victim) == ByteString(encodingAsUTF8: "victim"))
+
+        let linkedDirectory = temporaryDirectory.path.join("linked-ready")
+        try localFS.symlink(linkedDirectory, target: readyDirectory)
+        #expect(throws: (any Error).self) {
+            try SwiftAcceleratorCacheCancellationReadyMarker.publish(
+                directory: linkedDirectory,
+                checkpoint: .replayStage,
+                selector: selector,
+                fs: localFS
+            )
+        }
     }
     #endif
 

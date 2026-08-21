@@ -18,6 +18,11 @@ public import SWBLLBuild
 import SWBProtocol
 
 #if SWIFT_BUILD_ACCELERATOR_FAULT_INJECTION
+#if canImport(System)
+import System
+#else
+import SystemPackage
+#endif
 import Synchronization
 #endif
 
@@ -251,14 +256,17 @@ package struct SwiftAcceleratorCacheCancellationConfiguration: Sendable, Equatab
     package struct Request: Sendable, Equatable {
         package let checkpoint: SwiftAcceleratorCacheCancellationCheckpoint
         package let selector: String
+        package let readyDirectory: Path
     }
 
     package static let environmentVariable = "SWIFTBUILD_INTERNAL_ACCELERATOR_CACHE_CANCEL"
+    package static let readyDirectoryEnvironmentVariable = "SWIFTBUILD_INTERNAL_ACCELERATOR_CACHE_CANCEL_READY_DIRECTORY"
 
     package let request: Request?
 
     package init(environment: [String: String]) {
-        guard let rawRequest = environment[Self.environmentVariable] else {
+        guard let rawRequest = environment[Self.environmentVariable],
+              let rawReadyDirectory = environment[Self.readyDirectoryEnvironmentVariable] else {
             request = nil
             return
         }
@@ -266,15 +274,74 @@ package struct SwiftAcceleratorCacheCancellationConfiguration: Sendable, Equatab
         guard fields.count == 3,
               fields[0] == "v1",
               let checkpoint = SwiftAcceleratorCacheCancellationCheckpoint(rawValue: String(fields[1])),
-              SwiftAcceleratorCacheFaultInjectionConfiguration.isLowercaseSHA256(String(fields[2])) else {
+              SwiftAcceleratorCacheFaultInjectionConfiguration.isLowercaseSHA256(String(fields[2])),
+              Path(rawReadyDirectory).isAbsolute else {
             request = nil
             return
         }
-        request = .init(checkpoint: checkpoint, selector: String(fields[2]))
+        request = .init(checkpoint: checkpoint, selector: String(fields[2]), readyDirectory: Path(rawReadyDirectory))
     }
 
-    package static func removeControlVariable(from environment: inout [String: String]) {
+    package static func removeControlVariables(from environment: inout [String: String]) {
         environment.removeValue(forKey: environmentVariable)
+        environment.removeValue(forKey: readyDirectoryEnvironmentVariable)
+    }
+}
+
+package enum SwiftAcceleratorCacheCancellationReadyMarker {
+    package static func path(
+        directory: Path,
+        checkpoint: SwiftAcceleratorCacheCancellationCheckpoint,
+        selector: String
+    ) -> Path {
+        directory.join("cache-cancel-ready-v1-\(checkpoint.rawValue)-\(selector).marker")
+    }
+
+    package static func contents(
+        checkpoint: SwiftAcceleratorCacheCancellationCheckpoint,
+        selector: String
+    ) -> ByteString {
+        ByteString(encodingAsUTF8: "schema\tswift-build-cache-cancel-ready-v1\ncheckpoint\t\(checkpoint.rawValue)\nselector\t\(selector)\n")
+    }
+
+    @discardableResult
+    package static func publish(
+        directory: Path,
+        checkpoint: SwiftAcceleratorCacheCancellationCheckpoint,
+        selector: String,
+        fs: any FSProxy
+    ) throws -> Path {
+        guard directory.isAbsolute,
+              SwiftAcceleratorCacheFaultInjectionConfiguration.isLowercaseSHA256(selector),
+              fs.isDirectory(directory),
+              !fs.isSymlink(directory) else {
+            throw StubError.error("invalid Swift accelerator cache cancellation ready directory")
+        }
+
+        let markerPath = path(directory: directory, checkpoint: checkpoint, selector: selector)
+        let markerContents = contents(checkpoint: checkpoint, selector: selector)
+        let descriptor = try FileDescriptor.open(
+            FilePath(markerPath.str),
+            .writeOnly,
+            options: [.create, .exclusiveCreate, .closeOnExec],
+            permissions: [.ownerReadWrite]
+        )
+        do {
+            try descriptor.writeAll(Data(markerContents.bytes))
+            try descriptor.close()
+        } catch {
+            try? descriptor.close()
+            throw error
+        }
+
+        try fs.setFilePermissions(markerPath, permissions: 0o600)
+        guard !fs.isSymlink(markerPath),
+              try fs.isFile(markerPath),
+              try fs.getFilePermissions(markerPath) == 0o600,
+              try fs.read(markerPath) == markerContents else {
+            throw StubError.error("invalid Swift accelerator cache cancellation ready marker")
+        }
+        return markerPath
     }
 }
 
@@ -781,7 +848,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         let acceleratorFaultController = SwiftAcceleratorCacheFaultInjectionController.shared
         let acceleratorCancellationController = SwiftAcceleratorCacheCancellationController.shared
         SwiftAcceleratorCacheFaultInjectionConfiguration.removeControlVariables(from: &environment)
-        SwiftAcceleratorCacheCancellationConfiguration.removeControlVariable(from: &environment)
+        SwiftAcceleratorCacheCancellationConfiguration.removeControlVariables(from: &environment)
         let acceleratorFaultSelector = Self.acceleratorFaultSelector(
             targetIdentity: task.forTarget?.guid.stringValue,
             arch: arch,
@@ -1057,6 +1124,23 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                                 checkpoint: checkpoint
                             ) else {
                                 return
+                            }
+
+                            guard let request = acceleratorCancellationController.configuration.request else {
+                                throw SwiftAcceleratorCacheInjectedError.injected
+                            }
+                            do {
+                                try SwiftAcceleratorCacheCancellationReadyMarker.publish(
+                                    directory: request.readyDirectory,
+                                    checkpoint: checkpoint,
+                                    selector: acceleratorFaultSelector,
+                                    fs: executionDelegate.fs
+                                )
+                            } catch {
+                                outputDelegate.emitOutput(
+                                    ByteString(encodingAsUTF8: "Swift accelerator cache cancellation ready marker failed checkpoint=\(checkpoint.rawValue) selector=\(acceleratorFaultSelector)\n")
+                                )
+                                throw SwiftAcceleratorCacheInjectedError.injected
                             }
 
                             outputDelegate.emitOutput(

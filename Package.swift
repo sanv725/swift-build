@@ -214,7 +214,10 @@ let package = Package(
             swiftSettings: swiftSettings(languageMode: .v5)),
         .target(
             name: "SWBTaskExecution",
-            dependencies: ["SWBCore", "SWBUtil", "SWBCAS", "SWBLLBuild", "SWBTaskConstruction"],
+            dependencies: [
+                "SWBCore", "SWBUtil", "SWBCAS", "SWBLLBuild", "SWBTaskConstruction",
+                .product(name: "SystemPackage", package: "swift-system", condition: .when(platforms: systemPackagePlatforms)),
+            ],
             exclude: ["CMakeLists.txt"],
             swiftSettings: swiftSettings(languageMode: .v5)),
         .target(
