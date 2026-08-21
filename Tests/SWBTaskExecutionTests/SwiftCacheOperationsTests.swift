@@ -399,6 +399,341 @@ fileprivate struct SwiftCacheOperationsTests {
         #expect(!SwiftDriverJobTaskAction.cachePreparationIsFatal(.unavailable, strictCASErrors: false))
     }
 
+    @Test
+    func injectedCacheFaultsUseExistingOutcomeClassification() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let fs = localFS
+        let output = temporaryDirectory.path.join("main.o")
+
+        func prepare(_ fault: SwiftAcceleratorCacheInjectedFault) -> (SwiftAcceleratorCachePreparation, TestSwiftCacheOperations) {
+            let operations = TestSwiftCacheOperations(
+                queries: ["key": .hit(1)],
+                outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+            )
+            operations.replaySideEffect = { _ in
+                try fs.write(output, contents: ByteString(encodingAsUTF8: "cached-object"))
+            }
+            return (
+                SwiftDriverJobTaskAction.prepareAcceleratorCache(
+                    mode: .verify,
+                    operations: operations,
+                    cacheKeys: ["key"],
+                    plannedOutputs: [output],
+                    commandLine: ["swift-frontend", "-c"],
+                    fs: fs,
+                    injectedFault: fault
+                ),
+                operations
+            )
+        }
+
+        let (query, queryOperations) = prepare(.queryError)
+        assertFallback(query, expected: .queryError)
+        #expect(queryOperations.queriedKeys.isEmpty)
+
+        let (replay, replayOperations) = prepare(.replayError)
+        assertFallback(replay, expected: .replayError)
+        #expect(replayOperations.queriedKeys == ["key"])
+        #expect(replayOperations.replayedCompilations.isEmpty)
+        #expect(replay.scrubSucceeded == true)
+        #expect(!fs.exists(output))
+
+        let (manifest, manifestOperations) = prepare(.manifestError)
+        assertFallback(manifest, expected: .manifestError)
+        #expect(manifestOperations.replayedCompilations == [1])
+        #expect(manifest.scrubSucceeded == true)
+        #expect(!fs.exists(output))
+    }
+
+    @Test
+    func cancellationPrecedesEveryInjectedCacheFault() {
+        let operations = TestSwiftCacheOperations(queries: ["key": .hit(1)], outputs: [:])
+        for fault in [
+            SwiftAcceleratorCacheInjectedFault.queryError,
+            .replayError,
+            .manifestError,
+        ] {
+            let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+                mode: .verify,
+                operations: operations,
+                cacheKeys: ["key"],
+                plannedOutputs: [Path.temporaryDirectory.join("unused.o")],
+                commandLine: ["swift-frontend", "-c"],
+                fs: localFS,
+                injectedFault: fault,
+                isCancelled: { true }
+            )
+            #expect(preparation.outcome == .cancelled)
+        }
+        #expect(operations.queriedKeys.isEmpty)
+    }
+
+    @Test
+    func injectedCacheFaultsAreIgnoredOutsideVerifyMode() {
+        let operations = TestSwiftCacheOperations(
+            queries: ["key": .hit(1)],
+            outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+        )
+        let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .observe,
+            operations: operations,
+            cacheKeys: ["key"],
+            plannedOutputs: [Path.temporaryDirectory.join("never-materialized.o")],
+            commandLine: ["swift-frontend", "-c"],
+            fs: localFS,
+            injectedFault: .queryError
+        )
+        #expect(preparation.outcome == .wouldHit)
+        #expect(operations.queriedKeys == ["key"])
+        #expect(operations.replayedCompilations.isEmpty)
+    }
+
+    #if SWIFT_BUILD_ACCELERATOR_FAULT_INJECTION
+    @Test
+    func faultConfigurationIsClosedForMissingAndMalformedValues() {
+        let selector = String(repeating: "a", count: 64)
+        let valid = SwiftAcceleratorCacheFaultInjectionConfiguration(environment: [
+            SwiftAcceleratorCacheFaultInjectionConfiguration.faultEnvironmentVariable: "v1:query_error:\(selector)",
+            SwiftAcceleratorCacheFaultInjectionConfiguration.discoveryEnvironmentVariable: "1",
+        ])
+        #expect(valid.request?.fault == .queryError)
+        #expect(valid.request?.selector == selector)
+        #expect(valid.discoveryEnabled)
+
+        let missing = SwiftAcceleratorCacheFaultInjectionConfiguration(environment: [:])
+        #expect(missing.request == nil)
+        #expect(!missing.discoveryEnabled)
+
+        for malformed in [
+            "query_error:\(selector)",
+            "v2:query_error:\(selector)",
+            "v1:unknown:\(selector)",
+            "v1:query_error:\(String(repeating: "a", count: 63))",
+            "v1:query_error:\(String(repeating: "A", count: 64))",
+            "v1:query_error:\(String(repeating: "g", count: 64))",
+            "v1:query_error:\(selector):extra",
+        ] {
+            let configuration = SwiftAcceleratorCacheFaultInjectionConfiguration(environment: [
+                SwiftAcceleratorCacheFaultInjectionConfiguration.faultEnvironmentVariable: malformed,
+            ])
+            #expect(configuration.request == nil)
+        }
+
+        let malformedDiscovery = SwiftAcceleratorCacheFaultInjectionConfiguration(environment: [
+            SwiftAcceleratorCacheFaultInjectionConfiguration.discoveryEnvironmentVariable: "YES",
+        ])
+        #expect(!malformedDiscovery.discoveryEnabled)
+
+        var childEnvironment = [
+            SwiftAcceleratorCacheFaultInjectionConfiguration.faultEnvironmentVariable: "v1:query_error:\(selector)",
+            SwiftAcceleratorCacheFaultInjectionConfiguration.discoveryEnvironmentVariable: "1",
+            "PRESERVED": "value",
+        ]
+        SwiftAcceleratorCacheFaultInjectionConfiguration.removeControlVariables(from: &childEnvironment)
+        #expect(childEnvironment == ["PRESERVED": "value"])
+    }
+
+    @Test
+    func faultSelectorIsDeterministicOpaqueAndPathFree() {
+        let signature = ByteString(encodingAsUTF8: "stable-driver-signature")
+        let selector = SwiftDriverJobTaskAction.acceleratorFaultSelector(
+            targetIdentity: "TARGET-GUID-/Users/private-project",
+            arch: "arm64",
+            variant: "normal",
+            jobKey: .targetJob(7),
+            jobSignature: signature
+        )
+        let repeated = SwiftDriverJobTaskAction.acceleratorFaultSelector(
+            targetIdentity: "TARGET-GUID-/Users/private-project",
+            arch: "arm64",
+            variant: "normal",
+            jobKey: .targetJob(7),
+            jobSignature: signature
+        )
+        let differentJob = SwiftDriverJobTaskAction.acceleratorFaultSelector(
+            targetIdentity: "TARGET-GUID-/Users/private-project",
+            arch: "arm64",
+            variant: "normal",
+            jobKey: .targetJob(8),
+            jobSignature: signature
+        )
+
+        #expect(selector == repeated)
+        #expect(selector != differentJob)
+        #expect(selector.utf8.count == 64)
+        #expect(selector.utf8.allSatisfy {
+            (UInt8(ascii: "0")...UInt8(ascii: "9")).contains($0)
+                || (UInt8(ascii: "a")...UInt8(ascii: "f")).contains($0)
+        })
+        #expect(!selector.contains("Users"))
+        #expect(!selector.contains("private-project"))
+    }
+
+    @Test
+    func faultControllerRejectsWrongPolicyAndSelectorWithoutConsumingClaim() {
+        let selector = String(repeating: "b", count: 64)
+        let configuration = SwiftAcceleratorCacheFaultInjectionConfiguration(environment: [
+            SwiftAcceleratorCacheFaultInjectionConfiguration.faultEnvironmentVariable: "v1:replay_error:\(selector)",
+        ])
+        let controller = SwiftAcceleratorCacheFaultInjectionController(configuration: configuration)
+
+        #expect(!controller.claim(selector: selector, mode: .stock, eligibility: .eligible, checkpoint: .replayError))
+        #expect(!controller.claim(selector: selector, mode: .observe, eligibility: .eligible, checkpoint: .replayError))
+        #expect(!controller.claim(selector: selector, mode: .trust, eligibility: .eligible, checkpoint: .replayError))
+        #expect(!controller.claim(selector: selector, mode: .verify, eligibility: .excluded(.unsupportedPlatform), checkpoint: .replayError))
+        #expect(!controller.claim(selector: String(repeating: "c", count: 64), mode: .verify, eligibility: .eligible, checkpoint: .replayError))
+        #expect(!controller.claim(selector: selector, mode: .verify, eligibility: .eligible, checkpoint: .queryError))
+        #expect(controller.claim(selector: selector, mode: .verify, eligibility: .eligible, checkpoint: .replayError))
+        #expect(!controller.claim(selector: selector, mode: .verify, eligibility: .eligible, checkpoint: .replayError))
+    }
+
+    @Test
+    func faultControllerClaimsExactlyOnceConcurrently() async {
+        let selector = String(repeating: "d", count: 64)
+        let configuration = SwiftAcceleratorCacheFaultInjectionConfiguration(environment: [
+            SwiftAcceleratorCacheFaultInjectionConfiguration.faultEnvironmentVariable: "v1:manifest_error:\(selector)",
+        ])
+        let controller = SwiftAcceleratorCacheFaultInjectionController(configuration: configuration)
+        let claimCount = await withTaskGroup(of: Int.self, returning: Int.self) { group in
+            for _ in 0..<64 {
+                group.addTask {
+                    controller.claim(selector: selector, mode: .verify, eligibility: .eligible, checkpoint: .manifestError) ? 1 : 0
+                }
+            }
+            var total = 0
+            for await value in group {
+                total += value
+            }
+            return total
+        }
+        #expect(claimCount == 1)
+    }
+
+    @Test
+    func missesAndCancellationDoNotConsumeLaterPhaseFaults() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        for fault in [SwiftAcceleratorCacheInjectedFault.replayError, .manifestError] {
+            let expectedOutcome: SwiftAcceleratorCachePreparationOutcome = fault == .replayError ? .replayError : .manifestError
+            let selector = fault == .replayError ? String(repeating: "e", count: 64) : String(repeating: "f", count: 64)
+            let configuration = SwiftAcceleratorCacheFaultInjectionConfiguration(environment: [
+                SwiftAcceleratorCacheFaultInjectionConfiguration.faultEnvironmentVariable: "v1:\(fault.rawValue):\(selector)",
+            ])
+            let controller = SwiftAcceleratorCacheFaultInjectionController(configuration: configuration)
+            let claim: (SwiftAcceleratorCacheInjectedFault) -> Bool = { checkpoint in
+                controller.claim(selector: selector, mode: .verify, eligibility: .eligible, checkpoint: checkpoint)
+            }
+
+            let miss = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+                mode: .verify,
+                operations: TestSwiftCacheOperations(queries: ["key": .miss], outputs: [:]),
+                cacheKeys: ["key"],
+                plannedOutputs: [temporaryDirectory.path.join("miss-\(fault.rawValue).o")],
+                commandLine: ["swift-frontend", "-c"],
+                fs: localFS,
+                claimInjectedFault: claim
+            )
+            #expect(miss.outcome == .miss)
+
+            let cancelled = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+                mode: .verify,
+                operations: TestSwiftCacheOperations(queries: ["key": .hit(1)], outputs: [:]),
+                cacheKeys: ["key"],
+                plannedOutputs: [temporaryDirectory.path.join("cancelled-\(fault.rawValue).o")],
+                commandLine: ["swift-frontend", "-c"],
+                fs: localFS,
+                claimInjectedFault: claim,
+                isCancelled: { true }
+            )
+            #expect(cancelled.outcome == .cancelled)
+
+            let output = temporaryDirectory.path.join("later-\(fault.rawValue).o")
+            let operations = TestSwiftCacheOperations(
+                queries: ["key": .hit(1)],
+                outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+            )
+            operations.replaySideEffect = { _ in
+                try localFS.write(output, contents: ByteString(encodingAsUTF8: "cached"))
+            }
+            let injected = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+                mode: .verify,
+                operations: operations,
+                cacheKeys: ["key"],
+                plannedOutputs: [output],
+                commandLine: ["swift-frontend", "-c"],
+                fs: localFS,
+                claimInjectedFault: claim
+            )
+            #expect(injected.outcome == expectedOutcome)
+
+            let later = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+                mode: .verify,
+                operations: operations,
+                cacheKeys: ["key"],
+                plannedOutputs: [output],
+                commandLine: ["swift-frontend", "-c"],
+                fs: localFS,
+                claimInjectedFault: claim
+            )
+            #expect(later.outcome == .verificationReady)
+        }
+    }
+
+    @Test(.requireHostOS(.macOS))
+    func preScrubFailureDoesNotConsumeLaterPhaseFault() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        for fault in [SwiftAcceleratorCacheInjectedFault.replayError, .manifestError] {
+            let expectedOutcome: SwiftAcceleratorCachePreparationOutcome = fault == .replayError ? .replayError : .manifestError
+            let selector = fault == .replayError ? String(repeating: "1", count: 64) : String(repeating: "2", count: 64)
+            let configuration = SwiftAcceleratorCacheFaultInjectionConfiguration(environment: [
+                SwiftAcceleratorCacheFaultInjectionConfiguration.faultEnvironmentVariable: "v1:\(fault.rawValue):\(selector)",
+            ])
+            let controller = SwiftAcceleratorCacheFaultInjectionController(configuration: configuration)
+            let claim: (SwiftAcceleratorCacheInjectedFault) -> Bool = { checkpoint in
+                controller.claim(selector: selector, mode: .verify, eligibility: .eligible, checkpoint: checkpoint)
+            }
+            let lockedDirectory = temporaryDirectory.path.join("locked-\(fault.rawValue)")
+            let blockedOutput = lockedDirectory.join("blocked.o")
+            try localFS.createDirectory(lockedDirectory, recursive: true)
+            try localFS.write(blockedOutput, contents: ByteString(encodingAsUTF8: "stale"))
+            try localFS.setFilePermissions(lockedDirectory, permissions: 0o555)
+            defer { try? localFS.setFilePermissions(lockedDirectory, permissions: 0o755) }
+            let first = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+                mode: .verify,
+                operations: TestSwiftCacheOperations(
+                    queries: ["key": .hit(1)],
+                    outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+                ),
+                cacheKeys: ["key"],
+                plannedOutputs: [blockedOutput],
+                commandLine: ["swift-frontend", "-c"],
+                fs: localFS,
+                claimInjectedFault: claim
+            )
+            try localFS.setFilePermissions(lockedDirectory, permissions: 0o755)
+            #expect(first.outcome == .scrubFailure)
+
+            let laterOutput = temporaryDirectory.path.join("after-scrub-\(fault.rawValue).o")
+            let laterOperations = TestSwiftCacheOperations(
+                queries: ["key": .hit(1)],
+                outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+            )
+            laterOperations.replaySideEffect = { _ in
+                try localFS.write(laterOutput, contents: ByteString(encodingAsUTF8: "cached"))
+            }
+            let later = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+                mode: .verify,
+                operations: laterOperations,
+                cacheKeys: ["key"],
+                plannedOutputs: [laterOutput],
+                commandLine: ["swift-frontend", "-c"],
+                fs: localFS,
+                claimInjectedFault: claim
+            )
+            #expect(later.outcome == expectedOutcome)
+        }
+    }
+    #endif
+
     @Test(.requireHostOS(.macOS))
     func scrubFailureIsAlwaysFatalAndBlocksFrontend() throws {
         let temporaryDirectory = try NamedTemporaryDirectory()

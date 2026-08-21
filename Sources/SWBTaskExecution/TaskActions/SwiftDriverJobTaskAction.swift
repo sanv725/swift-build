@@ -17,6 +17,10 @@ public import SWBUtil
 public import SWBLLBuild
 import SWBProtocol
 
+#if SWIFT_BUILD_ACCELERATOR_FAULT_INJECTION
+import Synchronization
+#endif
+
 package struct SwiftCacheCachedOutput: Sendable, Equatable {
     package let kindName: String
     package let isMaterialized: Bool
@@ -144,6 +148,96 @@ package enum SwiftAcceleratorCachePreparationOutcome: Sendable, Equatable {
         self != .scrubFailure && self != .cancelled
     }
 }
+
+/// A nonserialized test seam for exercising the accelerator's existing
+/// fail-open decision boundaries. The environment-controlled adapter is only
+/// compiled into dedicated fault-injection service builds below.
+package enum SwiftAcceleratorCacheInjectedFault: String, Sendable, Equatable {
+    case queryError = "query_error"
+    case replayError = "replay_error"
+    case manifestError = "manifest_error"
+}
+
+private enum SwiftAcceleratorCacheInjectedError: Error {
+    case injected
+}
+
+#if SWIFT_BUILD_ACCELERATOR_FAULT_INJECTION
+package struct SwiftAcceleratorCacheFaultInjectionConfiguration: Sendable, Equatable {
+    package struct Request: Sendable, Equatable {
+        package let fault: SwiftAcceleratorCacheInjectedFault
+        package let selector: String
+    }
+
+    package static let faultEnvironmentVariable = "SWIFTBUILD_INTERNAL_ACCELERATOR_CACHE_FAULT"
+    package static let discoveryEnvironmentVariable = "SWIFTBUILD_INTERNAL_ACCELERATOR_CACHE_FAULT_DISCOVERY"
+
+    package let request: Request?
+    package let discoveryEnabled: Bool
+
+    package init(environment: [String: String]) {
+        discoveryEnabled = environment[Self.discoveryEnvironmentVariable] == "1"
+        guard let rawRequest = environment[Self.faultEnvironmentVariable] else {
+            request = nil
+            return
+        }
+        let fields = rawRequest.split(separator: ":", omittingEmptySubsequences: false)
+        guard fields.count == 3,
+              fields[0] == "v1",
+              let fault = SwiftAcceleratorCacheInjectedFault(rawValue: String(fields[1])),
+              Self.isLowercaseSHA256(String(fields[2])) else {
+            request = nil
+            return
+        }
+        request = .init(fault: fault, selector: String(fields[2]))
+    }
+
+    package static func removeControlVariables(from environment: inout [String: String]) {
+        environment.removeValue(forKey: faultEnvironmentVariable)
+        environment.removeValue(forKey: discoveryEnvironmentVariable)
+    }
+
+    private static func isLowercaseSHA256(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy {
+            (UInt8(ascii: "0")...UInt8(ascii: "9")).contains($0)
+                || (UInt8(ascii: "a")...UInt8(ascii: "f")).contains($0)
+        }
+    }
+}
+
+package final class SwiftAcceleratorCacheFaultInjectionController: @unchecked Sendable {
+    package static let shared = SwiftAcceleratorCacheFaultInjectionController(
+        configuration: .init(environment: ProcessInfo.processInfo.environment)
+    )
+
+    package let configuration: SwiftAcceleratorCacheFaultInjectionConfiguration
+    private let claimed = SWBMutex(false)
+
+    package init(configuration: SwiftAcceleratorCacheFaultInjectionConfiguration) {
+        self.configuration = configuration
+    }
+
+    package func claim(
+        selector: String,
+        mode: SwiftBuildAcceleratorCacheMode,
+        eligibility: SwiftBuildAcceleratorCacheEligibility,
+        checkpoint: SwiftAcceleratorCacheInjectedFault
+    ) -> Bool {
+        guard mode == .verify,
+              eligibility == .eligible,
+              let request = configuration.request,
+              request.fault == checkpoint,
+              request.selector == selector else {
+            return false
+        }
+        return claimed.withLock { claimed in
+            guard !claimed else { return false }
+            claimed = true
+            return true
+        }
+    }
+}
+#endif
 
 package struct SwiftAcceleratorCachePreparation: Sendable, Equatable {
     package let outcome: SwiftAcceleratorCachePreparationOutcome
@@ -610,6 +704,19 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             environment = task.environment.bindingsDictionary
         }
 
+        #if SWIFT_BUILD_ACCELERATOR_FAULT_INJECTION
+        let acceleratorFaultController = SwiftAcceleratorCacheFaultInjectionController.shared
+        SwiftAcceleratorCacheFaultInjectionConfiguration.removeControlVariables(from: &environment)
+        let acceleratorFaultSelector = Self.acceleratorFaultSelector(
+            targetIdentity: task.forTarget?.guid.stringValue,
+            arch: arch,
+            variant: variant,
+            jobKey: driverJob.key,
+            jobSignature: driverJob.signature
+        )
+        var acceleratorFaultCandidateWasProbed = false
+        #endif
+
         guard let payload = task.payload as? SwiftDriverJobDynamicTaskPayload else {
             fatalError("Unexpected payload type: \(type(of: task.payload)).")
         }
@@ -757,6 +864,14 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                         finalDisposition: finalDisposition
                     ))
                 }
+                #if SWIFT_BUILD_ACCELERATOR_FAULT_INJECTION
+                if acceleratorFaultController.configuration.discoveryEnabled,
+                   acceleratorFaultCandidateWasProbed {
+                    outputDelegate.note(
+                        "Swift accelerator cache fault candidate selector=\(acceleratorFaultSelector) outcome=\(observationOutcome.rawValue)"
+                    )
+                }
+                #endif
             }
 
             var cas: SwiftCASDatabases?
@@ -846,6 +961,20 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                             fileSystem: executionDelegate.fs
                         )
 
+                        #if SWIFT_BUILD_ACCELERATOR_FAULT_INJECTION
+                        acceleratorFaultCandidateWasProbed = true
+                        let claimInjectedFault: ((SwiftAcceleratorCacheInjectedFault) -> Bool)? = { checkpoint in
+                            acceleratorFaultController.claim(
+                                selector: acceleratorFaultSelector,
+                                mode: acceleratorPolicy.mode,
+                                eligibility: acceleratorPolicy.eligibility,
+                                checkpoint: checkpoint
+                            )
+                        }
+                        #else
+                        let claimInjectedFault: ((SwiftAcceleratorCacheInjectedFault) -> Bool)? = nil
+                        #endif
+
                         let preparation = Self.prepareAcceleratorCache(
                             mode: acceleratorPolicy.mode,
                             operations: SwiftCASCacheOperations(databases: database),
@@ -853,6 +982,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                             plannedOutputs: plannedOutputs,
                             commandLine: options.commandLine,
                             fs: executionDelegate.fs,
+                            claimInjectedFault: claimInjectedFault,
                             isCancelled: { _Concurrency.Task<Never, Never>.isCancelled }
                         )
                         lookupDurationNS = preparation.lookupDurationNS
@@ -1167,14 +1297,25 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         plannedOutputs: [Path],
         commandLine: [String],
         fs: any FSProxy,
+        injectedFault: SwiftAcceleratorCacheInjectedFault? = nil,
+        claimInjectedFault: ((SwiftAcceleratorCacheInjectedFault) -> Bool)? = nil,
         isCancelled: () -> Bool = { false }
     ) -> SwiftAcceleratorCachePreparation {
         if isCancelled() {
             return .init(outcome: .cancelled, lookupDurationNS: 0)
         }
+        // The runtime controller already enforces this boundary. Keep the
+        // nonserialized test seam equally narrow if it is called directly.
+        let activeInjectedFault = mode == .verify ? injectedFault : nil
+        let claimAtCheckpoint: (SwiftAcceleratorCacheInjectedFault) -> Bool = { checkpoint in
+            activeInjectedFault == checkpoint || (mode == .verify && claimInjectedFault?(checkpoint) == true)
+        }
         let lookupTimer = ElapsedTimer()
         let probe: SwiftCacheProbeResult<Operations.Compilation>
         do {
+            if claimAtCheckpoint(.queryError) {
+                throw SwiftAcceleratorCacheInjectedError.injected
+            }
             probe = try probeCache(operations: operations, cacheKeys: cacheKeys, isCancelled: isCancelled)
         } catch is CancellationError {
             return .init(outcome: .cancelled, lookupDurationNS: lookupTimer.elapsedTime().nanoseconds)
@@ -1229,6 +1370,9 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             var shadowManifest: SwiftCacheOutputManifest?
             let replayTimer = ElapsedTimer()
             do {
+                if claimAtCheckpoint(.replayError) {
+                    throw SwiftAcceleratorCacheInjectedError.injected
+                }
                 try replayCache(operations: operations, compilations: compilations, commandLine: commandLine, isCancelled: isCancelled)
             } catch is CancellationError {
                 outcome = .cancelled
@@ -1241,6 +1385,9 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             if outcome == .verificationReady && !isCancelled() {
                 let manifestTimer = ElapsedTimer()
                 do {
+                    if claimAtCheckpoint(.manifestError) {
+                        throw SwiftAcceleratorCacheInjectedError.injected
+                    }
                     shadowManifest = try makeOutputManifest(plannedOutputs, fs: fs, isCancelled: isCancelled)
                 } catch is CancellationError {
                     outcome = .cancelled
@@ -1352,6 +1499,45 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
     ) -> Bool {
         mode.isAcceleratorEnabled && isCancelled
     }
+
+    #if SWIFT_BUILD_ACCELERATOR_FAULT_INJECTION
+    /// Returns a path-free, opaque identity for selecting one planned Swift
+    /// job in a dedicated fault-injection build. The inputs are deliberately
+    /// limited to stable planning identity; command lines, cache keys, and
+    /// filesystem paths are not accepted by this boundary.
+    package static func acceleratorFaultSelector(
+        targetIdentity: String?,
+        arch: String,
+        variant: String?,
+        jobKey: LibSwiftDriver.JobKey,
+        jobSignature: ByteString
+    ) -> String {
+        let context = SHA256Context()
+
+        func addField(_ bytes: [UInt8]) {
+            context.add(number: UInt64(bytes.count))
+            context.add(bytes: bytes)
+        }
+        func addField(_ value: String) {
+            addField(Array(value.utf8))
+        }
+
+        addField("swift-build-accelerator-fault-selector-v1")
+        addField(targetIdentity ?? "explicit-dependency")
+        addField(arch)
+        addField(variant ?? "")
+        switch jobKey {
+        case .targetJob(let index):
+            addField("target")
+            addField(String(index))
+        case .explicitDependencyJob(let index):
+            addField("explicit")
+            addField(String(index))
+        }
+        addField(jobSignature.bytes)
+        return String(decoding: context.signature.bytes, as: UTF8.self)
+    }
+    #endif
 
     private static func isSymlink(_ path: Path, fs: any FSProxy) -> Bool {
         var destinationExists = false
