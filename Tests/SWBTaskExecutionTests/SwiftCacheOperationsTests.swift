@@ -1213,7 +1213,9 @@ fileprivate struct SwiftCacheOperationsTests {
         #expect(accepted.replayStreams?.count == 10)
         #expect(operations.replayedCompilations == Array(0..<10))
         #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
-        #expect(operations.requestedReplayParallelisms == [10])
+        #expect(operations.requestedReplayParallelisms == [
+            SwiftDriverJobTaskAction.unsafeParallelReplayMaximumParallelism
+        ])
         #endif
 
         for output in outputs where fs.exists(output) {
@@ -1441,8 +1443,24 @@ fileprivate struct SwiftCacheOperationsTests {
 
     #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
     @Test
+    func unsafeParallelReplaySelectsRequestedCompileTimeWidth() {
+        #if SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_WIDTH_2
+        #expect(SwiftDriverJobTaskAction.unsafeParallelReplayMaximumParallelism == 2)
+        #elseif SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_WIDTH_3
+        #expect(SwiftDriverJobTaskAction.unsafeParallelReplayMaximumParallelism == 3)
+        #elseif SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_WIDTH_4
+        #expect(SwiftDriverJobTaskAction.unsafeParallelReplayMaximumParallelism == 4)
+        #elseif SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_WIDTH_6
+        #expect(SwiftDriverJobTaskAction.unsafeParallelReplayMaximumParallelism == 6)
+        #else
+        #expect(SwiftDriverJobTaskAction.unsafeParallelReplayMaximumParallelism == 10)
+        #endif
+    }
+
+    @Test
     func unsafeParallelReplayDrainsStaggeredWorkAndPreservesCompilerKeyStreamOrder() throws {
         let compilations = Array(0..<11)
+        let maximumParallelism = SwiftDriverJobTaskAction.unsafeParallelReplayMaximumParallelism
         let operations = ParallelTestSwiftCacheOperations(
             queries: [:],
             outputs: [:],
@@ -1459,7 +1477,7 @@ fileprivate struct SwiftCacheOperationsTests {
             compilations: compilations,
             commandLine: ["swift-frontend", "-c"],
             captureStreams: true,
-            maximumParallelism: 10
+            maximumParallelism: maximumParallelism
         )
 
         #expect(streams?.map(\.standardOutput) == compilations.map { "stdout-\($0)" })
@@ -1469,14 +1487,15 @@ fileprivate struct SwiftCacheOperationsTests {
         #expect(operations.completedCompilations != compilations)
         #expect(operations.activeReplayCount == 0)
         #expect(operations.maximumActiveReplayCount > 1)
-        #expect(operations.maximumActiveReplayCount <= 10)
-        #expect(operations.requestedReplayParallelisms == [10])
+        #expect(operations.maximumActiveReplayCount <= maximumParallelism)
+        #expect(operations.requestedReplayParallelisms == [maximumParallelism])
     }
 
     @Test
     func unsafeParallelReplayFailureDrainsEveryLaneAndScrubsPartialOutputs() throws {
         let temporaryDirectory = try NamedTemporaryDirectory()
         let compilations = Array(0..<11)
+        let maximumParallelism = SwiftDriverJobTaskAction.unsafeParallelReplayMaximumParallelism
         let cacheKeys = compilations.map { "key-\($0)" }
         let plannedKinds = ["object", "d", "const-values", "swift-dependencies", "diagnostics"]
         let cachedOutputs: [SwiftCacheCachedOutput] = [
@@ -1521,13 +1540,14 @@ fileprivate struct SwiftCacheOperationsTests {
         #expect(operations.completedCompilations.count == compilations.count)
         #expect(operations.activeReplayCount == 0)
         #expect(operations.maximumActiveReplayCount > 1)
-        #expect(operations.maximumActiveReplayCount <= 10)
-        #expect(operations.requestedReplayParallelisms == [10])
+        #expect(operations.maximumActiveReplayCount <= maximumParallelism)
+        #expect(operations.requestedReplayParallelisms == [maximumParallelism])
         #expect(outputGroups.flatMap { $0 }.allSatisfy { !localFS.exists($0) })
     }
 
     @Test
     func unsafeParallelReplayDrainsBeforeInFlightCancellationOrQuarantineFallback() throws {
+        let maximumParallelism = SwiftDriverJobTaskAction.unsafeParallelReplayMaximumParallelism
         for quarantineAfterFirstCompletion in [false, true] {
             let temporaryDirectory = try NamedTemporaryDirectory()
             let compilations = Array(0..<11)
@@ -1579,14 +1599,15 @@ fileprivate struct SwiftCacheOperationsTests {
             #expect(operations.replayedCompilations.sorted() == compilations)
             #expect(operations.completedCompilations.count == compilations.count)
             #expect(operations.activeReplayCount == 0)
-            #expect(operations.maximumActiveReplayCount <= 10)
-            #expect(operations.requestedReplayParallelisms == [10])
+            #expect(operations.maximumActiveReplayCount <= maximumParallelism)
+            #expect(operations.requestedReplayParallelisms == [maximumParallelism])
             #expect(outputGroups.flatMap { $0 }.allSatisfy { !localFS.exists($0) })
         }
     }
 
     @Test
     func unsafeParallelReplayKeepsSingleCompilationOnSerialPath() throws {
+        let maximumParallelism = SwiftDriverJobTaskAction.unsafeParallelReplayMaximumParallelism
         let operations = ParallelTestSwiftCacheOperations(
             queries: [:],
             outputs: [:],
@@ -1601,7 +1622,7 @@ fileprivate struct SwiftCacheOperationsTests {
             compilations: [1],
             commandLine: ["swift-frontend", "-emit-module"],
             captureStreams: true,
-            maximumParallelism: 10
+            maximumParallelism: maximumParallelism
         )
 
         #expect(streams == [.init(standardOutput: "stdout", standardError: "stderr")])

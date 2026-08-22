@@ -18,6 +18,26 @@ public import SWBLLBuild
 import SWBProtocol
 
 #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
+// Candidate widths are separate compile definitions so every measured service
+// has one receipt-bound value. Omitting them preserves the commissioned width 10.
+#if SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_WIDTH_2 && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_WIDTH_3
+#error("unsafe parallel Swift cache replay requires at most one width selection")
+#endif
+#if SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_WIDTH_2 && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_WIDTH_4
+#error("unsafe parallel Swift cache replay requires at most one width selection")
+#endif
+#if SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_WIDTH_2 && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_WIDTH_6
+#error("unsafe parallel Swift cache replay requires at most one width selection")
+#endif
+#if SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_WIDTH_3 && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_WIDTH_4
+#error("unsafe parallel Swift cache replay requires at most one width selection")
+#endif
+#if SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_WIDTH_3 && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_WIDTH_6
+#error("unsafe parallel Swift cache replay requires at most one width selection")
+#endif
+#if SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_WIDTH_4 && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_WIDTH_6
+#error("unsafe parallel Swift cache replay requires at most one width selection")
+#endif
 import Synchronization
 #endif
 
@@ -618,6 +638,20 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
     public override class var toolIdentifier: String {
         "swift-driver-job-execution"
     }
+
+    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
+    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_WIDTH_2
+    package static let unsafeParallelReplayMaximumParallelism = 2
+    #elseif SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_WIDTH_3
+    package static let unsafeParallelReplayMaximumParallelism = 3
+    #elseif SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_WIDTH_4
+    package static let unsafeParallelReplayMaximumParallelism = 4
+    #elseif SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_WIDTH_6
+    package static let unsafeParallelReplayMaximumParallelism = 6
+    #else
+    package static let unsafeParallelReplayMaximumParallelism = 10
+    #endif
+    #endif
 
     private struct Options {
         static func emitUsage(_ name: String, _ outputDelegate: any TaskOutputDelegate) {
@@ -2297,7 +2331,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                     cacheKeyCount: cacheKeys.count,
                     plannedKindGroups: expectedOutputKindGroups
                 ) {
-                case .compile?: 10
+                case .compile?: unsafeParallelReplayMaximumParallelism
                 case .emitModule?, nil: 1
                 }
             } else {
