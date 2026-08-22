@@ -1019,7 +1019,7 @@ fileprivate struct SwiftCacheOperationsTests {
 
     #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
     @Test
-    func unsafeSemanticOutputProfilesRequireExactPinnedShapes() throws {
+    func unsafeSemanticOutputProfilesRequirePinnedPlannedShapes() throws {
         let compilePlannedKinds = ["object", "d", "const-values", "swift-dependencies", "diagnostics"]
         let modulePlannedKinds = [
             "swiftmodule", "swiftdoc", "swiftsourceinfo",
@@ -1058,17 +1058,24 @@ fileprivate struct SwiftCacheOperationsTests {
             .init(kindName: "const-values", isMaterialized: true),
         ]
         for keyCount in [10, 11] {
-            let result = try probe(
-                jobKind: .compile,
-                plannedKindGroups: Array(repeating: compilePlannedKinds, count: keyCount),
-                cachedOutputGroups: Array(repeating: compileCachedOutputs, count: keyCount)
-            ).0
-            switch result {
-            case .hit(let compilations, let outputCount):
-                #expect(compilations == Array(0..<keyCount))
-                #expect(outputCount == 5 * keyCount)
-            case .miss:
-                Issue.record("exact \(keyCount)-key compile semantic output profile was rejected")
+            let admittedCachedShapes = [
+                compileCachedOutputs,
+                [compileCachedOutputs[1], compileCachedOutputs[0]] + compileCachedOutputs.dropFirst(2),
+                compileCachedOutputs + [.init(kindName: "cached-diagnostics", isMaterialized: true)],
+            ]
+            for cachedOutputs in admittedCachedShapes {
+                let result = try probe(
+                    jobKind: .compile,
+                    plannedKindGroups: Array(repeating: compilePlannedKinds, count: keyCount),
+                    cachedOutputGroups: Array(repeating: cachedOutputs, count: keyCount)
+                ).0
+                switch result {
+                case .hit(let compilations, let outputCount):
+                    #expect(compilations == Array(0..<keyCount))
+                    #expect(outputCount == 5 * keyCount)
+                case .miss:
+                    Issue.record("trusted \(keyCount)-key compile semantic output profile was rejected")
+                }
             }
         }
 
@@ -1093,9 +1100,8 @@ fileprivate struct SwiftCacheOperationsTests {
         }
 
         let rejectedCachedShapes: [(SwiftCacheSemanticOutputJobKind, Int, [String], [SwiftCacheCachedOutput])] = [
-            (.compile, 10, compilePlannedKinds, compileCachedOutputs + [.init(kindName: "cached-diagnostics", isMaterialized: true)]),
             (.compile, 10, compilePlannedKinds, Array(compileCachedOutputs.dropLast())),
-            (.compile, 10, compilePlannedKinds, [compileCachedOutputs[1], compileCachedOutputs[0]] + compileCachedOutputs.dropFirst(2)),
+            (.compile, 10, compilePlannedKinds, [compileCachedOutputs[0], compileCachedOutputs[1], compileCachedOutputs[2], compileCachedOutputs[0]]),
             (.emitModule, 1, modulePlannedKinds, Array(moduleCachedOutputs.dropLast())),
             (.emitModule, 1, modulePlannedKinds, [moduleCachedOutputs[1], moduleCachedOutputs[0]] + moduleCachedOutputs.dropFirst(2)),
             (.compile, 10, Array(compilePlannedKinds.dropLast()), compileCachedOutputs),

@@ -1710,8 +1710,9 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
     ) -> Bool {
         switch profile {
         case .compile:
-            return cachedKinds.fileKinds == ["object", "dependencies", "swift-dependencies", "const-values"]
-                && !cachedKinds.hasCachedDiagnostics
+            let expectedKinds: Set<String> = ["object", "dependencies", "swift-dependencies", "const-values"]
+            return cachedKinds.fileKinds.count == expectedKinds.count
+                && Set(cachedKinds.fileKinds) == expectedKinds
         case .emitModule:
             return cachedKinds.fileKinds == [
                 "dependencies", "swiftmodule", "swiftdoc", "swiftsourceinfo", "abi-baseline-json",
