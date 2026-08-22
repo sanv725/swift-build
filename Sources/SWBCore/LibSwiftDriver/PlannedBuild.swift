@@ -78,6 +78,10 @@ public struct SwiftDriverJob: Serializable, CustomDebugStringConvertible {
     public let descriptionForLifecycle: String
     /// All file outputs this job produces
     public let outputs: [Path]
+    /// Expected file-producing cache output kinds, grouped in the same stable
+    /// cache-key order as ``cacheKeys``. Cached diagnostics are replay streams
+    /// and are deliberately not included in these groups.
+    public let cacheOutputKindGroups: [[String]]
     /// The command line to execute for this job
     public let commandLine: [SWBUtil.ByteString]
     /// The signature uniquely identifying the command line, looking through any indirection through response files.
@@ -115,13 +119,26 @@ public struct SwiftDriverJob: Serializable, CustomDebugStringConvertible {
             self.kind = categorizer.isExplicitDependencyBuild ? .explicitModule(uniqueID: responseFileContents.hashValue) : .target
         }
 
-        self.cacheKeys = job.outputCacheKeys.reduce(into: [String]()) { result, key in
-            result.append(key.value)
-        }.sorted()
+        let orderedCacheEntries = job.outputCacheKeys.map { input, key in
+            let outputs: [TypedVirtualPath]
+            if job.kind == .compile {
+                outputs = job.getCompileInputOutputs(for: input) ?? []
+            } else {
+                outputs = job.outputs
+            }
+            return (
+                key: key,
+                outputKindNames: outputs.compactMap {
+                    $0.type == .cachedDiagnostics ? nil : $0.type.description
+                }
+            )
+        }.sorted { $0.key < $1.key }
+        self.cacheKeys = orderedCacheEntries.map(\.key)
+        self.cacheOutputKindGroups = orderedCacheEntries.map(\.outputKindNames)
     }
 
     public func serialize<T>(to serializer: T) where T : Serializer {
-        serializer.serializeAggregate(10) {
+        serializer.serializeAggregate(11) {
             serializer.serialize(kind)
             serializer.serialize(ruleInfoType)
             serializer.serialize(moduleName)
@@ -132,11 +149,12 @@ public struct SwiftDriverJob: Serializable, CustomDebugStringConvertible {
             serializer.serialize(commandLineSignature)
             serializer.serialize(descriptionForLifecycle)
             serializer.serialize(cacheKeys)
+            serializer.serialize(cacheOutputKindGroups)
         }
     }
 
     public init(from deserializer: any Deserializer) throws {
-        try deserializer.beginAggregate(9)
+        try deserializer.beginAggregate(11)
         try self.kind = deserializer.deserialize()
         try self.ruleInfoType = deserializer.deserialize()
         try self.moduleName = deserializer.deserialize()
@@ -147,6 +165,7 @@ public struct SwiftDriverJob: Serializable, CustomDebugStringConvertible {
         try self.commandLineSignature = deserializer.deserialize()
         try self.descriptionForLifecycle = deserializer.deserialize()
         try self.cacheKeys = deserializer.deserialize()
+        try self.cacheOutputKindGroups = deserializer.deserialize()
     }
 
     public var debugDescription: String {

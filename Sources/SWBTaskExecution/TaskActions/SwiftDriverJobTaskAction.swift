@@ -88,6 +88,7 @@ package struct SwiftCASCacheOperations: SwiftCacheOperations {
 package enum SwiftCacheProbeMissReason: Sendable, Equatable {
     case missingKey
     case nonMaterializedOutput
+    case unsupportedOutput
 }
 
 package enum SwiftCacheProbeResult<Compilation> {
@@ -103,12 +104,14 @@ package struct SwiftCacheOutputManifest: Sendable, Equatable {
     package struct Entry: Sendable, Equatable {
         package let ordinal: Int
         package let fileKind: FileKind
+        package let permissions: UInt16
         package let byteCount: Int64
         package let digest: ByteString
 
-        package init(ordinal: Int, fileKind: FileKind, byteCount: Int64, digest: ByteString) {
+        package init(ordinal: Int, fileKind: FileKind, permissions: UInt16, byteCount: Int64, digest: ByteString) {
             self.ordinal = ordinal
             self.fileKind = fileKind
+            self.permissions = permissions
             self.byteCount = byteCount
             self.digest = digest
         }
@@ -1205,6 +1208,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                             trustAuthorization: acceleratorTrustAuthorization,
                             operations: SwiftCASCacheOperations(databases: database),
                             cacheKeys: cacheKeys,
+                            expectedOutputKindGroups: driverJob.driverJob.cacheOutputKindGroups,
                             plannedOutputs: plannedOutputs,
                             commandLine: options.commandLine,
                             fs: executionDelegate.fs,
@@ -1414,16 +1418,21 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
     package static func probeCache<Operations: SwiftCacheOperations>(
         operations: Operations,
         cacheKeys: [String],
+        expectedOutputKindGroups: [[String]],
         isCancelled: () -> Bool = { false }
     ) throws -> SwiftCacheProbeResult<Operations.Compilation> {
         guard !cacheKeys.isEmpty else {
             return .miss(.missingKey)
         }
+        guard cacheKeys.count == expectedOutputKindGroups.count,
+              expectedOutputKindGroups.allSatisfy({ !$0.isEmpty && $0.allSatisfy(supportedCachedFileOutputKinds.contains) }) else {
+            return .miss(.unsupportedOutput)
+        }
 
         var compilations: [Operations.Compilation] = []
         var outputCount = 0
         compilations.reserveCapacity(cacheKeys.count)
-        for cacheKey in cacheKeys {
+        for (cacheKey, expectedOutputKindNames) in zip(cacheKeys, expectedOutputKindGroups) {
             if isCancelled() { throw CancellationError() }
             let queriedCompilation = try operations.queryLocalCacheKey(cacheKey)
             if isCancelled() { throw CancellationError() }
@@ -1435,10 +1444,51 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             guard !outputs.isEmpty, outputs.allSatisfy(\.isMaterialized) else {
                 return .miss(.nonMaterializedOutput)
             }
-            outputCount += outputs.count
+            guard let admittedOutputKindNames = admittedCachedFileOutputKinds(outputs),
+                  admittedOutputKindNames == expectedOutputKindNames else {
+                return .miss(.unsupportedOutput)
+            }
+            outputCount += admittedOutputKindNames.count
             compilations.append(compilation)
         }
         return .hit(compilations: compilations, outputCount: outputCount)
+    }
+
+    /// Cache output names are part of the compiler CAS protocol. Keep the
+    /// materializing allowlist explicit so a new or ambiguous output kind fails
+    /// closed until its filesystem behavior is understood and tested.
+    private static let supportedCachedFileOutputKinds: Set<String> = [
+        "abi-baseline-json", "api-baseline-json", "api-descriptor-json",
+        "assembly", "ast-dump", "autolink", "bitstream-opt-record",
+        "const-values", "dependencies", "diagnostics",
+        "emit-module-dependencies", "emit-module-diagnostics", "imported-modules",
+        "json-dependencies", "json-module-artifacts", "json-supported-features",
+        "json-supported-swift-features", "json-target-info", "llvm-bc", "llvm-ir",
+        "module-semantic-info", "module-trace", "modulemap", "object", "objc-header", "pch", "pcm",
+        "private-swiftinterface", "package-swiftinterface", "raw-llvm-ir", "raw-sib",
+        "raw-sil", "remap", "sib", "sil", "swift-dependencies", "swiftdoc",
+        "swiftinterface", "swiftmodule", "swift-module-summary", "swiftsourceinfo", "tbd",
+        "yaml-opt-record",
+    ]
+
+    /// Cached diagnostics are replayed as diagnostics/streams, not as a planned
+    /// file output. At most one is accepted, and only after every file output.
+    private static func admittedCachedFileOutputKinds(_ outputs: [SwiftCacheCachedOutput]) -> [String]? {
+        var fileKinds: [String] = []
+        var sawCachedDiagnostics = false
+        for output in outputs {
+            if output.kindName == "cached-diagnostics" {
+                guard !sawCachedDiagnostics else { return nil }
+                sawCachedDiagnostics = true
+                continue
+            }
+            guard !sawCachedDiagnostics,
+                  supportedCachedFileOutputKinds.contains(output.kindName) else {
+                return nil
+            }
+            fileKinds.append(output.kindName)
+        }
+        return fileKinds
     }
 
     /// Replays in compiler-key order and intentionally discards cached streams.
@@ -1511,11 +1561,18 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             guard !isSymlink(path, fs: fs), try fs.getFileInfo(path).isFile else {
                 throw SwiftCacheOutputError.unsupportedOutput
             }
+            let permissions = try fs.getLinkFileInfo(path).permissions
             let bytes = try fs.read(path)
             if isCancelled() { throw CancellationError() }
             let hash = SHA256Context()
             hash.add(bytes: bytes)
-            entries.append(.init(ordinal: ordinal, fileKind: .regularFile, byteCount: Int64(bytes.count), digest: hash.signature))
+            entries.append(.init(
+                ordinal: ordinal,
+                fileKind: .regularFile,
+                permissions: permissions,
+                byteCount: Int64(bytes.count),
+                digest: hash.signature
+            ))
         }
         if isCancelled() { throw CancellationError() }
         return SwiftCacheOutputManifest(entries: entries)
@@ -1556,6 +1613,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         trustAuthorization: SwiftAcceleratorCacheTrustAuthorization? = nil,
         operations: Operations,
         cacheKeys: [String],
+        expectedOutputKindGroups: [[String]],
         plannedOutputs: [Path],
         commandLine: [String],
         fs: any FSProxy,
@@ -1579,6 +1637,9 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
            hasSharedObjectiveCHeaderOutput(commandLine: commandLine, plannedOutputs: plannedOutputs) {
             return .init(outcome: .unsupportedOutput, lookupDurationNS: 0)
         }
+        guard expectedOutputKindGroups.reduce(0, { $0 + $1.count }) == plannedOutputs.count else {
+            return .init(outcome: .unsupportedOutput, lookupDurationNS: 0)
+        }
         // The runtime controller already enforces this boundary. Keep the
         // nonserialized test seam equally narrow if it is called directly.
         let activeInjectedFault = mode == .verify ? injectedFault : nil
@@ -1592,7 +1653,12 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             if claimAtCheckpoint(.queryError) {
                 throw SwiftAcceleratorCacheInjectedError.injected
             }
-            probe = try probeCache(operations: operations, cacheKeys: cacheKeys, isCancelled: isCancelled)
+            probe = try probeCache(
+                operations: operations,
+                cacheKeys: cacheKeys,
+                expectedOutputKindGroups: expectedOutputKindGroups,
+                isCancelled: isCancelled
+            )
             try activeCancellationPause?(.queryStage)
         } catch is CancellationError {
             return .init(outcome: .cancelled, lookupDurationNS: lookupTimer.elapsedTime().nanoseconds)
@@ -1605,6 +1671,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         }
 
         switch probe {
+        case .miss(.unsupportedOutput):
+            return .init(outcome: .unsupportedOutput, lookupDurationNS: lookupDurationNS)
         case .miss:
             return .init(outcome: .miss, lookupDurationNS: lookupDurationNS)
         case .hit(_, let outputCount) where mode == .observe:

@@ -26,13 +26,17 @@ fileprivate struct SwiftCacheOperationsTests {
             outputs: [
                 1: [.init(kindName: "object", isMaterialized: true)],
                 2: [
-                    .init(kindName: "module", isMaterialized: true),
+                    .init(kindName: "swiftmodule", isMaterialized: true),
                     .init(kindName: "dependencies", isMaterialized: true),
                 ],
             ]
         )
 
-        switch try SwiftDriverJobTaskAction.probeCache(operations: operations, cacheKeys: ["one", "two"]) {
+        switch try SwiftDriverJobTaskAction.probeCache(
+            operations: operations,
+            cacheKeys: ["one", "two"],
+            expectedOutputKindGroups: [["object"], ["swiftmodule", "dependencies"]]
+        ) {
         case .hit(let compilations, let outputCount):
             #expect(compilations == [1, 2])
             #expect(outputCount == 3)
@@ -43,7 +47,11 @@ fileprivate struct SwiftCacheOperationsTests {
 
         operations.resetCalls()
         operations.queries["two"] = .miss
-        switch try SwiftDriverJobTaskAction.probeCache(operations: operations, cacheKeys: ["one", "two"]) {
+        switch try SwiftDriverJobTaskAction.probeCache(
+            operations: operations,
+            cacheKeys: ["one", "two"],
+            expectedOutputKindGroups: [["object"], ["swiftmodule", "dependencies"]]
+        ) {
         case .hit:
             Issue.record("missing second key was reported as a hit")
         case .miss(let reason):
@@ -53,8 +61,12 @@ fileprivate struct SwiftCacheOperationsTests {
 
         operations.resetCalls()
         operations.queries["two"] = .hit(2)
-        operations.outputs[2] = [.init(kindName: "module", isMaterialized: false)]
-        switch try SwiftDriverJobTaskAction.probeCache(operations: operations, cacheKeys: ["one", "two"]) {
+        operations.outputs[2] = [.init(kindName: "swiftmodule", isMaterialized: false)]
+        switch try SwiftDriverJobTaskAction.probeCache(
+            operations: operations,
+            cacheKeys: ["one", "two"],
+            expectedOutputKindGroups: [["object"], ["swiftmodule"]]
+        ) {
         case .hit:
             Issue.record("nonmaterialized output was reported as a hit")
         case .miss(let reason):
@@ -62,7 +74,11 @@ fileprivate struct SwiftCacheOperationsTests {
         }
 
         operations.resetCalls()
-        switch try SwiftDriverJobTaskAction.probeCache(operations: operations, cacheKeys: []) {
+        switch try SwiftDriverJobTaskAction.probeCache(
+            operations: operations,
+            cacheKeys: [],
+            expectedOutputKindGroups: []
+        ) {
         case .hit:
             Issue.record("empty key list was reported as a hit")
         case .miss(let reason):
@@ -72,13 +88,135 @@ fileprivate struct SwiftCacheOperationsTests {
     }
 
     @Test
+    func probeRequiresExactSupportedCachedOutputShape() throws {
+        func missReason(
+            outputs: [SwiftCacheCachedOutput],
+            expectedOutputKindGroups: [[String]] = [["object", "dependencies"]]
+        ) throws -> SwiftCacheProbeMissReason? {
+            let operations = TestSwiftCacheOperations(
+                queries: ["key": .hit(1)],
+                outputs: [1: outputs]
+            )
+            switch try SwiftDriverJobTaskAction.probeCache(
+                operations: operations,
+                cacheKeys: ["key"],
+                expectedOutputKindGroups: expectedOutputKindGroups
+            ) {
+            case .hit:
+                return nil
+            case .miss(let reason):
+                return reason
+            }
+        }
+
+        #expect(try missReason(outputs: [
+            .init(kindName: "object", isMaterialized: true),
+            .init(kindName: "dependencies", isMaterialized: true),
+            .init(kindName: "cached-diagnostics", isMaterialized: true),
+        ]) == nil)
+        #expect(try missReason(outputs: [
+            .init(kindName: "dependencies", isMaterialized: true),
+            .init(kindName: "object", isMaterialized: true),
+        ]) == .unsupportedOutput)
+        #expect(try missReason(outputs: [
+            .init(kindName: "object", isMaterialized: true),
+        ]) == .unsupportedOutput)
+        #expect(try missReason(outputs: [
+            .init(kindName: "object", isMaterialized: true),
+            .init(kindName: "dependencies", isMaterialized: true),
+            .init(kindName: "unknown-future-output", isMaterialized: true),
+        ]) == .unsupportedOutput)
+        #expect(try missReason(outputs: [
+            .init(kindName: "cached-diagnostics", isMaterialized: true),
+            .init(kindName: "object", isMaterialized: true),
+            .init(kindName: "dependencies", isMaterialized: true),
+        ]) == .unsupportedOutput)
+        #expect(try missReason(outputs: [
+            .init(kindName: "object", isMaterialized: true),
+            .init(kindName: "dependencies", isMaterialized: true),
+            .init(kindName: "cached-diagnostics", isMaterialized: true),
+            .init(kindName: "cached-diagnostics", isMaterialized: true),
+        ]) == .unsupportedOutput)
+        #expect(try missReason(
+            outputs: [.init(kindName: "object", isMaterialized: true)],
+            expectedOutputKindGroups: [["unknown-planned-output"]]
+        ) == .unsupportedOutput)
+
+        let misalignedOperations = TestSwiftCacheOperations(
+            queries: ["key": .hit(1)],
+            outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+        )
+        switch try SwiftDriverJobTaskAction.probeCache(
+            operations: misalignedOperations,
+            cacheKeys: ["key"],
+            expectedOutputKindGroups: []
+        ) {
+        case .hit:
+            Issue.record("misaligned key/output groups reached replay")
+        case .miss(let reason):
+            #expect(reason == .unsupportedOutput)
+        }
+        #expect(misalignedOperations.queriedKeys.isEmpty)
+    }
+
+    @Test
+    func unsupportedCachedOutputShapeNeverReplaysOrScrubs() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let fs = localFS
+        let output = temporaryDirectory.path.join("main.o")
+        try fs.write(output, contents: ByteString(encodingAsUTF8: "frontend-owned"))
+        let operations = TestSwiftCacheOperations(
+            queries: ["key": .hit(1)],
+            outputs: [1: [.init(kindName: "swiftmodule", isMaterialized: true)]]
+        )
+        operations.replaySideEffect = { _ in
+            Issue.record("unsupported cache output shape reached replay")
+        }
+
+        let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .verify,
+            operations: operations,
+            cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
+            plannedOutputs: [output],
+            commandLine: ["swift-frontend", "-c"],
+            fs: fs
+        )
+
+        #expect(preparation.outcome == .unsupportedOutput)
+        #expect(preparation.scrubSucceeded == nil)
+        #expect(operations.replayedCompilations.isEmpty)
+        #expect(try fs.read(output).asString == "frontend-owned")
+
+        operations.resetCalls()
+        let extraPlannedOutput = temporaryDirectory.path.join("unexpected.swiftmodule")
+        let countMismatch = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .verify,
+            operations: operations,
+            cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
+            plannedOutputs: [output, extraPlannedOutput],
+            commandLine: ["swift-frontend", "-c"],
+            fs: fs
+        )
+        #expect(countMismatch.outcome == .unsupportedOutput)
+        #expect(operations.queriedKeys.isEmpty)
+        #expect(operations.replayedCompilations.isEmpty)
+        #expect(try fs.read(output).asString == "frontend-owned")
+    }
+
+    @Test
     func probeAndReplayErrorsPropagateToTheFailOpenDecisionBoundary() throws {
         let operations = TestSwiftCacheOperations(
             queries: ["one": .failure, "two": .hit(2)],
             outputs: [2: [.init(kindName: "object", isMaterialized: true)]]
         )
         #expect(throws: TestCacheError.self) {
-            try SwiftDriverJobTaskAction.probeCache(operations: operations, cacheKeys: ["one", "two"])
+            try SwiftDriverJobTaskAction.probeCache(
+                operations: operations,
+                cacheKeys: ["one", "two"],
+                expectedOutputKindGroups: [["object"], ["object"]]
+            )
         }
         #expect(operations.queriedKeys == ["one"])
 
@@ -124,10 +262,13 @@ fileprivate struct SwiftCacheOperationsTests {
         let second = temporaryDirectory.path.join("module.swiftmodule")
         try fs.write(first, contents: ByteString(encodingAsUTF8: "first"))
         try fs.write(second, contents: ByteString(encodingAsUTF8: "second"))
+        try fs.setFilePermissions(first, permissions: 0o600)
+        try fs.setFilePermissions(second, permissions: 0o640)
 
         let baseline = try SwiftDriverJobTaskAction.makeOutputManifest([first, second], fs: fs)
         #expect(baseline.entries.map(\.ordinal) == [0, 1])
         #expect(baseline.entries.map(\.fileKind) == [.regularFile, .regularFile])
+        #expect(baseline.entries.map(\.permissions) == [0o600, 0o640])
         #expect(baseline.entries.map(\.byteCount) == [5, 6])
         #expect(baseline.totalBytes == 11)
         #expect(baseline.mismatchCount(comparedTo: baseline) == 0)
@@ -138,6 +279,11 @@ fileprivate struct SwiftCacheOperationsTests {
 
         let countMismatch = try SwiftDriverJobTaskAction.makeOutputManifest([first], fs: fs)
         #expect(baseline.mismatchCount(comparedTo: countMismatch) == 1)
+
+        try fs.write(second, contents: ByteString(encodingAsUTF8: "second"))
+        try fs.setFilePermissions(second, permissions: 0o600)
+        let modeMismatch = try SwiftDriverJobTaskAction.makeOutputManifest([first, second], fs: fs)
+        #expect(baseline.mismatchCount(comparedTo: modeMismatch) == 1)
 
         do {
             _ = try SwiftDriverJobTaskAction.makeOutputManifest([first, temporaryDirectory.path.join("missing")], fs: fs)
@@ -200,6 +346,7 @@ fileprivate struct SwiftCacheOperationsTests {
             mode: .verify,
             operations: operations,
             cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
             plannedOutputs: [object, sharedHeader],
             commandLine: ["swift-frontend", "-c", "-emit-objc-header-path", sharedHeader.str],
             fs: localFS
@@ -242,6 +389,7 @@ fileprivate struct SwiftCacheOperationsTests {
             mode: .verify,
             operations: operations,
             cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
             plannedOutputs: [output],
             commandLine: ["swift-frontend", "-c"],
             fs: fs
@@ -252,6 +400,44 @@ fileprivate struct SwiftCacheOperationsTests {
         #expect(preparation.scrubSucceeded == true)
         #expect(operations.replayedCompilations == [1])
         #expect(!fs.exists(output))
+    }
+
+    @Test
+    func verificationManifestRejectsPermissionModeMismatch() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let fs = localFS
+        let output = temporaryDirectory.path.join("main.o")
+        let operations = TestSwiftCacheOperations(
+            queries: ["key": .hit(1)],
+            outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+        )
+        operations.replaySideEffect = { _ in
+            try fs.write(output, contents: ByteString(encodingAsUTF8: "same-bytes"))
+            try fs.setFilePermissions(output, permissions: 0o600)
+        }
+
+        let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .verify,
+            operations: operations,
+            cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
+            plannedOutputs: [output],
+            commandLine: ["swift-frontend", "-c"],
+            fs: fs
+        )
+        let shadowManifest = try #require(preparation.shadowManifest)
+        #expect(shadowManifest.entries.map(\.permissions) == [0o600])
+
+        try fs.write(output, contents: ByteString(encodingAsUTF8: "same-bytes"))
+        try fs.setFilePermissions(output, permissions: 0o644)
+        let comparison = SwiftDriverJobTaskAction.compareFreshOutputs(
+            shadowManifest: shadowManifest,
+            plannedOutputs: [output],
+            fs: fs
+        )
+        #expect(!comparison.isMatch)
+        #expect(comparison.mismatchCount == 1)
+        #expect(comparison.comparedBytes == 10)
     }
 
     @Test
@@ -271,6 +457,7 @@ fileprivate struct SwiftCacheOperationsTests {
             mode: .observe,
             operations: operations,
             cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
             plannedOutputs: [output],
             commandLine: ["swift-frontend", "-c"],
             fs: fs
@@ -286,6 +473,7 @@ fileprivate struct SwiftCacheOperationsTests {
             mode: externallyRequestedTrust,
             operations: operations,
             cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
             plannedOutputs: [output],
             commandLine: ["swift-frontend", "-c"],
             fs: fs
@@ -301,6 +489,7 @@ fileprivate struct SwiftCacheOperationsTests {
             mode: .verify,
             operations: operations,
             cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
             plannedOutputs: [output],
             commandLine: ["swift-frontend", "-c"],
             fs: fs
@@ -351,6 +540,7 @@ fileprivate struct SwiftCacheOperationsTests {
             mode: .trust,
             operations: operations,
             cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
             plannedOutputs: [output],
             commandLine: ["swift-frontend", "-c"],
             fs: fs
@@ -382,6 +572,7 @@ fileprivate struct SwiftCacheOperationsTests {
             mode: .verify,
             operations: operations,
             cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
             plannedOutputs: [output],
             commandLine: ["swift-frontend", "-c"],
             fs: fs,
@@ -409,7 +600,7 @@ fileprivate struct SwiftCacheOperationsTests {
             queries: ["one": .hit(1), "two": .hit(2)],
             outputs: [
                 1: [.init(kindName: "object", isMaterialized: true)],
-                2: [.init(kindName: "module", isMaterialized: true)],
+                2: [.init(kindName: "swiftmodule", isMaterialized: true)],
             ]
         )
         var quarantined = false
@@ -424,6 +615,7 @@ fileprivate struct SwiftCacheOperationsTests {
             mode: .verify,
             operations: operations,
             cacheKeys: ["one", "two"],
+            expectedOutputKindGroups: [["object"], ["swiftmodule"]],
             plannedOutputs: [first, second],
             commandLine: ["swift-frontend", "-c"],
             fs: fs,
@@ -481,6 +673,7 @@ fileprivate struct SwiftCacheOperationsTests {
             trustAuthorization: authorization,
             operations: operations,
             cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
             plannedOutputs: [output],
             commandLine: ["swift-frontend", "-c"],
             fs: fs
@@ -499,6 +692,7 @@ fileprivate struct SwiftCacheOperationsTests {
             trustAuthorization: authorization,
             operations: operations,
             cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
             plannedOutputs: [output, sharedHeader],
             commandLine: ["swift-frontend", "-c", "-emit-objc-header-path", sharedHeader.str],
             fs: fs
@@ -523,6 +717,7 @@ fileprivate struct SwiftCacheOperationsTests {
             mode: .verify,
             operations: queryFailure,
             cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
             plannedOutputs: [first],
             commandLine: ["swift-frontend", "-c"],
             fs: fs,
@@ -540,6 +735,7 @@ fileprivate struct SwiftCacheOperationsTests {
             mode: .verify,
             operations: createFailure,
             cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
             plannedOutputs: [first],
             commandLine: ["swift-frontend", "-c"],
             fs: fs,
@@ -553,7 +749,7 @@ fileprivate struct SwiftCacheOperationsTests {
             queries: ["one": .hit(1), "two": .hit(2)],
             outputs: [
                 1: [.init(kindName: "object", isMaterialized: true)],
-                2: [.init(kindName: "module", isMaterialized: true)],
+                2: [.init(kindName: "swiftmodule", isMaterialized: true)],
             ]
         )
         replayFailure.failReplayForCompilation = 2
@@ -566,6 +762,7 @@ fileprivate struct SwiftCacheOperationsTests {
             mode: .verify,
             operations: replayFailure,
             cacheKeys: ["one", "two"],
+            expectedOutputKindGroups: [["object"], ["swiftmodule"]],
             plannedOutputs: [first, second],
             commandLine: ["swift-frontend", "-c"],
             fs: fs,
@@ -583,7 +780,10 @@ fileprivate struct SwiftCacheOperationsTests {
 
         let missingOutput = TestSwiftCacheOperations(
             queries: ["key": .hit(1)],
-            outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+            outputs: [1: [
+                .init(kindName: "object", isMaterialized: true),
+                .init(kindName: "swiftmodule", isMaterialized: true),
+            ]]
         )
         missingOutput.replaySideEffect = { _ in
             try fs.write(first, contents: ByteString(encodingAsUTF8: "only-one-output"))
@@ -593,6 +793,7 @@ fileprivate struct SwiftCacheOperationsTests {
             mode: .verify,
             operations: missingOutput,
             cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object", "swiftmodule"]],
             plannedOutputs: [first, second],
             commandLine: ["swift-frontend", "-c"],
             fs: fs,
@@ -631,6 +832,7 @@ fileprivate struct SwiftCacheOperationsTests {
                     mode: .verify,
                     operations: operations,
                     cacheKeys: ["key"],
+                    expectedOutputKindGroups: [["object"]],
                     plannedOutputs: [output],
                     commandLine: ["swift-frontend", "-c"],
                     fs: fs,
@@ -670,6 +872,7 @@ fileprivate struct SwiftCacheOperationsTests {
                 mode: .verify,
                 operations: operations,
                 cacheKeys: ["key"],
+                expectedOutputKindGroups: [["object"]],
                 plannedOutputs: [Path.temporaryDirectory.join("unused.o")],
                 commandLine: ["swift-frontend", "-c"],
                 fs: localFS,
@@ -691,6 +894,7 @@ fileprivate struct SwiftCacheOperationsTests {
             mode: .observe,
             operations: operations,
             cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
             plannedOutputs: [Path.temporaryDirectory.join("never-materialized.o")],
             commandLine: ["swift-frontend", "-c"],
             fs: localFS,
@@ -864,6 +1068,7 @@ fileprivate struct SwiftCacheOperationsTests {
                 mode: .verify,
                 operations: TestSwiftCacheOperations(queries: ["key": .miss], outputs: [:]),
                 cacheKeys: ["key"],
+                expectedOutputKindGroups: [["object"]],
                 plannedOutputs: [temporaryDirectory.path.join("miss-\(fault.rawValue).o")],
                 commandLine: ["swift-frontend", "-c"],
                 fs: localFS,
@@ -875,6 +1080,7 @@ fileprivate struct SwiftCacheOperationsTests {
                 mode: .verify,
                 operations: TestSwiftCacheOperations(queries: ["key": .hit(1)], outputs: [:]),
                 cacheKeys: ["key"],
+                expectedOutputKindGroups: [["object"]],
                 plannedOutputs: [temporaryDirectory.path.join("cancelled-\(fault.rawValue).o")],
                 commandLine: ["swift-frontend", "-c"],
                 fs: localFS,
@@ -895,6 +1101,7 @@ fileprivate struct SwiftCacheOperationsTests {
                 mode: .verify,
                 operations: operations,
                 cacheKeys: ["key"],
+                expectedOutputKindGroups: [["object"]],
                 plannedOutputs: [output],
                 commandLine: ["swift-frontend", "-c"],
                 fs: localFS,
@@ -906,6 +1113,7 @@ fileprivate struct SwiftCacheOperationsTests {
                 mode: .verify,
                 operations: operations,
                 cacheKeys: ["key"],
+                expectedOutputKindGroups: [["object"]],
                 plannedOutputs: [output],
                 commandLine: ["swift-frontend", "-c"],
                 fs: localFS,
@@ -941,6 +1149,7 @@ fileprivate struct SwiftCacheOperationsTests {
                     outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
                 ),
                 cacheKeys: ["key"],
+                expectedOutputKindGroups: [["object"]],
                 plannedOutputs: [blockedOutput],
                 commandLine: ["swift-frontend", "-c"],
                 fs: localFS,
@@ -961,6 +1170,7 @@ fileprivate struct SwiftCacheOperationsTests {
                 mode: .verify,
                 operations: laterOperations,
                 cacheKeys: ["key"],
+                expectedOutputKindGroups: [["object"]],
                 plannedOutputs: [laterOutput],
                 commandLine: ["swift-frontend", "-c"],
                 fs: localFS,
@@ -1115,13 +1325,17 @@ fileprivate struct SwiftCacheOperationsTests {
         defer { try? fs.setFilePermissions(lockedDirectory, permissions: 0o755) }
         let operations = TestSwiftCacheOperations(
             queries: ["key": .hit(1)],
-            outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+            outputs: [1: [
+                .init(kindName: "object", isMaterialized: true),
+                .init(kindName: "swiftmodule", isMaterialized: true),
+            ]]
         )
 
         let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
             mode: .verify,
             operations: operations,
             cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object", "swiftmodule"]],
             plannedOutputs: [output, laterOutput],
             commandLine: ["swift-frontend", "-c"],
             fs: fs
@@ -1149,6 +1363,7 @@ fileprivate struct SwiftCacheOperationsTests {
                 mode: .observe,
                 operations: operations,
                 cacheKeys: [key],
+                expectedOutputKindGroups: [["object"]],
                 plannedOutputs: [Path.temporaryDirectory.join("not-materialized-in-observe")],
                 commandLine: ["swift-frontend", "-c"],
                 fs: fs
@@ -1179,7 +1394,7 @@ fileprivate struct SwiftCacheOperationsTests {
             queries: ["one": .hit(1), "two": .hit(2)],
             outputs: [
                 1: [.init(kindName: "object", isMaterialized: true)],
-                2: [.init(kindName: "module", isMaterialized: true)],
+                2: [.init(kindName: "swiftmodule", isMaterialized: true)],
             ]
         )
 
@@ -1187,6 +1402,7 @@ fileprivate struct SwiftCacheOperationsTests {
             try SwiftDriverJobTaskAction.probeCache(
                 operations: operations,
                 cacheKeys: ["one", "two"],
+                expectedOutputKindGroups: [["object"], ["swiftmodule"]],
                 isCancelled: { operations.queriedKeys.count == 1 }
             )
         }
@@ -1260,6 +1476,7 @@ fileprivate struct SwiftCacheOperationsTests {
             mode: .verify,
             operations: queryOperations,
             cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
             plannedOutputs: [temporaryDirectory.path.join("query.o")],
             commandLine: ["swift-frontend", "-c"],
             fs: fs,
@@ -1286,6 +1503,7 @@ fileprivate struct SwiftCacheOperationsTests {
             mode: .verify,
             operations: replayOperations,
             cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
             plannedOutputs: [replayOutput],
             commandLine: ["swift-frontend", "-c"],
             fs: fs,
@@ -1311,6 +1529,7 @@ fileprivate struct SwiftCacheOperationsTests {
             mode: .verify,
             operations: materializedOperations,
             cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
             plannedOutputs: [materializedOutput],
             commandLine: ["swift-frontend", "-c"],
             fs: fs,
@@ -1335,6 +1554,7 @@ fileprivate struct SwiftCacheOperationsTests {
             mode: .observe,
             operations: operations,
             cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
             plannedOutputs: [Path.temporaryDirectory.join("observe-never-replayed.o")],
             commandLine: ["swift-frontend", "-c"],
             fs: localFS,
