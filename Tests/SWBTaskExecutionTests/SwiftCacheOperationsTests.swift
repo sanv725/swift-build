@@ -160,6 +160,76 @@ fileprivate struct SwiftCacheOperationsTests {
     }
 
     @Test
+    func semanticOutputAdapterIsAbsentFromNormalBinaries() throws {
+        let profiles: [(SwiftCacheSemanticOutputJobKind, Int, [String], [SwiftCacheCachedOutput], Int)] = [
+            (
+                .compile,
+                10,
+                ["object", "d", "const-values", "swift-dependencies", "diagnostics"],
+                [
+                    .init(kindName: "object", isMaterialized: true),
+                    .init(kindName: "dependencies", isMaterialized: true),
+                    .init(kindName: "swift-dependencies", isMaterialized: true),
+                    .init(kindName: "const-values", isMaterialized: true),
+                ],
+                5
+            ),
+            (
+                .emitModule,
+                1,
+                [
+                    "swiftmodule", "swiftdoc", "swiftsourceinfo",
+                    "emit-module-diagnostics", "emit-module.d", "abi-baseline-json",
+                ],
+                [
+                    .init(kindName: "dependencies", isMaterialized: true),
+                    .init(kindName: "swiftmodule", isMaterialized: true),
+                    .init(kindName: "swiftdoc", isMaterialized: true),
+                    .init(kindName: "swiftsourceinfo", isMaterialized: true),
+                    .init(kindName: "abi-baseline-json", isMaterialized: true),
+                    .init(kindName: "cached-diagnostics", isMaterialized: true),
+                ],
+                6
+            ),
+        ]
+
+        for (jobKind, keyCount, plannedKinds, cachedOutputs, expectedCount) in profiles {
+            let cacheKeys = (0..<keyCount).map { "key-\($0)" }
+            let queries: [String: TestSwiftCacheOperations.Query] = Dictionary(
+                uniqueKeysWithValues: cacheKeys.enumerated().map { ($0.element, .hit($0.offset)) }
+            )
+            let outputs = Dictionary(
+                uniqueKeysWithValues: (0..<keyCount).map { ($0, cachedOutputs) }
+            )
+            let operations = TestSwiftCacheOperations(
+                queries: queries,
+                outputs: outputs
+            )
+            switch try SwiftDriverJobTaskAction.probeCache(
+                operations: operations,
+                cacheKeys: cacheKeys,
+                expectedOutputKindGroups: Array(repeating: plannedKinds, count: keyCount),
+                semanticOutputJobKind: jobKind,
+                allowUnsafeSemanticOutputAdapter: true
+            ) {
+            #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+            case .hit(let compilations, let outputCount):
+                #expect(compilations == Array(0..<keyCount))
+                #expect(outputCount == expectedCount * keyCount)
+            case .miss:
+                Issue.record("compile-gated semantic output profile was rejected")
+            #else
+            case .hit:
+                Issue.record("normal binary admitted a compile-gated semantic output profile")
+            case .miss(let reason):
+                #expect(reason == .unsupportedOutput)
+                #expect(operations.queriedKeys.isEmpty)
+            #endif
+            }
+        }
+    }
+
+    @Test
     func unsupportedCachedOutputShapeNeverReplaysOrScrubs() throws {
         let temporaryDirectory = try NamedTemporaryDirectory()
         let fs = localFS
@@ -948,6 +1018,301 @@ fileprivate struct SwiftCacheOperationsTests {
     }
 
     #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+    @Test
+    func unsafeSemanticOutputProfilesRequireExactPinnedShapes() throws {
+        let compilePlannedKinds = ["object", "d", "const-values", "swift-dependencies", "diagnostics"]
+        let modulePlannedKinds = [
+            "swiftmodule", "swiftdoc", "swiftsourceinfo",
+            "emit-module-diagnostics", "emit-module.d", "abi-baseline-json",
+        ]
+
+        func probe(
+            jobKind: SwiftCacheSemanticOutputJobKind,
+            plannedKindGroups: [[String]],
+            cachedOutputGroups: [[SwiftCacheCachedOutput]],
+            allowAdapter: Bool = true
+        ) throws -> (SwiftCacheProbeResult<Int>, [String]) {
+            let cacheKeys = plannedKindGroups.indices.map { "key-\($0)" }
+            let queries: [String: TestSwiftCacheOperations.Query] = Dictionary(
+                uniqueKeysWithValues: cacheKeys.enumerated().map { ($0.element, .hit($0.offset)) }
+            )
+            let outputs = Dictionary(uniqueKeysWithValues: cachedOutputGroups.enumerated().map { ($0.offset, $0.element) })
+            let operations = TestSwiftCacheOperations(
+                queries: queries,
+                outputs: outputs
+            )
+            let result = try SwiftDriverJobTaskAction.probeCache(
+                operations: operations,
+                cacheKeys: cacheKeys,
+                expectedOutputKindGroups: plannedKindGroups,
+                semanticOutputJobKind: jobKind,
+                allowUnsafeSemanticOutputAdapter: allowAdapter
+            )
+            return (result, operations.queriedKeys)
+        }
+
+        let compileCachedOutputs: [SwiftCacheCachedOutput] = [
+            .init(kindName: "object", isMaterialized: true),
+            .init(kindName: "dependencies", isMaterialized: true),
+            .init(kindName: "swift-dependencies", isMaterialized: true),
+            .init(kindName: "const-values", isMaterialized: true),
+        ]
+        for keyCount in [10, 11] {
+            let result = try probe(
+                jobKind: .compile,
+                plannedKindGroups: Array(repeating: compilePlannedKinds, count: keyCount),
+                cachedOutputGroups: Array(repeating: compileCachedOutputs, count: keyCount)
+            ).0
+            switch result {
+            case .hit(let compilations, let outputCount):
+                #expect(compilations == Array(0..<keyCount))
+                #expect(outputCount == 5 * keyCount)
+            case .miss:
+                Issue.record("exact \(keyCount)-key compile semantic output profile was rejected")
+            }
+        }
+
+        let moduleCachedOutputs: [SwiftCacheCachedOutput] = [
+            .init(kindName: "dependencies", isMaterialized: true),
+            .init(kindName: "swiftmodule", isMaterialized: true),
+            .init(kindName: "swiftdoc", isMaterialized: true),
+            .init(kindName: "swiftsourceinfo", isMaterialized: true),
+            .init(kindName: "abi-baseline-json", isMaterialized: true),
+            .init(kindName: "cached-diagnostics", isMaterialized: true),
+        ]
+        switch try probe(
+            jobKind: .emitModule,
+            plannedKindGroups: [modulePlannedKinds],
+            cachedOutputGroups: [moduleCachedOutputs]
+        ).0 {
+        case .hit(let compilations, let outputCount):
+            #expect(compilations == [0])
+            #expect(outputCount == 6)
+        case .miss:
+            Issue.record("exact module semantic output profile was rejected")
+        }
+
+        let rejectedCachedShapes: [(SwiftCacheSemanticOutputJobKind, Int, [String], [SwiftCacheCachedOutput])] = [
+            (.compile, 10, compilePlannedKinds, compileCachedOutputs + [.init(kindName: "cached-diagnostics", isMaterialized: true)]),
+            (.compile, 10, compilePlannedKinds, Array(compileCachedOutputs.dropLast())),
+            (.compile, 10, compilePlannedKinds, [compileCachedOutputs[1], compileCachedOutputs[0]] + compileCachedOutputs.dropFirst(2)),
+            (.emitModule, 1, modulePlannedKinds, Array(moduleCachedOutputs.dropLast())),
+            (.emitModule, 1, modulePlannedKinds, [moduleCachedOutputs[1], moduleCachedOutputs[0]] + moduleCachedOutputs.dropFirst(2)),
+            (.compile, 10, Array(compilePlannedKinds.dropLast()), compileCachedOutputs),
+        ]
+        for (jobKind, keyCount, plannedKinds, cachedOutputs) in rejectedCachedShapes {
+            switch try probe(
+                jobKind: jobKind,
+                plannedKindGroups: Array(repeating: plannedKinds, count: keyCount),
+                cachedOutputGroups: Array(repeating: cachedOutputs, count: keyCount)
+            ).0 {
+            case .hit:
+                Issue.record("malformed semantic output profile was accepted")
+            case .miss(let reason):
+                #expect(reason == .unsupportedOutput)
+            }
+        }
+
+        switch try probe(
+            jobKind: .compile,
+            plannedKindGroups: Array(repeating: compilePlannedKinds, count: 10),
+            cachedOutputGroups: Array(repeating: compileCachedOutputs, count: 10),
+            allowAdapter: false
+        ).0 {
+        case .hit:
+            Issue.record("compile profile bypassed the explicit adapter boundary")
+        case .miss(let reason):
+            #expect(reason == .unsupportedOutput)
+        }
+
+        let wholeJobRejections: [(SwiftCacheSemanticOutputJobKind, [[String]], [[SwiftCacheCachedOutput]])] = [
+            (.compile, [compilePlannedKinds], [compileCachedOutputs]),
+            (.emitModule, Array(repeating: modulePlannedKinds, count: 2), Array(repeating: moduleCachedOutputs, count: 2)),
+            (
+                .compile,
+                Array(repeating: compilePlannedKinds, count: 9) + [modulePlannedKinds],
+                Array(repeating: compileCachedOutputs, count: 9) + [moduleCachedOutputs]
+            ),
+            (.emitModule, [compilePlannedKinds], [compileCachedOutputs]),
+        ]
+        for (jobKind, plannedKindGroups, cachedOutputGroups) in wholeJobRejections {
+            let (result, queriedKeys) = try probe(
+                jobKind: jobKind,
+                plannedKindGroups: plannedKindGroups,
+                cachedOutputGroups: cachedOutputGroups
+            )
+            switch result {
+            case .hit:
+                Issue.record("invalid whole-job semantic profile was accepted")
+            case .miss(let reason):
+                #expect(reason == .unsupportedOutput)
+                #expect(queriedKeys.isEmpty)
+            }
+        }
+    }
+
+    @Test
+    func unsafeTrustSemanticCompileProfileStillRequiresEveryPlannedFile() throws {
+        let fs = PseudoFS()
+        try fs.createDirectory(Path("/build"), recursive: true)
+        let plannedKinds = ["object", "d", "const-values", "swift-dependencies", "diagnostics"]
+        let cachedOutputs: [SwiftCacheCachedOutput] = [
+            .init(kindName: "object", isMaterialized: true),
+            .init(kindName: "dependencies", isMaterialized: true),
+            .init(kindName: "swift-dependencies", isMaterialized: true),
+            .init(kindName: "const-values", isMaterialized: true),
+        ]
+        let cacheKeys = (0..<10).map { "key-\($0)" }
+        let outputGroups = (0..<10).map { index in
+            [
+                Path("/build/main-\(index).o"),
+                Path("/build/main-\(index).d"),
+                Path("/build/main-\(index).swiftconstvalues"),
+                Path("/build/main-\(index).swiftdeps"),
+                Path("/build/main-\(index).dia"),
+            ]
+        }
+        let outputs = outputGroups.flatMap { $0 }
+        let queries: [String: TestSwiftCacheOperations.Query] = Dictionary(
+            uniqueKeysWithValues: cacheKeys.enumerated().map { ($0.element, .hit($0.offset)) }
+        )
+        let operations = TestSwiftCacheOperations(
+            queries: queries,
+            outputs: Dictionary(uniqueKeysWithValues: (0..<10).map { ($0, cachedOutputs) }),
+            replayStreams: .init(standardOutput: "cached-stdout", standardError: "cached-stderr")
+        )
+        operations.replaySideEffect = { compilation in
+            for output in outputGroups[compilation] {
+                try fs.write(output, contents: ByteString(encodingAsUTF8: output.basename))
+            }
+        }
+
+        let accepted = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .trust,
+            semanticOutputJobKind: .compile,
+            operations: operations,
+            cacheKeys: cacheKeys,
+            expectedOutputKindGroups: Array(repeating: plannedKinds, count: 10),
+            plannedOutputs: outputs,
+            commandLine: ["swift-frontend", "-c"],
+            fs: fs
+        )
+
+        #expect(accepted.outcome == .unsafeTrustHit)
+        #expect(accepted.cachedOutputCount == 50)
+        #expect(outputs.allSatisfy(fs.exists))
+        #expect(accepted.replayStreams?.count == 10)
+        #expect(operations.replayedCompilations == Array(0..<10))
+
+        for output in outputs where fs.exists(output) {
+            try fs.remove(output)
+        }
+        operations.resetCalls()
+        operations.replaySideEffect = { compilation in
+            for output in outputGroups[compilation].dropLast() {
+                try fs.write(output, contents: ByteString(encodingAsUTF8: output.basename))
+            }
+        }
+
+        let missingDiagnostics = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .trust,
+            semanticOutputJobKind: .compile,
+            operations: operations,
+            cacheKeys: cacheKeys,
+            expectedOutputKindGroups: Array(repeating: plannedKinds, count: 10),
+            plannedOutputs: outputs,
+            commandLine: ["swift-frontend", "-c"],
+            fs: fs
+        )
+
+        #expect(missingDiagnostics.outcome == .replayError)
+        #expect(missingDiagnostics.outcome.shouldExecuteFrontend)
+        #expect(missingDiagnostics.replayStreams == nil)
+        #expect(outputs.allSatisfy { !fs.exists($0) })
+    }
+
+    @Test
+    func unsafeTrustSemanticModuleProfileStillRequiresEveryPlannedFile() throws {
+        let fs = PseudoFS()
+        try fs.createDirectory(Path("/build"), recursive: true)
+        let outputs = [
+            Path("/build/App.swiftmodule"),
+            Path("/build/App.swiftdoc"),
+            Path("/build/App.swiftsourceinfo"),
+            Path("/build/App.emit-module.dia"),
+            Path("/build/App.emit-module.d"),
+            Path("/build/App.abi.json"),
+        ]
+        let cachedOutputs: [SwiftCacheCachedOutput] = [
+            .init(kindName: "dependencies", isMaterialized: true),
+            .init(kindName: "swiftmodule", isMaterialized: true),
+            .init(kindName: "swiftdoc", isMaterialized: true),
+            .init(kindName: "swiftsourceinfo", isMaterialized: true),
+            .init(kindName: "abi-baseline-json", isMaterialized: true),
+            .init(kindName: "cached-diagnostics", isMaterialized: true),
+        ]
+        let operations = TestSwiftCacheOperations(
+            queries: ["key": .hit(1)],
+            outputs: [1: cachedOutputs],
+            replayStreams: .init(standardOutput: "cached-stdout", standardError: "cached-stderr")
+        )
+        operations.replaySideEffect = { _ in
+            for output in outputs {
+                try fs.write(output, contents: ByteString(encodingAsUTF8: output.basename))
+            }
+        }
+
+        let accepted = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .trust,
+            semanticOutputJobKind: .emitModule,
+            operations: operations,
+            cacheKeys: ["key"],
+            expectedOutputKindGroups: [[
+                "swiftmodule", "swiftdoc", "swiftsourceinfo",
+                "emit-module-diagnostics", "emit-module.d", "abi-baseline-json",
+            ]],
+            plannedOutputs: outputs,
+            commandLine: ["swift-frontend", "-emit-module"],
+            fs: fs
+        )
+
+        #expect(accepted.outcome == .unsafeTrustHit)
+        #expect(accepted.cachedOutputCount == 6)
+        #expect(outputs.allSatisfy(fs.exists))
+        #expect(accepted.replayStreams == [
+            .init(standardOutput: "cached-stdout", standardError: "cached-stderr")
+        ])
+
+        for output in outputs where fs.exists(output) {
+            try fs.remove(output)
+        }
+        operations.resetCalls()
+        operations.replaySideEffect = { _ in
+            for (index, output) in outputs.enumerated() where index != 3 {
+                try fs.write(output, contents: ByteString(encodingAsUTF8: output.basename))
+            }
+        }
+
+        let missingDiagnostics = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .trust,
+            semanticOutputJobKind: .emitModule,
+            operations: operations,
+            cacheKeys: ["key"],
+            expectedOutputKindGroups: [[
+                "swiftmodule", "swiftdoc", "swiftsourceinfo",
+                "emit-module-diagnostics", "emit-module.d", "abi-baseline-json",
+            ]],
+            plannedOutputs: outputs,
+            commandLine: ["swift-frontend", "-emit-module"],
+            fs: fs
+        )
+
+        #expect(missingDiagnostics.outcome == .replayError)
+        #expect(missingDiagnostics.outcome.shouldExecuteFrontend)
+        #expect(missingDiagnostics.replayStreams == nil)
+        #expect(outputs.allSatisfy { !fs.exists($0) })
+    }
+
     @Test
     func unsafeTrustRejectsSingleMissingReplayOutput() throws {
         let fs = PseudoFS()

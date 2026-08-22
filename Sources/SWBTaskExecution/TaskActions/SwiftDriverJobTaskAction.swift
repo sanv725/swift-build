@@ -97,6 +97,23 @@ package enum SwiftCacheProbeMissReason: Sendable, Equatable {
     case unsupportedOutput
 }
 
+package enum SwiftCacheSemanticOutputJobKind: Sendable, Equatable {
+    case compile
+    case emitModule
+    case other
+
+    package init(ruleInfoType: String) {
+        switch ruleInfoType {
+        case "Compile":
+            self = .compile
+        case "EmitModule":
+            self = .emitModule
+        default:
+            self = .other
+        }
+    }
+}
+
 package enum SwiftCacheProbeResult<Compilation> {
     case hit(compilations: [Compilation], outputCount: Int)
     case miss(SwiftCacheProbeMissReason)
@@ -1248,6 +1265,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                         let preparation = Self.prepareAcceleratorCache(
                             mode: acceleratorPolicy.mode,
                             trustAuthorization: acceleratorTrustAuthorization,
+                            semanticOutputJobKind: .init(ruleInfoType: driverJob.driverJob.ruleInfoType),
                             operations: SwiftCASCacheOperations(databases: database),
                             cacheKeys: cacheKeys,
                             expectedOutputKindGroups: driverJob.driverJob.cacheOutputKindGroups,
@@ -1540,15 +1558,35 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         operations: Operations,
         cacheKeys: [String],
         expectedOutputKindGroups: [[String]],
+        semanticOutputJobKind: SwiftCacheSemanticOutputJobKind = .other,
+        allowUnsafeSemanticOutputAdapter: Bool = false,
         isCancelled: () -> Bool = { false }
     ) throws -> SwiftCacheProbeResult<Operations.Compilation> {
         guard !cacheKeys.isEmpty else {
             return .miss(.missingKey)
         }
-        guard cacheKeys.count == expectedOutputKindGroups.count,
-              expectedOutputKindGroups.allSatisfy({ !$0.isEmpty && $0.allSatisfy(supportedCachedFileOutputKinds.contains) }) else {
+        guard cacheKeys.count == expectedOutputKindGroups.count else {
             return .miss(.unsupportedOutput)
         }
+        let exactOutputProtocol = expectedOutputKindGroups.allSatisfy {
+            !$0.isEmpty && $0.allSatisfy(supportedCachedFileOutputKinds.contains)
+        }
+        #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+        let unsafeSemanticProfile = allowUnsafeSemanticOutputAdapter
+            ? unsafeSemanticOutputProfile(
+                jobKind: semanticOutputJobKind,
+                cacheKeyCount: cacheKeys.count,
+                plannedKindGroups: expectedOutputKindGroups
+            )
+            : nil
+        guard exactOutputProtocol || unsafeSemanticProfile != nil else {
+            return .miss(.unsupportedOutput)
+        }
+        #else
+        guard exactOutputProtocol else {
+            return .miss(.unsupportedOutput)
+        }
+        #endif
 
         var compilations: [Operations.Compilation] = []
         var outputCount = 0
@@ -1565,11 +1603,21 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             guard !outputs.isEmpty, outputs.allSatisfy(\.isMaterialized) else {
                 return .miss(.nonMaterializedOutput)
             }
-            guard let admittedOutputKindNames = admittedCachedFileOutputKinds(outputs),
-                  admittedOutputKindNames == expectedOutputKindNames else {
+            guard let admittedOutputKinds = admittedCachedOutputKinds(outputs) else {
                 return .miss(.unsupportedOutput)
             }
-            outputCount += admittedOutputKindNames.count
+            let exactMatch = admittedOutputKinds.fileKinds == expectedOutputKindNames
+            #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+            let unsafeSemanticMatch = unsafeSemanticProfile.map {
+                matchesUnsafeSemanticOutputProfile($0, cachedKinds: admittedOutputKinds)
+            } ?? false
+            #else
+            let unsafeSemanticMatch = false
+            #endif
+            guard exactMatch || unsafeSemanticMatch else {
+                return .miss(.unsupportedOutput)
+            }
+            outputCount += exactMatch ? admittedOutputKinds.fileKinds.count : expectedOutputKindNames.count
             compilations.append(compilation)
         }
         return .hit(compilations: compilations, outputCount: outputCount)
@@ -1594,7 +1642,12 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
 
     /// Cached diagnostics are replayed as diagnostics/streams, not as a planned
     /// file output. At most one is accepted, and only after every file output.
-    private static func admittedCachedFileOutputKinds(_ outputs: [SwiftCacheCachedOutput]) -> [String]? {
+    private struct AdmittedCachedOutputKinds {
+        let fileKinds: [String]
+        let hasCachedDiagnostics: Bool
+    }
+
+    private static func admittedCachedOutputKinds(_ outputs: [SwiftCacheCachedOutput]) -> AdmittedCachedOutputKinds? {
         var fileKinds: [String] = []
         var sawCachedDiagnostics = false
         for output in outputs {
@@ -1609,8 +1662,63 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             }
             fileKinds.append(output.kindName)
         }
-        return fileKinds
+        return .init(fileKinds: fileKinds, hasCachedDiagnostics: sawCachedDiagnostics)
     }
+
+    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+    /// Closed profiles observed for Xcode 26.3 target compile and module jobs.
+    /// This is intentionally not a general alias or order-normalization layer.
+    private enum UnsafeSemanticOutputProfile {
+        case compile
+        case emitModule
+    }
+
+    private static let unsafeCompilePlannedKinds = [
+        "object", "d", "const-values", "swift-dependencies", "diagnostics",
+    ]
+    private static let unsafeEmitModulePlannedKinds = [
+        "swiftmodule", "swiftdoc", "swiftsourceinfo",
+        "emit-module-diagnostics", "emit-module.d", "abi-baseline-json",
+    ]
+
+    private static func unsafeSemanticOutputProfile(
+        jobKind: SwiftCacheSemanticOutputJobKind,
+        cacheKeyCount: Int,
+        plannedKindGroups: [[String]]
+    ) -> UnsafeSemanticOutputProfile? {
+        switch jobKind {
+        case .compile:
+            guard cacheKeyCount == 10 || cacheKeyCount == 11,
+                  plannedKindGroups.allSatisfy({ $0 == unsafeCompilePlannedKinds }) else {
+                return nil
+            }
+            return .compile
+        case .emitModule:
+            guard cacheKeyCount == 1,
+                  plannedKindGroups == [unsafeEmitModulePlannedKinds] else {
+                return nil
+            }
+            return .emitModule
+        case .other:
+            return nil
+        }
+    }
+
+    private static func matchesUnsafeSemanticOutputProfile(
+        _ profile: UnsafeSemanticOutputProfile,
+        cachedKinds: AdmittedCachedOutputKinds
+    ) -> Bool {
+        switch profile {
+        case .compile:
+            return cachedKinds.fileKinds == ["object", "dependencies", "swift-dependencies", "const-values"]
+                && !cachedKinds.hasCachedDiagnostics
+        case .emitModule:
+            return cachedKinds.fileKinds == [
+                "dependencies", "swiftmodule", "swiftdoc", "swiftsourceinfo", "abi-baseline-json",
+            ] && cachedKinds.hasCachedDiagnostics
+        }
+    }
+    #endif
 
     /// Replays in compiler-key order. Cached streams are discarded immediately
     /// unless capture is requested, in which case they are returned in that same
@@ -1800,6 +1908,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
     package static func prepareAcceleratorCache<Operations: SwiftCacheOperations>(
         mode: SwiftBuildAcceleratorCacheMode,
         trustAuthorization: SwiftAcceleratorCacheTrustAuthorization? = nil,
+        semanticOutputJobKind: SwiftCacheSemanticOutputJobKind = .other,
         operations: Operations,
         cacheKeys: [String],
         expectedOutputKindGroups: [[String]],
@@ -1913,10 +2022,17 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             if claimAtCheckpoint(.queryError) {
                 throw SwiftAcceleratorCacheInjectedError.injected
             }
+            #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+            let allowUnsafeSemanticOutputAdapter = mode == .trust
+            #else
+            let allowUnsafeSemanticOutputAdapter = false
+            #endif
             probe = try probeCache(
                 operations: operations,
                 cacheKeys: cacheKeys,
                 expectedOutputKindGroups: expectedOutputKindGroups,
+                semanticOutputJobKind: semanticOutputJobKind,
+                allowUnsafeSemanticOutputAdapter: allowUnsafeSemanticOutputAdapter,
                 isCancelled: isCancelled
             )
             try activeCancellationPause?(.queryStage)
