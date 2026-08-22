@@ -27,6 +27,7 @@ add_library(SWBUtil
   CountedSet.swift
   CSV.swift
   Debugger.swift
+  DescriptorRelativeFileOperations.swift
   DependencyInfo.swift
   DiagnosticsEngine.swift
   Dictionary.swift
