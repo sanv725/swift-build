@@ -854,11 +854,16 @@ public class PseudoFS: FSProxy, @unchecked Sendable {
     }
 
     public func isFile(_ path: Path) -> Bool {
-        preconditionFailure("TODO: implement when needed")
+        return queue.blocking_sync {
+            if case .file? = getNode(path)?.contents {
+                return true
+            }
+            return false
+        }
     }
 
     public func getLinkFileInfo(_ path: Path) throws -> FileInfo {
-        preconditionFailure("TODO: implement when needed")
+        try getFileInfo(path)
     }
 
     private func _symlink(_ path: Path, target: Path) throws {

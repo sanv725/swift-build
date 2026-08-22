@@ -17,6 +17,12 @@ public import SWBUtil
 public import SWBLLBuild
 import SWBProtocol
 
+#if canImport(Darwin)
+package typealias SwiftCacheOutputAccessPlan = DescriptorRelativeFileOperations.OutputAccessPlan
+#else
+package struct SwiftCacheOutputAccessPlan: Sendable {}
+#endif
+
 #if SWIFT_BUILD_ACCELERATOR_FAULT_INJECTION
 #if canImport(System)
 import System
@@ -1019,6 +1025,10 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             var comparedBytes: UInt64?
             var finalDisposition: TaskCacheObservation.FinalDisposition = .executed
             var shadowManifest: SwiftCacheOutputManifest?
+            var outputAccessPlan: SwiftCacheOutputAccessPlan?
+            #if canImport(Darwin)
+            var outputLeafExpectation: SwiftCacheOutputAccessPlan.LeafExpectation = .admitted
+            #endif
             let isCancellationRequested = {
                 _Concurrency.Task<Never, Never>.isCancelled
                     || (executionDelegate as? any TaskExecutionCancellationDelegate)?.isCancellationRequested == true
@@ -1112,6 +1122,34 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                     observationEligibility = .ineligible
                     observationExclusionReason = .unsupportedOutput
                     observationOutcome = .excluded
+                }
+
+                if observationEligibility == .eligible, acceleratorPolicy.mode.usesAcceleratorMaterialization {
+                    do {
+                        switch try makeLocalFileSystemOutputAccessPlan(
+                            paths: plannedOutputs,
+                            fs: executionDelegate.fs,
+                            isCancelled: isCancellationRequested
+                        ) {
+                        #if canImport(Darwin)
+                        case .descriptor(let plan):
+                            outputAccessPlan = plan
+                        #endif
+                        case .compatibilityFallback:
+                            break
+                        case .unsupportedFileSystem:
+                            observationEligibility = .ineligible
+                            observationExclusionReason = .unsupportedOutput
+                            observationOutcome = .excluded
+                        }
+                    } catch is CancellationError {
+                        observationOutcome = .cancelled
+                        return .cancelled
+                    } catch {
+                        observationEligibility = .ineligible
+                        observationExclusionReason = .unsupportedOutput
+                        observationOutcome = .excluded
+                    }
                 }
 
                 if observationEligibility == .eligible {
@@ -1212,6 +1250,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                             plannedOutputs: plannedOutputs,
                             commandLine: options.commandLine,
                             fs: executionDelegate.fs,
+                            outputAccessPlan: outputAccessPlan,
                             claimInjectedFault: claimInjectedFault,
                             pauseAtCancellationCheckpoint: pauseAtCancellationCheckpoint,
                             isCancelled: isCancellationRequested,
@@ -1232,6 +1271,11 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                         }
                         if let scrubSucceeded = preparation.scrubSucceeded {
                             scrubOutcome = scrubSucceeded ? .succeeded : .failed
+                            #if canImport(Darwin)
+                            if scrubSucceeded, outputAccessPlan != nil {
+                                outputLeafExpectation = .absent
+                            }
+                            #endif
                         }
 
                         switch preparation.outcome {
@@ -1316,6 +1360,27 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 return .cancelled
             }
 
+            #if canImport(Darwin)
+            if let outputAccessPlan {
+                do {
+                    try outputAccessPlan.revalidateCurrentNamespace(
+                        leafExpectation: outputLeafExpectation,
+                        isCancelled: isCancellationRequested
+                    )
+                } catch is CancellationError {
+                    observationOutcome = .cancelled
+                    return .cancelled
+                } catch {
+                    dynamicExecutionDelegate.operationContext.quarantineAcceleratorCache()
+                    observationOutcome = .cacheError
+                    observationFallback = .scrubFailure
+                    scrubOutcome = .failed
+                    outputDelegate.error("Swift accelerator cache output namespace changed before frontend execution")
+                    return .failed
+                }
+            }
+            #endif
+
             let compilerTimer = ElapsedTimer()
             do {
                 try await spawn(commandLine: options.commandLine, environment: environment, workingDirectory: task.workingDirectory, dynamicExecutionDelegate: dynamicExecutionDelegate, clientDelegate: clientDelegate, processDelegate: delegate)
@@ -1327,7 +1392,40 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
 
             if delegate.commandResult == .succeeded, let shadowManifest {
                 finalDisposition = .verifiedThenExecuted
-                let comparison = Self.compareFreshOutputs(shadowManifest: shadowManifest, plannedOutputs: plannedOutputs, fs: executionDelegate.fs)
+                let comparison: SwiftAcceleratorCacheComparison
+                do {
+                    #if canImport(Darwin)
+                    if let outputAccessPlan {
+                        comparison = try Self.compareFreshOutputs(
+                            shadowManifest: shadowManifest,
+                            outputAccessPlan: outputAccessPlan,
+                            isCancelled: isCancellationRequested
+                        )
+                    } else {
+                        comparison = Self.compareFreshOutputs(
+                            shadowManifest: shadowManifest,
+                            plannedOutputs: plannedOutputs,
+                            fs: executionDelegate.fs
+                        )
+                    }
+                    #else
+                    comparison = Self.compareFreshOutputs(
+                        shadowManifest: shadowManifest,
+                        plannedOutputs: plannedOutputs,
+                        fs: executionDelegate.fs
+                    )
+                    #endif
+                } catch is CancellationError {
+                    observationOutcome = .cancelled
+                    return .cancelled
+                } catch {
+                    dynamicExecutionDelegate.operationContext.quarantineAcceleratorCache()
+                    observationOutcome = .cacheError
+                    observationFallback = .scrubFailure
+                    scrubOutcome = .failed
+                    outputDelegate.error("Swift accelerator cache output namespace changed before fresh comparison")
+                    return .failed
+                }
                 verificationDurationNS = (verificationDurationNS ?? 0) + comparison.durationNS
                 mismatchCount = comparison.mismatchCount
                 comparedBytes = comparison.comparedBytes
@@ -1580,6 +1678,34 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         return SwiftCacheOutputManifest(entries: entries)
     }
 
+    #if canImport(Darwin)
+    package static func makeOutputManifest(
+        _ session: DescriptorRelativeFileOperations.OutputAccessSession,
+        replayedOutputs: Bool,
+        isCancelled: () -> Bool = { false }
+    ) throws -> SwiftCacheOutputManifest {
+        var entries: [SwiftCacheOutputManifest.Entry] = []
+        entries.reserveCapacity(session.count)
+        for ordinal in 0..<session.count {
+            if isCancelled() || _Concurrency.Task<Never, Never>.isCancelled { throw CancellationError() }
+            let snapshot = if replayedOutputs {
+                try session.snapshotReplayedOutput(at: ordinal, isCancelled: isCancelled)
+            } else {
+                try session.snapshotCurrentOutput(at: ordinal, isCancelled: isCancelled)
+            }
+            entries.append(.init(
+                ordinal: ordinal,
+                fileKind: .regularFile,
+                permissions: snapshot.metadata.permissions,
+                byteCount: snapshot.metadata.byteCount,
+                digest: snapshot.digest
+            ))
+        }
+        if isCancelled() || _Concurrency.Task<Never, Never>.isCancelled { throw CancellationError() }
+        return SwiftCacheOutputManifest(entries: entries)
+    }
+    #endif
+
     /// Scrubs the complete planned output list, including outputs that replay did
     /// not report writing. A failed removal is a correctness failure, not fallback.
     package static func scrubOutputs(
@@ -1610,6 +1736,22 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         }
     }
 
+    #if canImport(Darwin)
+    package static func scrubAdmittedOutputs(
+        _ session: DescriptorRelativeFileOperations.OutputAccessSession,
+        isCancelled: () -> Bool = { false }
+    ) throws {
+        try session.scrubAdmittedOutputs(isCancelled: isCancelled)
+    }
+
+    package static func scrubReplayOutputs(
+        _ session: DescriptorRelativeFileOperations.OutputAccessSession,
+        isCancelled: () -> Bool = { false }
+    ) throws {
+        try session.scrubReplayOutputs(isCancelled: isCancelled)
+    }
+    #endif
+
     package static func prepareAcceleratorCache<Operations: SwiftCacheOperations>(
         mode: SwiftBuildAcceleratorCacheMode,
         trustAuthorization: SwiftAcceleratorCacheTrustAuthorization? = nil,
@@ -1619,6 +1761,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         plannedOutputs: [Path],
         commandLine: [String],
         fs: any FSProxy,
+        outputAccessPlan: SwiftCacheOutputAccessPlan? = nil,
         injectedFault: SwiftAcceleratorCacheInjectedFault? = nil,
         claimInjectedFault: ((SwiftAcceleratorCacheInjectedFault) -> Bool)? = nil,
         pauseAtCancellationCheckpoint: ((SwiftAcceleratorCacheCancellationCheckpoint) throws -> Void)? = nil,
@@ -1642,6 +1785,71 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         guard expectedOutputKindGroups.reduce(0, { $0 + $1.count }) == plannedOutputs.count else {
             return .init(outcome: .unsupportedOutput, lookupDurationNS: 0)
         }
+        #if canImport(Darwin)
+        if outputAccessPlan != nil,
+           (!mode.usesAcceleratorMaterialization || !supportsDescriptorOutputAccessPlan(fs: fs)) {
+            return .init(outcome: .unsupportedOutput, lookupDurationNS: 0)
+        }
+        var activeOutputAccessPlan = outputAccessPlan
+        if mode.usesAcceleratorMaterialization && activeOutputAccessPlan == nil {
+            do {
+                switch try makeLocalFileSystemOutputAccessPlan(
+                    paths: plannedOutputs,
+                    fs: fs,
+                    isCancelled: isCancelled
+                ) {
+                case .descriptor(let plan):
+                    activeOutputAccessPlan = plan
+                case .compatibilityFallback:
+                    try validateOutputDestinations(plannedOutputs, fs: fs)
+                case .unsupportedFileSystem:
+                    return .init(outcome: .unsupportedOutput, lookupDurationNS: 0)
+                }
+            } catch is CancellationError {
+                return .init(outcome: .cancelled, lookupDurationNS: 0)
+            } catch {
+                return .init(outcome: .unsupportedOutput, lookupDurationNS: 0)
+            }
+        }
+        if let activeOutputAccessPlan, activeOutputAccessPlan.paths != plannedOutputs {
+            return .init(outcome: .unsupportedOutput, lookupDurationNS: 0)
+        }
+        let outputAccessSession: DescriptorRelativeFileOperations.OutputAccessSession?
+        do {
+            outputAccessSession = try activeOutputAccessPlan?.openSession(
+                leafExpectation: .admitted,
+                isCancelled: isCancelled
+            )
+        } catch is CancellationError {
+            return .init(outcome: .cancelled, lookupDurationNS: 0)
+        } catch {
+            quarantineCache()
+            return .init(outcome: .scrubFailure, lookupDurationNS: 0, scrubSucceeded: false)
+        }
+        defer { outputAccessSession?.close() }
+        #else
+        if outputAccessPlan != nil {
+            return .init(outcome: .unsupportedOutput, lookupDurationNS: 0)
+        }
+        if mode.usesAcceleratorMaterialization {
+            do {
+                switch try makeLocalFileSystemOutputAccessPlan(
+                    paths: plannedOutputs,
+                    fs: fs,
+                    isCancelled: isCancelled
+                ) {
+                case .compatibilityFallback:
+                    try validateOutputDestinations(plannedOutputs, fs: fs)
+                case .unsupportedFileSystem:
+                    return .init(outcome: .unsupportedOutput, lookupDurationNS: 0)
+                }
+            } catch is CancellationError {
+                return .init(outcome: .cancelled, lookupDurationNS: 0)
+            } catch {
+                return .init(outcome: .unsupportedOutput, lookupDurationNS: 0)
+            }
+        }
+        #endif
         // The runtime controller already enforces this boundary. Keep the
         // nonserialized test seam equally narrow if it is called directly.
         let activeInjectedFault = mode == .verify ? injectedFault : nil
@@ -1676,6 +1884,25 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         case .miss(.unsupportedOutput):
             return .init(outcome: .unsupportedOutput, lookupDurationNS: lookupDurationNS)
         case .miss:
+            #if canImport(Darwin)
+            if let activeOutputAccessPlan {
+                do {
+                    try activeOutputAccessPlan.revalidateCurrentNamespace(
+                        leafExpectation: .admitted,
+                        isCancelled: isCancelled
+                    )
+                } catch is CancellationError {
+                    return .init(outcome: .cancelled, lookupDurationNS: lookupDurationNS)
+                } catch {
+                    quarantineCache()
+                    return .init(
+                        outcome: .scrubFailure,
+                        lookupDurationNS: lookupDurationNS,
+                        scrubSucceeded: false
+                    )
+                }
+            }
+            #endif
             return .init(outcome: .miss, lookupDurationNS: lookupDurationNS)
         case .hit(_, let outputCount) where mode == .observe:
             return .init(outcome: .wouldHit, lookupDurationNS: lookupDurationNS, cachedOutputCount: outputCount)
@@ -1687,7 +1914,15 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             // incomplete replay could make a stale file look like a cache hit.
             let preScrubTimer = ElapsedTimer()
             do {
+                #if canImport(Darwin)
+                if let outputAccessSession {
+                    try scrubAdmittedOutputs(outputAccessSession, isCancelled: isCancelled)
+                } else {
+                    try scrubOutputs(plannedOutputs, fs: fs, isCancelled: isCancelled)
+                }
+                #else
                 try scrubOutputs(plannedOutputs, fs: fs, isCancelled: isCancelled)
+                #endif
             } catch is CancellationError {
                 return .init(
                     outcome: .cancelled,
@@ -1720,6 +1955,10 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             var outcome: SwiftAcceleratorCachePreparationOutcome = .verificationReady
             var shadowManifest: SwiftCacheOutputManifest?
             let replayTimer = ElapsedTimer()
+            var replayFailure: (any Error)?
+            #if canImport(Darwin)
+            var replayIdentitiesCaptured = false
+            #endif
             do {
                 if claimAtCheckpoint(.replayError) {
                     throw SwiftAcceleratorCacheInjectedError.injected
@@ -1734,13 +1973,33 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                     isCancelled: isCancelled,
                     isQuarantined: isQuarantined
                 )
+                #if canImport(Darwin)
+                if let outputAccessSession {
+                    try outputAccessSession.captureReplayOutputs()
+                    replayIdentitiesCaptured = true
+                }
+                #endif
                 if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
                 try activeCancellationPause?(.postMaterialization)
-            } catch is CancellationError {
-                outcome = .cancelled
-            } catch is SwiftAcceleratorCacheQuarantinedError {
-                outcome = .quarantined
             } catch {
+                replayFailure = error
+            }
+
+            #if canImport(Darwin)
+            if let outputAccessSession, !replayIdentitiesCaptured {
+                do {
+                    try outputAccessSession.captureReplayOutputs()
+                    replayIdentitiesCaptured = true
+                } catch {
+                    replayFailure = error
+                }
+            }
+            #endif
+            if replayFailure is CancellationError {
+                outcome = .cancelled
+            } else if replayFailure is SwiftAcceleratorCacheQuarantinedError {
+                outcome = .quarantined
+            } else if replayFailure != nil {
                 quarantineCache()
                 outcome = .replayError
             }
@@ -1754,7 +2013,19 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                     if claimAtCheckpoint(.manifestError) {
                         throw SwiftAcceleratorCacheInjectedError.injected
                     }
+                    #if canImport(Darwin)
+                    if let outputAccessSession {
+                        shadowManifest = try makeOutputManifest(
+                            outputAccessSession,
+                            replayedOutputs: true,
+                            isCancelled: isCancelled
+                        )
+                    } else {
+                        shadowManifest = try makeOutputManifest(plannedOutputs, fs: fs, isCancelled: isCancelled)
+                    }
+                    #else
                     shadowManifest = try makeOutputManifest(plannedOutputs, fs: fs, isCancelled: isCancelled)
+                    #endif
                     if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
                 } catch is CancellationError {
                     outcome = .cancelled
@@ -1776,7 +2047,15 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
 
             let scrubTimer = ElapsedTimer()
             do {
+                #if canImport(Darwin)
+                if let outputAccessSession {
+                    try scrubReplayOutputs(outputAccessSession, isCancelled: isCancelled)
+                } else {
+                    try scrubOutputs(plannedOutputs, fs: fs, isCancelled: isCancelled)
+                }
+                #else
                 try scrubOutputs(plannedOutputs, fs: fs, isCancelled: isCancelled)
+                #endif
             } catch is CancellationError {
                 totalScrubDurationNS += scrubTimer.elapsedTime().nanoseconds
                 return .init(
@@ -1804,6 +2083,39 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 )
             }
             totalScrubDurationNS += scrubTimer.elapsedTime().nanoseconds
+            #if canImport(Darwin)
+            if let activeOutputAccessPlan {
+                do {
+                    try activeOutputAccessPlan.revalidateCurrentNamespace(
+                        leafExpectation: .absent,
+                        isCancelled: isCancelled
+                    )
+                } catch is CancellationError {
+                    return .init(
+                        outcome: .cancelled,
+                        lookupDurationNS: lookupDurationNS,
+                        replayDurationNS: replayDurationNS,
+                        manifestDurationNS: manifestDurationNS,
+                        scrubDurationNS: totalScrubDurationNS,
+                        scrubSucceeded: true,
+                        cachedOutputCount: outputCount,
+                        shadowManifest: nil
+                    )
+                } catch {
+                    quarantineCache()
+                    return .init(
+                        outcome: .scrubFailure,
+                        lookupDurationNS: lookupDurationNS,
+                        replayDurationNS: replayDurationNS,
+                        manifestDurationNS: manifestDurationNS,
+                        scrubDurationNS: totalScrubDurationNS,
+                        scrubSucceeded: false,
+                        cachedOutputCount: outputCount,
+                        shadowManifest: nil
+                    )
+                }
+            }
+            #endif
             return .init(
                 outcome: outcome,
                 lookupDurationNS: lookupDurationNS,
@@ -1840,6 +2152,43 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             )
         }
     }
+
+    #if canImport(Darwin)
+    package static func compareFreshOutputs(
+        shadowManifest: SwiftCacheOutputManifest,
+        outputAccessPlan: SwiftCacheOutputAccessPlan,
+        isCancelled: () -> Bool = { false }
+    ) throws -> SwiftAcceleratorCacheComparison {
+        let timer = ElapsedTimer()
+        let session = try outputAccessPlan.openSession(
+            leafExpectation: .unchecked,
+            isCancelled: isCancelled
+        )
+        defer { session.close() }
+        do {
+            let freshManifest = try makeOutputManifest(
+                session,
+                replayedOutputs: false,
+                isCancelled: isCancelled
+            )
+            return .init(
+                freshManifest: freshManifest,
+                mismatchCount: shadowManifest.mismatchCount(comparedTo: freshManifest),
+                comparedBytes: UInt64(min(shadowManifest.totalBytes, freshManifest.totalBytes)),
+                durationNS: timer.elapsedTime().nanoseconds
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            return .init(
+                freshManifest: nil,
+                mismatchCount: max(1, outputAccessPlan.count),
+                comparedBytes: 0,
+                durationNS: timer.elapsedTime().nanoseconds
+            )
+        }
+    }
+    #endif
 
     package static func cachePreparationIsFatal(
         _ outcome: SwiftAcceleratorCachePreparationOutcome,

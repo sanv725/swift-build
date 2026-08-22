@@ -344,7 +344,7 @@
                         testingHook: { event, descriptor in
                             guard event == .chunkHashed(index: 0) else { return }
                             try localFS.write(leaf, contents: replacementContents)
-                            var times = [
+                            let times = [
                                 timespec(tv_sec: 946_684_800, tv_nsec: 123_456_789),
                                 timespec(tv_sec: 946_684_800, tv_nsec: 123_456_789),
                             ]
@@ -376,6 +376,164 @@
             for invalid in [Path("relative/leaf"), Path("/tmp/../tmp/leaf"), Path("/tmp//leaf"), Path.root] {
                 #expect(throws: DescriptorRelativeFileOperations.OperationError.invalidAbsolutePath) {
                     _ = try DescriptorRelativeFileOperations.snapshotRegularFile(at: invalid)
+                }
+            }
+        }
+
+        @Test
+        func outputAccessPlanRejectsAncestorSymlinksAndSpecialLeaves() throws {
+            try withTemporaryDirectory { (temporaryDirectory: Path) in
+                let realParent = temporaryDirectory.join("real-parent")
+                let linkedParent = temporaryDirectory.join("linked-parent")
+                try localFS.createDirectory(realParent)
+                try localFS.symlink(linkedParent, target: realParent)
+
+                #expect(throws: (any Error).self) {
+                    _ = try makeLocalFileSystemOutputAccessPlan(
+                        paths: [linkedParent.join("leaf")],
+                        fs: localFS
+                    )
+                }
+
+                let fifo = temporaryDirectory.join("fifo")
+                try #require(Darwin.mkfifo(fifo.str, 0o600) == 0)
+                #expect(
+                    throws: DescriptorRelativeFileOperations.OperationError.unexpectedNodeType(
+                        expected: .regularFile,
+                        actual: .other
+                    )
+                ) {
+                    _ = try makeLocalFileSystemOutputAccessPlan(paths: [fifo], fs: localFS)
+                }
+            }
+        }
+
+        @Test
+        func outputAccessSessionRemainsPinnedAcrossAncestorReplacement() throws {
+            try withTemporaryDirectory { (temporaryDirectory: Path) in
+                let parent = temporaryDirectory.join("parent")
+                let movedParent = temporaryDirectory.join("moved-parent")
+                let output = parent.join("leaf")
+                let movedOutput = movedParent.join("leaf")
+                let replayedContents = ByteString(encodingAsUTF8: "replayed")
+                let replacementContents = ByteString(encodingAsUTF8: "replacement")
+                try localFS.createDirectory(parent)
+
+                let plan = try descriptorPlan(paths: [output])
+                let session = try plan.openSession(leafExpectation: .admitted)
+                defer { session.close() }
+                try localFS.write(output, contents: replayedContents)
+                try localFS.move(parent, to: movedParent)
+                try localFS.createDirectory(parent)
+                try localFS.write(output, contents: replacementContents)
+
+                try session.captureReplayOutputs()
+                let snapshot = try session.snapshotReplayedOutput(at: 0)
+                let expectedHash = SHA256Context()
+                expectedHash.add(bytes: replayedContents)
+                #expect(snapshot.digest == expectedHash.signature)
+
+                try session.scrubReplayOutputs()
+                #expect(!localFS.exists(movedOutput))
+                #expect(try localFS.read(output) == replacementContents)
+                #expect(throws: (any Error).self) {
+                    try plan.revalidateCurrentNamespace(leafExpectation: .unchecked)
+                }
+            }
+        }
+
+        @Test
+        func outputAccessSessionPreservesNewAndReplacedAdmittedLeaves() throws {
+            try withTemporaryDirectory { (temporaryDirectory: Path) in
+                let absentAtAdmission = temporaryDirectory.join("absent-at-admission")
+                let absentPlan = try descriptorPlan(paths: [absentAtAdmission])
+                try localFS.write(absentAtAdmission, contents: ByteString(encodingAsUTF8: "new-owner"))
+                #expect(throws: DescriptorRelativeFileOperations.OperationError.scrubFailed) {
+                    _ = try absentPlan.openSession(leafExpectation: .admitted)
+                }
+                #expect(try localFS.read(absentAtAdmission).asString == "new-owner")
+
+                let preexisting = temporaryDirectory.join("preexisting")
+                let movedPreexisting = temporaryDirectory.join("moved-preexisting")
+                try localFS.write(preexisting, contents: ByteString(encodingAsUTF8: "admitted"))
+                let preexistingPlan = try descriptorPlan(paths: [preexisting])
+                try localFS.move(preexisting, to: movedPreexisting)
+                try localFS.write(preexisting, contents: ByteString(encodingAsUTF8: "replacement"))
+                #expect(throws: DescriptorRelativeFileOperations.OperationError.scrubFailed) {
+                    _ = try preexistingPlan.openSession(leafExpectation: .admitted)
+                }
+                #expect(try localFS.read(preexisting).asString == "replacement")
+            }
+        }
+
+        @Test
+        func outputAccessRevalidationRejectsLeafRecreatedAfterScrub() throws {
+            try withTemporaryDirectory { (temporaryDirectory: Path) in
+                let output = temporaryDirectory.join("leaf")
+                let plan = try descriptorPlan(paths: [output])
+                let session = try plan.openSession(leafExpectation: .admitted)
+                try localFS.write(output, contents: ByteString(encodingAsUTF8: "replayed"))
+                try session.captureReplayOutputs()
+                try session.scrubReplayOutputs()
+                session.close()
+
+                try localFS.write(output, contents: ByteString(encodingAsUTF8: "new-owner"))
+                #expect(throws: DescriptorRelativeFileOperations.OperationError.scrubFailed) {
+                    try plan.revalidateCurrentNamespace(leafExpectation: .absent)
+                }
+                #expect(try localFS.read(output).asString == "new-owner")
+            }
+        }
+
+        @Test
+        func outputAccessRevalidationCancelsDuringAncestorWalk() throws {
+            try withTemporaryDirectory { (temporaryDirectory: Path) in
+                let first = temporaryDirectory.join("first")
+                let second = first.join("second")
+                try localFS.createDirectory(second, recursive: true)
+                let plan = try descriptorPlan(paths: [second.join("leaf")])
+                var cancellationChecks = 0
+
+                #expect(throws: CancellationError.self) {
+                    try plan.revalidateCurrentNamespace(
+                        leafExpectation: .unchecked,
+                        isCancelled: {
+                            cancellationChecks += 1
+                            return cancellationChecks == 3
+                        }
+                    )
+                }
+                #expect(cancellationChecks == 3)
+
+                let session = try plan.openSession(leafExpectation: .admitted)
+                let descriptors = session.parentDescriptorRawValuesForTesting
+                session.close()
+                for descriptor in descriptors {
+                    Darwin.errno = 0
+                    #expect(Darwin.fcntl(descriptor, F_GETFD) == -1)
+                    #expect(Darwin.errno == EBADF)
+                }
+            }
+        }
+
+        @Test
+        func outputAccessSessionClosesEveryParentDescriptor() throws {
+            try withTemporaryDirectory { (temporaryDirectory: Path) in
+                let firstParent = temporaryDirectory.join("first")
+                let secondParent = temporaryDirectory.join("second")
+                try localFS.createDirectory(firstParent)
+                try localFS.createDirectory(secondParent)
+                let plan = try descriptorPlan(paths: [firstParent.join("one"), secondParent.join("two")])
+                let session = try plan.openSession(leafExpectation: .admitted)
+                let descriptors = session.parentDescriptorRawValuesForTesting
+
+                session.close()
+
+                #expect(descriptors.count == 2)
+                for descriptor in descriptors {
+                    Darwin.errno = 0
+                    #expect(Darwin.fcntl(descriptor, F_GETFD) == -1)
+                    #expect(Darwin.errno == EBADF)
                 }
             }
         }
@@ -418,6 +576,15 @@
                 .readOnly,
                 options: [.directory, .noFollow, .closeOnExec]
             )
+        }
+
+        private func descriptorPlan(paths: [Path]) throws -> DescriptorRelativeFileOperations.OutputAccessPlan {
+            switch try makeLocalFileSystemOutputAccessPlan(paths: paths, fs: localFS) {
+            case .descriptor(let plan):
+                return plan
+            case .compatibilityFallback, .unsupportedFileSystem:
+                throw DescriptorRelativeFileOperations.OperationError.invalidAbsolutePath
+            }
         }
 
         private func readAll(_ descriptor: FileDescriptor) throws -> ByteString {

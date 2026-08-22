@@ -315,6 +315,366 @@ fileprivate struct SwiftCacheOperationsTests {
         }
     }
 
+    #if canImport(Darwin)
+    @Test
+    func descriptorAdmissionRejectsAncestorSymlinkBeforeQueryOrScrub() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let fs = localFS
+        let realParent = temporaryDirectory.path.join("real-parent")
+        let linkedParent = temporaryDirectory.path.join("linked-parent")
+        let victim = realParent.join("main.o")
+        try fs.createDirectory(realParent)
+        try fs.write(victim, contents: ByteString(encodingAsUTF8: "victim"))
+        try fs.symlink(linkedParent, target: realParent)
+        let operations = TestSwiftCacheOperations(
+            queries: ["key": .hit(1)],
+            outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+        )
+
+        let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .verify,
+            operations: operations,
+            cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
+            plannedOutputs: [linkedParent.join("main.o")],
+            commandLine: ["swift-frontend", "-c"],
+            fs: fs
+        )
+
+        #expect(preparation.outcome == .unsupportedOutput)
+        #expect(operations.queriedKeys.isEmpty)
+        #expect(operations.replayedCompilations.isEmpty)
+        #expect(try fs.read(victim).asString == "victim")
+    }
+
+    @Test
+    func descriptorAdmissionCancellationDuringAncestorWalkDoesNotQueryOrReplay() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let parent = temporaryDirectory.path.join("first").join("second")
+        try localFS.createDirectory(parent, recursive: true)
+        let operations = TestSwiftCacheOperations(
+            queries: ["key": .hit(1)],
+            outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+        )
+        var cancellationChecks = 0
+
+        let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .verify,
+            operations: operations,
+            cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
+            plannedOutputs: [parent.join("main.o")],
+            commandLine: ["swift-frontend", "-c"],
+            fs: localFS,
+            isCancelled: {
+                cancellationChecks += 1
+                return cancellationChecks == 5
+            }
+        )
+
+        #expect(preparation.outcome == .cancelled)
+        #expect(cancellationChecks == 5)
+        #expect(operations.queriedKeys.isEmpty)
+        #expect(operations.replayedCompilations.isEmpty)
+    }
+
+    @Test
+    func descriptorSessionPreservesLeafCreatedAfterAdmissionBeforeQuery() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let output = temporaryDirectory.path.join("main.o")
+        let plan: SwiftCacheOutputAccessPlan
+        switch try makeLocalFileSystemOutputAccessPlan(paths: [output], fs: localFS) {
+        case .descriptor(let descriptorPlan):
+            plan = descriptorPlan
+        case .compatibilityFallback, .unsupportedFileSystem:
+            Issue.record("local Darwin filesystem did not select the descriptor backend")
+            return
+        }
+        try localFS.write(output, contents: ByteString(encodingAsUTF8: "new-owner"))
+        let operations = TestSwiftCacheOperations(
+            queries: ["key": .hit(1)],
+            outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+        )
+        var quarantineCount = 0
+
+        let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .verify,
+            operations: operations,
+            cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
+            plannedOutputs: [output],
+            commandLine: ["swift-frontend", "-c"],
+            fs: localFS,
+            outputAccessPlan: plan,
+            quarantineCache: { quarantineCount += 1 }
+        )
+
+        #expect(preparation.outcome == .scrubFailure)
+        #expect(!preparation.outcome.shouldExecuteFrontend)
+        #expect(preparation.scrubSucceeded == false)
+        #expect(operations.queriedKeys.isEmpty)
+        #expect(operations.replayedCompilations.isEmpty)
+        #expect(try localFS.read(output).asString == "new-owner")
+        #expect(quarantineCount == 1)
+    }
+
+    @Test
+    func cacheMissRejectsReplacementOfAnAdmittedLeaf() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let output = temporaryDirectory.path.join("main.o")
+        let movedOutput = temporaryDirectory.path.join("moved-main.o")
+        try localFS.write(output, contents: ByteString(encodingAsUTF8: "admitted"))
+        let plan: SwiftCacheOutputAccessPlan
+        switch try makeLocalFileSystemOutputAccessPlan(paths: [output], fs: localFS) {
+        case .descriptor(let descriptorPlan):
+            plan = descriptorPlan
+        case .compatibilityFallback, .unsupportedFileSystem:
+            Issue.record("local Darwin filesystem did not select the descriptor backend")
+            return
+        }
+        let operations = TestSwiftCacheOperations(queries: ["key": .miss], outputs: [:])
+        operations.querySideEffect = { _ in
+            try localFS.move(output, to: movedOutput)
+            try localFS.write(output, contents: ByteString(encodingAsUTF8: "new-owner"))
+        }
+        var quarantineCount = 0
+
+        let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .verify,
+            operations: operations,
+            cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
+            plannedOutputs: [output],
+            commandLine: ["swift-frontend", "-c"],
+            fs: localFS,
+            outputAccessPlan: plan,
+            quarantineCache: { quarantineCount += 1 }
+        )
+
+        #expect(preparation.outcome == .scrubFailure)
+        #expect(preparation.scrubSucceeded == false)
+        #expect(operations.queriedKeys == ["key"])
+        #expect(operations.replayedCompilations.isEmpty)
+        #expect(try localFS.read(output).asString == "new-owner")
+        #expect(try localFS.read(movedOutput).asString == "admitted")
+        #expect(quarantineCount == 1)
+    }
+
+    @Test
+    func suppliedDescriptorPlanRequiresMaterializingLocalFileSystem() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let output = temporaryDirectory.path.join("main.o")
+        let plan: SwiftCacheOutputAccessPlan
+        switch try makeLocalFileSystemOutputAccessPlan(paths: [output], fs: localFS) {
+        case .descriptor(let descriptorPlan):
+            plan = descriptorPlan
+        case .compatibilityFallback, .unsupportedFileSystem:
+            Issue.record("local Darwin filesystem did not select the descriptor backend")
+            return
+        }
+
+        for (mode, fs): (SwiftBuildAcceleratorCacheMode, any FSProxy) in [
+            (.observe, localFS),
+            (.verify, PseudoFS()),
+        ] {
+            let operations = TestSwiftCacheOperations(
+                queries: ["key": .hit(1)],
+                outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+            )
+            let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+                mode: mode,
+                operations: operations,
+                cacheKeys: ["key"],
+                expectedOutputKindGroups: [["object"]],
+                plannedOutputs: [output],
+                commandLine: ["swift-frontend", "-c"],
+                fs: fs,
+                outputAccessPlan: plan
+            )
+
+            #expect(preparation.outcome == .unsupportedOutput)
+            #expect(operations.queriedKeys.isEmpty)
+            #expect(operations.replayedCompilations.isEmpty)
+        }
+    }
+
+    @Test
+    func replayUsesPinnedParentAndNamespaceReplacementFailsBeforeFrontend() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let fs = localFS
+        let parent = temporaryDirectory.path.join("parent")
+        let movedParent = temporaryDirectory.path.join("moved-parent")
+        let output = parent.join("main.o")
+        let movedOutput = movedParent.join("main.o")
+        try fs.createDirectory(parent)
+        let operations = TestSwiftCacheOperations(
+            queries: ["key": .hit(1)],
+            outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+        )
+        operations.replaySideEffect = { _ in
+            try fs.write(output, contents: ByteString(encodingAsUTF8: "cached"))
+            try fs.move(parent, to: movedParent)
+            try fs.createDirectory(parent)
+            try fs.write(output, contents: ByteString(encodingAsUTF8: "replacement-owner"))
+        }
+        var quarantineCount = 0
+
+        let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .verify,
+            operations: operations,
+            cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
+            plannedOutputs: [output],
+            commandLine: ["swift-frontend", "-c"],
+            fs: fs,
+            quarantineCache: { quarantineCount += 1 }
+        )
+
+        #expect(preparation.outcome == .scrubFailure)
+        #expect(!preparation.outcome.shouldExecuteFrontend)
+        #expect(preparation.scrubSucceeded == false)
+        #expect(preparation.shadowManifest == nil)
+        #expect(operations.queriedKeys == ["key"])
+        #expect(operations.replayedCompilations == [1])
+        #expect(!fs.exists(movedOutput), "the replayed node under the pinned parent must be scrubbed")
+        #expect(try fs.read(output).asString == "replacement-owner")
+        #expect(quarantineCount == 1)
+    }
+
+    @Test
+    func postMaterializationReplacementIsPreservedAndFailsScrub() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let output = temporaryDirectory.path.join("main.o")
+        let movedOutput = temporaryDirectory.path.join("moved-main.o")
+        let operations = TestSwiftCacheOperations(
+            queries: ["key": .hit(1)],
+            outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+        )
+        operations.replaySideEffect = { _ in
+            try localFS.write(output, contents: ByteString(encodingAsUTF8: "replayed"))
+        }
+
+        let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .verify,
+            operations: operations,
+            cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
+            plannedOutputs: [output],
+            commandLine: ["swift-frontend", "-c"],
+            fs: localFS,
+            pauseAtCancellationCheckpoint: { checkpoint in
+                guard checkpoint == .postMaterialization else { return }
+                try localFS.move(output, to: movedOutput)
+                try localFS.write(output, contents: ByteString(encodingAsUTF8: "new-owner"))
+            }
+        )
+
+        #expect(preparation.outcome == .scrubFailure)
+        #expect(preparation.scrubSucceeded == false)
+        #expect(operations.replayedCompilations == [1])
+        #expect(try localFS.read(output).asString == "new-owner")
+        #expect(try localFS.read(movedOutput).asString == "replayed")
+    }
+
+    @Test
+    func freshDescriptorComparisonPreservesCallbackCancellation() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let output = temporaryDirectory.path.join("main.o")
+        let plan: SwiftCacheOutputAccessPlan
+        switch try makeLocalFileSystemOutputAccessPlan(paths: [output], fs: localFS) {
+        case .descriptor(let descriptorPlan):
+            plan = descriptorPlan
+        case .compatibilityFallback, .unsupportedFileSystem:
+            Issue.record("local Darwin filesystem did not select the descriptor backend")
+            return
+        }
+        try localFS.write(output, contents: ByteString(encodingAsUTF8: "fresh"))
+        let shadowManifest = try SwiftDriverJobTaskAction.makeOutputManifest([output], fs: localFS)
+        let comparison = try SwiftDriverJobTaskAction.compareFreshOutputs(
+            shadowManifest: shadowManifest,
+            outputAccessPlan: plan
+        )
+        #expect(comparison.isMatch)
+
+        #expect(throws: CancellationError.self) {
+            _ = try SwiftDriverJobTaskAction.compareFreshOutputs(
+                shadowManifest: shadowManifest,
+                outputAccessPlan: plan,
+                isCancelled: { true }
+            )
+        }
+        #expect(localFS.exists(output))
+    }
+    #endif
+
+    @Test
+    func pseudoFileSystemCompatibilityFallbackReplaysManifestsAndScrubs() throws {
+        let fs = PseudoFS()
+        let output = Path("/main.o")
+        switch try makeLocalFileSystemOutputAccessPlan(paths: [output], fs: fs) {
+        case .compatibilityFallback:
+            break
+        #if canImport(Darwin)
+        case .descriptor:
+            Issue.record("PseudoFS unexpectedly selected the descriptor backend")
+        #endif
+        case .unsupportedFileSystem:
+            Issue.record("PseudoFS unexpectedly failed compatibility admission")
+        }
+        let operations = TestSwiftCacheOperations(
+            queries: ["key": .hit(1)],
+            outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+        )
+        operations.replaySideEffect = { _ in
+            try fs.write(output, contents: ByteString(encodingAsUTF8: "cached-object"))
+            try fs.setFilePermissions(output, permissions: 0o600)
+        }
+
+        let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .verify,
+            operations: operations,
+            cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
+            plannedOutputs: [output],
+            commandLine: ["swift-frontend", "-c"],
+            fs: fs
+        )
+
+        #expect(preparation.outcome == .verificationReady)
+        #expect(preparation.shadowManifest?.entries.map(\.permissions) == [0o600])
+        #expect(preparation.shadowManifest?.entries.map(\.byteCount) == [13])
+        #expect(preparation.scrubSucceeded == true)
+        #expect(operations.queriedKeys == ["key"])
+        #expect(operations.replayedCompilations == [1])
+        #expect(!fs.exists(output))
+    }
+
+    @Test
+    func pseudoFileSystemCompatibilityAdmissionRejectsDirectoryBeforeQuery() throws {
+        let fs = PseudoFS()
+        let output = Path("/directory")
+        try fs.createDirectory(output)
+        let operations = TestSwiftCacheOperations(
+            queries: ["key": .hit(1)],
+            outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+        )
+
+        let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .verify,
+            operations: operations,
+            cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
+            plannedOutputs: [output],
+            commandLine: ["swift-frontend", "-c"],
+            fs: fs
+        )
+
+        #expect(preparation.outcome == .unsupportedOutput)
+        #expect(operations.queriedKeys.isEmpty)
+        #expect(operations.replayedCompilations.isEmpty)
+        #expect(fs.isDirectory(output))
+    }
+
     @Test
     func verifyDetectsSharedObjectiveCHeaderOutputBeforeReplay() throws {
         let temporaryDirectory = try NamedTemporaryDirectory()
@@ -1636,6 +1996,7 @@ private final class TestSwiftCacheOperations: SwiftCacheOperations {
     let replayStreams: SwiftCacheReplayStreams
     var failCreateReplay = false
     var failReplayForCompilation: Int?
+    var querySideEffect: ((String) throws -> Void)?
     var replaySideEffect: ((Int) throws -> Void)?
     private(set) var queriedKeys: [String] = []
     private(set) var replayCommandLine: [String]?
@@ -1659,6 +2020,7 @@ private final class TestSwiftCacheOperations: SwiftCacheOperations {
 
     func queryLocalCacheKey(_ key: String) throws -> Int? {
         queriedKeys.append(key)
+        try querySideEffect?(key)
         switch queries[key] ?? .miss {
         case .hit(let compilation):
             return compilation

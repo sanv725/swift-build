@@ -70,6 +70,7 @@ add_library(SWBUtil
   OrderedDictionary.swift
   OrderedSet.swift
   OSLog.swift
+  OutputAccessPlan.swift
   OutputByteStream.swift
   Pair.swift
   Path.swift
