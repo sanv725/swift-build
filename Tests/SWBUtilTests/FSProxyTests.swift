@@ -23,6 +23,10 @@ import System
 import SystemPackage
 #endif
 
+private enum FSProxyReadBodySentinel: Error, Equatable {
+    case expected
+}
+
 @Suite fileprivate struct FSProxyTests {
     let hostOS: OperatingSystem
 
@@ -243,6 +247,48 @@ import SystemPackage
             try testData.write(toFile: testDataPath.str, atomically: false, encoding: String.Encoding.utf8)
             #expect(try ByteString(testData) == localFS.read(testDataPath))
             #expect(try ByteString(testData) == localFS.read(testDataPath))
+        }
+    }
+
+    @Test
+    func readBodyErrorsArePreserved() throws {
+        try withTemporaryDirectory { tmpDir in
+            let localPath = tmpDir.join("local.txt")
+            try localFS.write(localPath, contents: ByteString(encodingAsUTF8: "local"))
+
+            let pseudoFS = PseudoFS()
+            let pseudoPath = Path.root.join("pseudo.txt")
+            try pseudoFS.write(pseudoPath, contents: ByteString(encodingAsUTF8: "pseudo"))
+
+            for (fs, path) in [(localFS as any FSProxy, localPath), (pseudoFS as any FSProxy, pseudoPath)] {
+                #expect(performing: {
+                    try fs.read(path) { _ -> Void in
+                        throw FSProxyReadBodySentinel.expected
+                    }
+                }, throws: { error in
+                    error as? FSProxyReadBodySentinel == .expected
+                })
+
+                #expect(performing: {
+                    try fs.read(path) { _ -> Void in
+                        throw CancellationError()
+                    }
+                }, throws: { error in
+                    error is CancellationError
+                })
+            }
+        }
+    }
+
+    @Test
+    func genericReadMissingFileRetainsContextualOpenError() throws {
+        try withTemporaryDirectory { tmpDir in
+            let missing = tmpDir.join("missing")
+            #expect(performing: {
+                try localFS.read(missing) { _ in () }
+            }, throws: { error in
+                error.localizedDescription.hasPrefix("Cannot open file handle for file at path: \(missing.str):")
+            })
         }
     }
 

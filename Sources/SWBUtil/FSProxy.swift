@@ -493,12 +493,14 @@ class LocalFS: FSProxy, @unchecked Sendable {
     }
 
     func read<T>(_ path: Path, read: (FileHandle) throws -> T) throws -> T {
+        let fileHandle: FileHandle
         do {
-            let fh = try FileHandle(forReadingFrom: URL(fileURLWithPath: path.str))
-            return try read(fh)
+            fileHandle = try FileHandle(forReadingFrom: URL(fileURLWithPath: path.str))
         } catch {
             throw StubError.error("Cannot open file handle for file at path: \(path.str): \(error.localizedDescription)")
         }
+        defer { try? fileHandle.close() }
+        return try read(fileHandle)
     }
 
     func read(_ path: Path) throws -> ByteString {
@@ -1105,12 +1107,14 @@ public class PseudoFS: FSProxy, @unchecked Sendable {
         return try withTemporaryDirectory { dir in
             let temporaryFilePath = dir.join(path.basename)
             try localFS.write(temporaryFilePath, contents: self.read(path))
+            let fileHandle: FileHandle
             do {
-                let fh = try FileHandle(forReadingFrom: URL(fileURLWithPath: temporaryFilePath.str))
-                return try read(fh)
+                fileHandle = try FileHandle(forReadingFrom: URL(fileURLWithPath: temporaryFilePath.str))
             } catch {
                 throw StubError.error("Cannot open file handle for file at path: \(temporaryFilePath.str): \(error.localizedDescription)")
             }
+            defer { try? fileHandle.close() }
+            return try read(fileHandle)
         }
     }
 
