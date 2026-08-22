@@ -171,6 +171,175 @@
         }
 
         @Test
+        func snapshotsMultipleChunksWithDigestParity() throws {
+            try withTemporaryDirectory { temporaryDirectory in
+                let leaf = temporaryDirectory.join("leaf")
+                let contents = ByteString((0..<(64 * 1024 * 2 + 17)).map { UInt8(truncatingIfNeeded: $0) })
+                try localFS.write(leaf, contents: contents)
+
+                var chunkCount = 0
+                let snapshot = try DescriptorRelativeFileOperations.snapshotRegularFile(at: leaf) { event, _ in
+                    if case .chunkHashed = event {
+                        chunkCount += 1
+                    }
+                }
+                let expectedHash = SHA256Context()
+                expectedHash.add(bytes: contents)
+
+                #expect(chunkCount == 3)
+                #expect(snapshot.metadata.type == .regularFile)
+                #expect(snapshot.metadata.byteCount == Int64(contents.count))
+                #expect(snapshot.digest == expectedHash.signature)
+            }
+        }
+
+        @Test
+        func snapshotPreservesMidStreamCancellation() async throws {
+            try await withTemporaryDirectory { (temporaryDirectory: Path) in
+                let leaf = temporaryDirectory.join("leaf")
+                try localFS.write(
+                    leaf,
+                    contents: ByteString((0..<(64 * 1024 * 2)).map { UInt8(truncatingIfNeeded: $0) })
+                )
+                let firstChunkHashed = WaitCondition()
+                let allowCancellationCheck = DispatchSemaphore(value: 0)
+                let snapshotTask = Task.detached {
+                    try DescriptorRelativeFileOperations.snapshotRegularFile(at: leaf) { event, _ in
+                        if event == .chunkHashed(index: 0) {
+                            firstChunkHashed.signal()
+                            allowCancellationCheck.wait()
+                        }
+                    }
+                }
+
+                await firstChunkHashed.wait()
+                snapshotTask.cancel()
+                allowCancellationCheck.signal()
+                await #expect(throws: CancellationError.self) {
+                    try await snapshotTask.value
+                }
+            }
+        }
+
+        @Test
+        func snapshotRejectsAncestorSymlinks() throws {
+            try withTemporaryDirectory { temporaryDirectory in
+                let realAncestor = temporaryDirectory.join("real")
+                let linkedAncestor = temporaryDirectory.join("linked")
+                try localFS.createDirectory(realAncestor)
+                try localFS.write(realAncestor.join("leaf"), contents: ByteString(encodingAsUTF8: "contents"))
+                try localFS.symlink(linkedAncestor, target: realAncestor)
+
+                #expect(throws: (any Error).self) {
+                    _ = try DescriptorRelativeFileOperations.snapshotRegularFile(at: linkedAncestor.join("leaf"))
+                }
+            }
+        }
+
+        @Test
+        func snapshotLeafRemainsAnchoredAfterPathReplacement() throws {
+            try withTemporaryDirectory { temporaryDirectory in
+                let leaf = temporaryDirectory.join("leaf")
+                let movedLeaf = temporaryDirectory.join("moved-leaf")
+                let replacement = temporaryDirectory.join("replacement")
+                let originalContents = ByteString(encodingAsUTF8: "original contents")
+                let replacementContents = ByteString(encodingAsUTF8: "replacement contents")
+                try localFS.write(leaf, contents: originalContents)
+                try localFS.write(replacement, contents: replacementContents)
+
+                let snapshot = try DescriptorRelativeFileOperations.snapshotRegularFile(at: leaf) { event, _ in
+                    guard event == .leafOpened else { return }
+                    try localFS.move(leaf, to: movedLeaf)
+                    try localFS.move(replacement, to: leaf)
+                }
+                let expectedHash = SHA256Context()
+                expectedHash.add(bytes: originalContents)
+
+                #expect(snapshot.metadata.byteCount == Int64(originalContents.count))
+                #expect(snapshot.digest == expectedHash.signature)
+                #expect(try localFS.read(leaf) == replacementContents)
+            }
+        }
+
+        @Test
+        func snapshotRejectsBeforeAfterPermissionDrift() throws {
+            try withTemporaryDirectory { temporaryDirectory in
+                let leaf = temporaryDirectory.join("leaf")
+                try localFS.write(
+                    leaf,
+                    contents: ByteString((0..<(64 * 1024 + 1)).map { UInt8(truncatingIfNeeded: $0) })
+                )
+                try localFS.setFilePermissions(leaf, permissions: 0o600)
+
+                do {
+                    _ = try DescriptorRelativeFileOperations.snapshotRegularFile(at: leaf) { event, descriptor in
+                        guard event == .chunkHashed(index: 0) else { return }
+                        try #require(Darwin.fchmod(descriptor.rawValue, 0o640) == 0)
+                    }
+                    Issue.record("expected permission drift to reject the snapshot")
+                } catch let error as DescriptorRelativeFileOperations.OperationError {
+                    guard case .fileChanged(let before, let after) = error else {
+                        Issue.record("unexpected snapshot error: \(error)")
+                        return
+                    }
+                    #expect(before.permissions == 0o600)
+                    #expect(after.permissions == 0o640)
+                    #expect(before.device == after.device)
+                    #expect(before.inode == after.inode)
+                }
+            }
+        }
+
+        @Test
+        func snapshotRejectsSameSizeInPlaceRewrite() throws {
+            try withTemporaryDirectory { temporaryDirectory in
+                let leaf = temporaryDirectory.join("leaf")
+                let byteCount = 64 * 1024 + 1
+                let originalContents = ByteString((0..<byteCount).map { UInt8(truncatingIfNeeded: $0) })
+                let replacementContents = ByteString((0..<byteCount).map { UInt8(truncatingIfNeeded: ~$0) })
+                try localFS.write(leaf, contents: originalContents)
+                try localFS.setFilePermissions(leaf, permissions: 0o600)
+
+                do {
+                    _ = try DescriptorRelativeFileOperations.snapshotRegularFile(at: leaf) { event, descriptor in
+                        guard event == .chunkHashed(index: 0) else { return }
+                        try localFS.write(leaf, contents: replacementContents)
+                        var times = [
+                            timespec(tv_sec: 946_684_800, tv_nsec: 123_456_789),
+                            timespec(tv_sec: 946_684_800, tv_nsec: 123_456_789),
+                        ]
+                        try #require(times.withUnsafeBufferPointer { Darwin.futimens(descriptor.rawValue, $0.baseAddress) } == 0)
+                    }
+                    Issue.record("expected a same-size rewrite to reject the snapshot")
+                } catch let error as DescriptorRelativeFileOperations.OperationError {
+                    guard case .fileChanged(let before, let after) = error else {
+                        Issue.record("unexpected snapshot error: \(error)")
+                        return
+                    }
+                    #expect(before.byteCount == after.byteCount)
+                    #expect(before.permissions == after.permissions)
+                    #expect(before.device == after.device)
+                    #expect(before.inode == after.inode)
+                    #expect(
+                        before.modificationTimeSeconds != after.modificationTimeSeconds
+                            || before.modificationTimeNanoseconds != after.modificationTimeNanoseconds
+                            || before.changeTimeSeconds != after.changeTimeSeconds
+                            || before.changeTimeNanoseconds != after.changeTimeNanoseconds
+                    )
+                }
+            }
+        }
+
+        @Test
+        func snapshotRejectsNonAbsoluteOrNonnormalizedPaths() {
+            for invalid in [Path("relative/leaf"), Path("/tmp/../tmp/leaf"), Path("/tmp//leaf"), Path.root] {
+                #expect(throws: DescriptorRelativeFileOperations.OperationError.invalidAbsolutePath) {
+                    _ = try DescriptorRelativeFileOperations.snapshotRegularFile(at: invalid)
+                }
+            }
+        }
+
+        @Test
         func retriesOnlyInterruptedSystemCalls() throws {
             var attempts = 0
             let result = try DescriptorRelativeFileOperations.retryingSyscall(
