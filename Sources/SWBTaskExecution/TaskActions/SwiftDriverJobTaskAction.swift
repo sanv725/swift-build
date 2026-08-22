@@ -17,6 +17,10 @@ public import SWBUtil
 public import SWBLLBuild
 import SWBProtocol
 
+#if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
+import Synchronization
+#endif
+
 #if canImport(Darwin)
 package typealias SwiftCacheOutputAccessPlan = DescriptorRelativeFileOperations.OutputAccessPlan
 #else
@@ -62,7 +66,51 @@ package protocol SwiftCacheOperations {
     func cachedOutputs(for compilation: Compilation) throws -> [SwiftCacheCachedOutput]
     func createReplayInstance(commandLine: [String]) throws -> ReplayInstance
     func replayCompilation(_ compilation: Compilation, using instance: ReplayInstance) throws -> SwiftCacheReplayStreams
+    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
+    func replayCompilations(
+        _ compilations: [Compilation],
+        using instance: ReplayInstance,
+        maximumParallelism: Int
+    ) -> [Result<SwiftCacheReplayStreams, any Error>]
+    #endif
 }
+
+#if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
+extension SwiftCacheOperations {
+    package func replayCompilations(
+        _ compilations: [Compilation],
+        using instance: ReplayInstance,
+        maximumParallelism: Int
+    ) -> [Result<SwiftCacheReplayStreams, any Error>] {
+        compilations.map { compilation in
+            Result { try replayCompilation(compilation, using: instance) }
+        }
+    }
+}
+#endif
+
+#if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
+private final class UnsafeParallelSwiftCASReplayContext: @unchecked Sendable {
+    let operations: SwiftCASCacheOperations
+    let compilations: [SwiftCachedCompilation]
+    let instance: SwiftCacheReplayInstance
+
+    init(
+        operations: SwiftCASCacheOperations,
+        compilations: [SwiftCachedCompilation],
+        instance: SwiftCacheReplayInstance
+    ) {
+        self.operations = operations
+        self.compilations = compilations
+        self.instance = instance
+    }
+}
+
+private struct UnsafeParallelSwiftCASReplayState {
+    var nextIndex = 0
+    var results: [Result<SwiftCacheReplayStreams, any Error>?]
+}
+#endif
 
 package struct SwiftCASCacheOperations: SwiftCacheOperations {
     package let databases: SwiftCASDatabases
@@ -89,6 +137,59 @@ package struct SwiftCASCacheOperations: SwiftCacheOperations {
         let result = try databases.replayCompilation(instance: instance, compilation: compilation)
         return try SwiftCacheReplayStreams(standardOutput: result.getStdOut(), standardError: result.getStdErr())
     }
+
+    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
+    /// Mirrors stock Swift replay's shared-instance width-10 behavior, but uses
+    /// synchronous workers so the accelerator preparation state machine stays
+    /// synchronous. Every scheduled compilation produces an ordered Result
+    /// before the caller is allowed to surface an error.
+    package func replayCompilations(
+        _ compilations: [SwiftCachedCompilation],
+        using instance: SwiftCacheReplayInstance,
+        maximumParallelism: Int
+    ) -> [Result<SwiftCacheReplayStreams, any Error>] {
+        guard maximumParallelism > 1, compilations.count > 1 else {
+            return compilations.map { compilation in
+                Result { try replayCompilation(compilation, using: instance) }
+            }
+        }
+
+        let context = UnsafeParallelSwiftCASReplayContext(
+            operations: self,
+            compilations: compilations,
+            instance: instance
+        )
+        let state = SWBMutex(UnsafeParallelSwiftCASReplayState(
+            results: Array(repeating: nil, count: compilations.count)
+        ))
+        let workerCount = min(maximumParallelism, compilations.count)
+        SWBQueue.concurrentPerform(iterations: workerCount) { _ in
+            while true {
+                let index = state.withLock { state -> Int? in
+                    guard state.nextIndex < context.compilations.count else { return nil }
+                    defer { state.nextIndex += 1 }
+                    return state.nextIndex
+                }
+                guard let index else { return }
+                let result = Result {
+                    try context.operations.replayCompilation(
+                        context.compilations[index],
+                        using: context.instance
+                    )
+                }
+                state.withLock { $0.results[index] = result }
+            }
+        }
+        return state.withLock { state in
+            state.results.map { result in
+                guard let result else {
+                    preconditionFailure("parallel Swift cache replay did not drain every scheduled result")
+                }
+                return result
+            }
+        }
+    }
+    #endif
 }
 
 package enum SwiftCacheProbeMissReason: Sendable, Equatable {
@@ -1741,6 +1842,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         try pauseBeforeMaterialization?()
         if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
         if isCancelled() { throw CancellationError() }
+
         var streams: [SwiftCacheReplayStreams]? = captureStreams ? [] : nil
         streams?.reserveCapacity(compilations.count)
         for compilation in compilations {
@@ -1753,6 +1855,65 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         }
         return streams
     }
+
+    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
+    package static func replayCacheWithUnsafeParallelism<Operations: SwiftCacheOperations>(
+        operations: Operations,
+        compilations: [Operations.Compilation],
+        commandLine: [String],
+        captureStreams: Bool,
+        maximumParallelism: Int,
+        pauseBeforeMaterialization: (() throws -> Void)? = nil,
+        isCancelled: () -> Bool = { false },
+        isQuarantined: () -> Bool = { false }
+    ) throws -> [SwiftCacheReplayStreams]? {
+        guard maximumParallelism > 1, compilations.count > 1 else {
+            return try replayCache(
+                operations: operations,
+                compilations: compilations,
+                commandLine: commandLine,
+                captureStreams: captureStreams,
+                pauseBeforeMaterialization: pauseBeforeMaterialization,
+                isCancelled: isCancelled,
+                isQuarantined: isQuarantined
+            )
+        }
+
+        if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
+        if isCancelled() { throw CancellationError() }
+        let instance = try operations.createReplayInstance(commandLine: Array(commandLine.dropFirst()))
+        if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
+        if isCancelled() { throw CancellationError() }
+        try pauseBeforeMaterialization?()
+        if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
+        if isCancelled() { throw CancellationError() }
+
+        let orderedResults = operations.replayCompilations(
+            compilations,
+            using: instance,
+            maximumParallelism: maximumParallelism
+        )
+        if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
+        if isCancelled() { throw CancellationError() }
+        var streams: [SwiftCacheReplayStreams]? = captureStreams ? [] : nil
+        streams?.reserveCapacity(compilations.count)
+        var firstError: (any Error)?
+        for result in orderedResults {
+            switch result {
+            case .success(let replayStreams):
+                streams?.append(replayStreams)
+            case .failure(let error):
+                if firstError == nil {
+                    firstError = error
+                }
+            }
+        }
+        if let firstError {
+            throw firstError
+        }
+        return streams
+    }
+    #endif
 
     /// Checks only output presence and regular-file shape. The unsafe trust
     /// experiment intentionally avoids content reads and hashing.
@@ -2129,6 +2290,20 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             #else
             let captureReplayStreams = false
             #endif
+            #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
+            let replayMaximumParallelism: Int = if mode == .trust {
+                switch unsafeSemanticOutputProfile(
+                    jobKind: semanticOutputJobKind,
+                    cacheKeyCount: cacheKeys.count,
+                    plannedKindGroups: expectedOutputKindGroups
+                ) {
+                case .compile?: 10
+                case .emitModule?, nil: 1
+                }
+            } else {
+                1
+            }
+            #endif
             #if canImport(Darwin)
             var replayIdentitiesCaptured = false
             #endif
@@ -2136,6 +2311,20 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 if claimAtCheckpoint(.replayError) {
                     throw SwiftAcceleratorCacheInjectedError.injected
                 }
+                #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
+                capturedReplayStreams = try replayCacheWithUnsafeParallelism(
+                    operations: operations,
+                    compilations: compilations,
+                    commandLine: commandLine,
+                    captureStreams: captureReplayStreams,
+                    maximumParallelism: replayMaximumParallelism,
+                    pauseBeforeMaterialization: {
+                        try activeCancellationPause?(.replayStage)
+                    },
+                    isCancelled: isCancelled,
+                    isQuarantined: isQuarantined
+                )
+                #else
                 capturedReplayStreams = try replayCache(
                     operations: operations,
                     compilations: compilations,
@@ -2147,6 +2336,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                     isCancelled: isCancelled,
                     isQuarantined: isQuarantined
                 )
+                #endif
                 #if canImport(Darwin)
                 if let outputAccessSession {
                     try outputAccessSession.captureReplayOutputs()

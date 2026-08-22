@@ -10,6 +10,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+import Foundation
+import Synchronization
 import Testing
 
 import SWBCore
@@ -324,6 +326,7 @@ fileprivate struct SwiftCacheOperationsTests {
 
         #expect(operations.replayCommandLine == ["-frontend", "-c"])
         #expect(operations.replayedCompilations == [3, 1, 2])
+        #expect(operations.maximumActiveReplayCount == 1)
         #expect(streams?.map(\.standardOutput) == ["stdout-3", "stdout-1", "stdout-2"])
         #expect(streams?.map(\.standardError) == ["stderr-3", "stderr-1", "stderr-2"])
     }
@@ -1209,6 +1212,9 @@ fileprivate struct SwiftCacheOperationsTests {
         #expect(outputs.allSatisfy(fs.exists))
         #expect(accepted.replayStreams?.count == 10)
         #expect(operations.replayedCompilations == Array(0..<10))
+        #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
+        #expect(operations.requestedReplayParallelisms == [10])
+        #endif
 
         for output in outputs where fs.exists(output) {
             try fs.remove(output)
@@ -1288,6 +1294,10 @@ fileprivate struct SwiftCacheOperationsTests {
         #expect(accepted.replayStreams == [
             .init(standardOutput: "cached-stdout", standardError: "cached-stderr")
         ])
+        #expect(operations.maximumActiveReplayCount == 1)
+        #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
+        #expect(operations.requestedReplayParallelisms.isEmpty)
+        #endif
 
         for output in outputs where fs.exists(output) {
             try fs.remove(output)
@@ -1428,6 +1438,178 @@ fileprivate struct SwiftCacheOperationsTests {
         #expect(!localFS.exists(first))
         #expect(!localFS.exists(second))
     }
+
+    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
+    @Test
+    func unsafeParallelReplayDrainsStaggeredWorkAndPreservesCompilerKeyStreamOrder() throws {
+        let compilations = Array(0..<11)
+        let operations = ParallelTestSwiftCacheOperations(
+            queries: [:],
+            outputs: [:],
+            replayStreamsByCompilation: Dictionary(uniqueKeysWithValues: compilations.map {
+                ($0, .init(standardOutput: "stdout-\($0)", standardError: "stderr-\($0)"))
+            }),
+            replayDelays: Dictionary(uniqueKeysWithValues: compilations.map {
+                ($0, Double(11 - $0) * 0.002)
+            })
+        )
+
+        let streams = try SwiftDriverJobTaskAction.replayCacheWithUnsafeParallelism(
+            operations: operations,
+            compilations: compilations,
+            commandLine: ["swift-frontend", "-c"],
+            captureStreams: true,
+            maximumParallelism: 10
+        )
+
+        #expect(streams?.map(\.standardOutput) == compilations.map { "stdout-\($0)" })
+        #expect(streams?.map(\.standardError) == compilations.map { "stderr-\($0)" })
+        #expect(operations.replayedCompilations.sorted() == compilations)
+        #expect(operations.completedCompilations.count == compilations.count)
+        #expect(operations.completedCompilations != compilations)
+        #expect(operations.activeReplayCount == 0)
+        #expect(operations.maximumActiveReplayCount > 1)
+        #expect(operations.maximumActiveReplayCount <= 10)
+        #expect(operations.requestedReplayParallelisms == [10])
+    }
+
+    @Test
+    func unsafeParallelReplayFailureDrainsEveryLaneAndScrubsPartialOutputs() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let compilations = Array(0..<11)
+        let cacheKeys = compilations.map { "key-\($0)" }
+        let plannedKinds = ["object", "d", "const-values", "swift-dependencies", "diagnostics"]
+        let cachedOutputs: [SwiftCacheCachedOutput] = [
+            .init(kindName: "object", isMaterialized: true),
+            .init(kindName: "dependencies", isMaterialized: true),
+            .init(kindName: "swift-dependencies", isMaterialized: true),
+            .init(kindName: "const-values", isMaterialized: true),
+        ]
+        let outputGroups = compilations.map { compilation in
+            plannedKinds.map { kind in temporaryDirectory.path.join("\(compilation)-\(kind)") }
+        }
+        let operations = ParallelTestSwiftCacheOperations(
+            queries: Dictionary(uniqueKeysWithValues: cacheKeys.enumerated().map {
+                ($0.element, .hit($0.offset))
+            }),
+            outputs: Dictionary(uniqueKeysWithValues: compilations.map { ($0, cachedOutputs) }),
+            replayStreamsByCompilation: Dictionary(uniqueKeysWithValues: compilations.map {
+                ($0, .init(standardOutput: "stdout-\($0)", standardError: "stderr-\($0)"))
+            }),
+            replayDelays: Dictionary(uniqueKeysWithValues: compilations.map { ($0, 0.005) }),
+            failReplayForCompilation: 10,
+            materializedOutputPaths: Dictionary(uniqueKeysWithValues: outputGroups.enumerated().map {
+                ($0.offset, $0.element)
+            })
+        )
+
+        let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .trust,
+            semanticOutputJobKind: .compile,
+            operations: operations,
+            cacheKeys: cacheKeys,
+            expectedOutputKindGroups: Array(repeating: plannedKinds, count: compilations.count),
+            plannedOutputs: outputGroups.flatMap { $0 },
+            commandLine: ["swift-frontend", "-c"],
+            fs: localFS
+        )
+
+        #expect(preparation.outcome == .replayError)
+        #expect(preparation.outcome.shouldExecuteFrontend)
+        #expect(preparation.replayStreams == nil)
+        #expect(operations.replayedCompilations.sorted() == compilations)
+        #expect(operations.completedCompilations.count == compilations.count)
+        #expect(operations.activeReplayCount == 0)
+        #expect(operations.maximumActiveReplayCount > 1)
+        #expect(operations.maximumActiveReplayCount <= 10)
+        #expect(operations.requestedReplayParallelisms == [10])
+        #expect(outputGroups.flatMap { $0 }.allSatisfy { !localFS.exists($0) })
+    }
+
+    @Test
+    func unsafeParallelReplayDrainsBeforeInFlightCancellationOrQuarantineFallback() throws {
+        for quarantineAfterFirstCompletion in [false, true] {
+            let temporaryDirectory = try NamedTemporaryDirectory()
+            let compilations = Array(0..<11)
+            let cacheKeys = compilations.map { "key-\($0)" }
+            let plannedKinds = ["object", "d", "const-values", "swift-dependencies", "diagnostics"]
+            let cachedOutputs: [SwiftCacheCachedOutput] = [
+                .init(kindName: "object", isMaterialized: true),
+                .init(kindName: "dependencies", isMaterialized: true),
+                .init(kindName: "swift-dependencies", isMaterialized: true),
+                .init(kindName: "const-values", isMaterialized: true),
+            ]
+            let outputGroups = compilations.map { compilation in
+                plannedKinds.map { kind in temporaryDirectory.path.join("\(compilation)-\(kind)") }
+            }
+            let operations = ParallelTestSwiftCacheOperations(
+                queries: Dictionary(uniqueKeysWithValues: cacheKeys.enumerated().map {
+                    ($0.element, .hit($0.offset))
+                }),
+                outputs: Dictionary(uniqueKeysWithValues: compilations.map { ($0, cachedOutputs) }),
+                replayStreamsByCompilation: Dictionary(uniqueKeysWithValues: compilations.map {
+                    ($0, .init(standardOutput: "stdout-\($0)", standardError: "stderr-\($0)"))
+                }),
+                replayDelays: Dictionary(uniqueKeysWithValues: compilations.map { ($0, 0.005) }),
+                materializedOutputPaths: Dictionary(uniqueKeysWithValues: outputGroups.enumerated().map {
+                    ($0.offset, $0.element)
+                })
+            )
+
+            let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+                mode: .trust,
+                semanticOutputJobKind: .compile,
+                operations: operations,
+                cacheKeys: cacheKeys,
+                expectedOutputKindGroups: Array(repeating: plannedKinds, count: compilations.count),
+                plannedOutputs: outputGroups.flatMap { $0 },
+                commandLine: ["swift-frontend", "-c"],
+                fs: localFS,
+                isCancelled: {
+                    !quarantineAfterFirstCompletion && !operations.completedCompilations.isEmpty
+                },
+                isQuarantined: {
+                    quarantineAfterFirstCompletion && !operations.completedCompilations.isEmpty
+                }
+            )
+
+            #expect(preparation.outcome == (quarantineAfterFirstCompletion ? .quarantined : .cancelled))
+            #expect(preparation.outcome.shouldExecuteFrontend == quarantineAfterFirstCompletion)
+            #expect(preparation.replayStreams == nil)
+            #expect(operations.replayedCompilations.sorted() == compilations)
+            #expect(operations.completedCompilations.count == compilations.count)
+            #expect(operations.activeReplayCount == 0)
+            #expect(operations.maximumActiveReplayCount <= 10)
+            #expect(operations.requestedReplayParallelisms == [10])
+            #expect(outputGroups.flatMap { $0 }.allSatisfy { !localFS.exists($0) })
+        }
+    }
+
+    @Test
+    func unsafeParallelReplayKeepsSingleCompilationOnSerialPath() throws {
+        let operations = ParallelTestSwiftCacheOperations(
+            queries: [:],
+            outputs: [:],
+            replayStreamsByCompilation: [
+                1: .init(standardOutput: "stdout", standardError: "stderr")
+            ],
+            replayDelays: [1: 0.001]
+        )
+
+        let streams = try SwiftDriverJobTaskAction.replayCacheWithUnsafeParallelism(
+            operations: operations,
+            compilations: [1],
+            commandLine: ["swift-frontend", "-emit-module"],
+            captureStreams: true,
+            maximumParallelism: 10
+        )
+
+        #expect(streams == [.init(standardOutput: "stdout", standardError: "stderr")])
+        #expect(operations.replayedCompilations == [1])
+        #expect(operations.maximumActiveReplayCount == 1)
+        #expect(operations.requestedReplayParallelisms.isEmpty)
+    }
+    #endif
     #endif
 
     @Test
@@ -2517,9 +2699,28 @@ private final class TestSwiftCacheOperations: SwiftCacheOperations {
     var failReplayForCompilation: Int?
     var querySideEffect: ((String) throws -> Void)?
     var replaySideEffect: ((Int) throws -> Void)?
-    private(set) var queriedKeys: [String] = []
-    private(set) var replayCommandLine: [String]?
-    private(set) var replayedCompilations: [Int] = []
+
+    private struct CallState {
+        var queriedKeys: [String] = []
+        var replayCommandLine: [String]?
+        var replayedCompilations: [Int] = []
+        #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
+        var requestedReplayParallelisms: [Int] = []
+        #endif
+        var activeReplayCount = 0
+        var maximumActiveReplayCount = 0
+    }
+
+    private let callState = SWBMutex(CallState())
+
+    var queriedKeys: [String] { callState.withLock { $0.queriedKeys } }
+    var replayCommandLine: [String]? { callState.withLock { $0.replayCommandLine } }
+    var replayedCompilations: [Int] { callState.withLock { $0.replayedCompilations } }
+    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
+    var requestedReplayParallelisms: [Int] { callState.withLock { $0.requestedReplayParallelisms } }
+    #endif
+    var activeReplayCount: Int { callState.withLock { $0.activeReplayCount } }
+    var maximumActiveReplayCount: Int { callState.withLock { $0.maximumActiveReplayCount } }
 
     init(
         queries: [String: Query],
@@ -2534,13 +2735,13 @@ private final class TestSwiftCacheOperations: SwiftCacheOperations {
     }
 
     func resetCalls() {
-        queriedKeys = []
-        replayCommandLine = nil
-        replayedCompilations = []
+        callState.withLock {
+            $0 = CallState()
+        }
     }
 
     func queryLocalCacheKey(_ key: String) throws -> Int? {
-        queriedKeys.append(key)
+        callState.withLock { $0.queriedKeys.append(key) }
         try querySideEffect?(key)
         switch queries[key] ?? .miss {
         case .hit(let compilation):
@@ -2557,7 +2758,7 @@ private final class TestSwiftCacheOperations: SwiftCacheOperations {
     }
 
     func createReplayInstance(commandLine: [String]) throws -> Int {
-        replayCommandLine = commandLine
+        callState.withLock { $0.replayCommandLine = commandLine }
         if failCreateReplay {
             throw TestCacheError.injected
         }
@@ -2565,11 +2766,167 @@ private final class TestSwiftCacheOperations: SwiftCacheOperations {
     }
 
     func replayCompilation(_ compilation: Int, using instance: Int) throws -> SwiftCacheReplayStreams {
-        replayedCompilations.append(compilation)
+        callState.withLock {
+            $0.replayedCompilations.append(compilation)
+            $0.activeReplayCount += 1
+            $0.maximumActiveReplayCount = max($0.maximumActiveReplayCount, $0.activeReplayCount)
+        }
+        defer { callState.withLock { $0.activeReplayCount -= 1 } }
         try replaySideEffect?(compilation)
         if compilation == failReplayForCompilation {
             throw TestCacheError.injected
         }
         return replayStreamsByCompilation[compilation] ?? replayStreams
     }
+
+    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
+    func replayCompilations(
+        _ compilations: [Int],
+        using instance: Int,
+        maximumParallelism: Int
+    ) -> [Result<SwiftCacheReplayStreams, any Error>] {
+        callState.withLock { $0.requestedReplayParallelisms.append(maximumParallelism) }
+        return compilations.map { compilation in
+            Result { try replayCompilation(compilation, using: instance) }
+        }
+    }
+    #endif
 }
+
+#if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
+/// Purpose-built callback-free fake for the dual-gated parallel experiment.
+/// Its immutable fixtures are safe to read concurrently and every mutable call
+/// observation is protected by `callState`.
+private final class ParallelTestSwiftCacheOperations: SwiftCacheOperations, @unchecked Sendable {
+    enum Query {
+        case hit(Int)
+        case miss
+    }
+
+    private let queries: [String: Query]
+    private let outputs: [Int: [SwiftCacheCachedOutput]]
+    private let replayStreamsByCompilation: [Int: SwiftCacheReplayStreams]
+    private let replayDelays: [Int: TimeInterval]
+    private let failReplayForCompilation: Int?
+    private let materializedOutputPaths: [Int: [Path]]
+
+    private struct CallState {
+        var replayedCompilations: [Int] = []
+        var completedCompilations: [Int] = []
+        var requestedReplayParallelisms: [Int] = []
+        var activeReplayCount = 0
+        var maximumActiveReplayCount = 0
+    }
+
+    private struct BatchState {
+        var nextIndex = 0
+        var results: [Result<SwiftCacheReplayStreams, any Error>?]
+    }
+
+    private let callState = SWBMutex(CallState())
+
+    var replayedCompilations: [Int] { callState.withLock { $0.replayedCompilations } }
+    var completedCompilations: [Int] { callState.withLock { $0.completedCompilations } }
+    var requestedReplayParallelisms: [Int] { callState.withLock { $0.requestedReplayParallelisms } }
+    var activeReplayCount: Int { callState.withLock { $0.activeReplayCount } }
+    var maximumActiveReplayCount: Int { callState.withLock { $0.maximumActiveReplayCount } }
+
+    init(
+        queries: [String: Query],
+        outputs: [Int: [SwiftCacheCachedOutput]],
+        replayStreamsByCompilation: [Int: SwiftCacheReplayStreams],
+        replayDelays: [Int: TimeInterval],
+        failReplayForCompilation: Int? = nil,
+        materializedOutputPaths: [Int: [Path]] = [:]
+    ) {
+        self.queries = queries
+        self.outputs = outputs
+        self.replayStreamsByCompilation = replayStreamsByCompilation
+        self.replayDelays = replayDelays
+        self.failReplayForCompilation = failReplayForCompilation
+        self.materializedOutputPaths = materializedOutputPaths
+    }
+
+    func queryLocalCacheKey(_ key: String) throws -> Int? {
+        switch queries[key] ?? .miss {
+        case .hit(let compilation):
+            return compilation
+        case .miss:
+            return nil
+        }
+    }
+
+    func cachedOutputs(for compilation: Int) throws -> [SwiftCacheCachedOutput] {
+        outputs[compilation] ?? []
+    }
+
+    func createReplayInstance(commandLine: [String]) throws -> Int {
+        1
+    }
+
+    func replayCompilation(_ compilation: Int, using instance: Int) throws -> SwiftCacheReplayStreams {
+        callState.withLock {
+            $0.replayedCompilations.append(compilation)
+            $0.activeReplayCount += 1
+            $0.maximumActiveReplayCount = max($0.maximumActiveReplayCount, $0.activeReplayCount)
+        }
+        defer {
+            callState.withLock {
+                $0.activeReplayCount -= 1
+                $0.completedCompilations.append(compilation)
+            }
+        }
+
+        if let delay = replayDelays[compilation] {
+            Thread.sleep(forTimeInterval: delay)
+        }
+        for path in materializedOutputPaths[compilation] ?? [] {
+            try localFS.write(path, contents: ByteString(encodingAsUTF8: path.basename))
+        }
+        if compilation == failReplayForCompilation {
+            throw TestCacheError.injected
+        }
+        return replayStreamsByCompilation[compilation] ?? .init(standardOutput: "", standardError: "")
+    }
+
+    func replayCompilations(
+        _ compilations: [Int],
+        using instance: Int,
+        maximumParallelism: Int
+    ) -> [Result<SwiftCacheReplayStreams, any Error>] {
+        callState.withLock { $0.requestedReplayParallelisms.append(maximumParallelism) }
+        guard maximumParallelism > 1, compilations.count > 1 else {
+            return compilations.map { compilation in
+                Result { try replayCompilation(compilation, using: instance) }
+            }
+        }
+
+        let batchState = SWBMutex(BatchState(
+            results: Array(repeating: nil, count: compilations.count)
+        ))
+        SWBQueue.concurrentPerform(iterations: min(maximumParallelism, compilations.count)) { _ in
+            while true {
+                let index = batchState.withLock { state -> Int? in
+                    guard state.nextIndex < compilations.count else { return nil }
+                    defer { state.nextIndex += 1 }
+                    return state.nextIndex
+                }
+                guard let index else { return }
+                let result = Result {
+                    try self.replayCompilation(compilations[index], using: instance)
+                }
+                batchState.withLock { $0.results[index] = result }
+            }
+        }
+
+        return batchState.withLock { state in
+            state.results.map { result in
+                guard let result else {
+                    preconditionFailure("parallel test replay did not drain every scheduled result")
+                }
+                return result
+            }
+        }
+    }
+}
+#endif
