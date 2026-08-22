@@ -191,6 +191,23 @@ fileprivate struct SwiftCacheOperationsTests {
             commandLine: ["swift-frontend", "-c", "-emit-objc-header-path"],
             plannedOutputs: [object, sharedHeader]
         ))
+
+        let operations = TestSwiftCacheOperations(
+            queries: ["key": .hit(1)],
+            outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+        )
+        let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .verify,
+            operations: operations,
+            cacheKeys: ["key"],
+            plannedOutputs: [object, sharedHeader],
+            commandLine: ["swift-frontend", "-c", "-emit-objc-header-path", sharedHeader.str],
+            fs: localFS
+        )
+        #expect(preparation.outcome == .unsupportedOutput)
+        #expect(preparation.outcome.shouldExecuteFrontend)
+        #expect(operations.queriedKeys.isEmpty)
+        #expect(operations.replayedCompilations.isEmpty)
     }
 
     @Test
@@ -317,11 +334,189 @@ fileprivate struct SwiftCacheOperationsTests {
     }
 
     @Test
+    func directTrustWithoutAuthorizationDoesNotTouchCacheOrOutputs() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let fs = localFS
+        let output = temporaryDirectory.path.join("main.o")
+        try fs.write(output, contents: ByteString(encodingAsUTF8: "fresh-frontend-owned"))
+        let operations = TestSwiftCacheOperations(
+            queries: ["key": .hit(1)],
+            outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+        )
+        operations.replaySideEffect = { _ in
+            try fs.write(output, contents: ByteString(encodingAsUTF8: "cached-object"))
+        }
+
+        let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .trust,
+            operations: operations,
+            cacheKeys: ["key"],
+            plannedOutputs: [output],
+            commandLine: ["swift-frontend", "-c"],
+            fs: fs
+        )
+
+        #expect(preparation.outcome == .unauthorizedTrust)
+        #expect(preparation.outcome.shouldExecuteFrontend)
+        #expect(preparation.lookupDurationNS == 0)
+        #expect(preparation.replayDurationNS == nil)
+        #expect(preparation.scrubDurationNS == nil)
+        #expect(operations.queriedKeys.isEmpty)
+        #expect(operations.replayedCompilations.isEmpty)
+        #expect(try fs.read(output).asString == "fresh-frontend-owned")
+        #expect(!SwiftDriverJobTaskAction.cachePreparationIsFatal(.unauthorizedTrust, strictCASErrors: true))
+    }
+
+    @Test
+    func quarantinedVerifyDoesNotTouchCacheOrOutputs() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let fs = localFS
+        let output = temporaryDirectory.path.join("main.o")
+        try fs.write(output, contents: ByteString(encodingAsUTF8: "fresh-frontend-owned"))
+        let operations = TestSwiftCacheOperations(
+            queries: ["key": .hit(1)],
+            outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+        )
+
+        let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .verify,
+            operations: operations,
+            cacheKeys: ["key"],
+            plannedOutputs: [output],
+            commandLine: ["swift-frontend", "-c"],
+            fs: fs,
+            isQuarantined: { true }
+        )
+
+        #expect(preparation.outcome == .quarantined)
+        #expect(preparation.outcome.shouldExecuteFrontend)
+        #expect(preparation.lookupDurationNS == 0)
+        #expect(preparation.replayDurationNS == nil)
+        #expect(preparation.scrubDurationNS == nil)
+        #expect(operations.queriedKeys.isEmpty)
+        #expect(operations.replayedCompilations.isEmpty)
+        #expect(try fs.read(output).asString == "fresh-frontend-owned")
+        #expect(!SwiftDriverJobTaskAction.cachePreparationIsFatal(.quarantined, strictCASErrors: true))
+    }
+
+    @Test
+    func quarantineRaisedDuringReplayStopsLaterCompilationsAndScrubsAllOutputs() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let fs = localFS
+        let first = temporaryDirectory.path.join("first.o")
+        let second = temporaryDirectory.path.join("second.swiftmodule")
+        let operations = TestSwiftCacheOperations(
+            queries: ["one": .hit(1), "two": .hit(2)],
+            outputs: [
+                1: [.init(kindName: "object", isMaterialized: true)],
+                2: [.init(kindName: "module", isMaterialized: true)],
+            ]
+        )
+        var quarantined = false
+        operations.replaySideEffect = { compilation in
+            guard compilation == 1 else { return }
+            try fs.write(first, contents: ByteString(encodingAsUTF8: "cached-object"))
+            try fs.write(second, contents: ByteString(encodingAsUTF8: "partial-module"))
+            quarantined = true
+        }
+
+        let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .verify,
+            operations: operations,
+            cacheKeys: ["one", "two"],
+            plannedOutputs: [first, second],
+            commandLine: ["swift-frontend", "-c"],
+            fs: fs,
+            isQuarantined: { quarantined }
+        )
+
+        #expect(preparation.outcome == .quarantined)
+        #expect(preparation.outcome.shouldExecuteFrontend)
+        #expect(preparation.scrubSucceeded == true)
+        #expect(operations.queriedKeys == ["one", "two"])
+        #expect(operations.replayedCompilations == [1])
+        #expect(!fs.exists(first))
+        #expect(!fs.exists(second))
+    }
+
+    @Test
+    func privateTrustControlIsAlwaysStrippedFromFrontendEnvironment() {
+        var environment = [
+            SwiftAcceleratorCacheTrustAuthorization.environmentVariable: "v1",
+            "UNRELATED": "preserved",
+        ]
+
+        SwiftAcceleratorCacheTrustAuthorization.removeControlVariable(from: &environment)
+
+        #expect(environment[SwiftAcceleratorCacheTrustAuthorization.environmentVariable] == nil)
+        #expect(environment["UNRELATED"] == "preserved")
+    }
+
+    #if SWIFT_BUILD_ACCELERATOR_TRUST_CANARY
+    @Test
+    func trustCanaryAuthorizationRequiresExactV1AndOnlyEnablesShadowPreparation() throws {
+        #expect(SwiftAcceleratorCacheTrustAuthorization.parse(environment: [:]) == nil)
+        for value in ["", "V1", " v1", "v1 ", "v1\n", "v1:", "v2"] {
+            #expect(SwiftAcceleratorCacheTrustAuthorization.parse(environment: [
+                SwiftAcceleratorCacheTrustAuthorization.environmentVariable: value
+            ]) == nil)
+        }
+        let authorization = try #require(SwiftAcceleratorCacheTrustAuthorization.parse(environment: [
+            SwiftAcceleratorCacheTrustAuthorization.environmentVariable: "v1"
+        ]))
+
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let fs = localFS
+        let output = temporaryDirectory.path.join("main.o")
+        let operations = TestSwiftCacheOperations(
+            queries: ["key": .hit(1)],
+            outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+        )
+        operations.replaySideEffect = { _ in
+            try fs.write(output, contents: ByteString(encodingAsUTF8: "cached-object"))
+        }
+
+        let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .trust,
+            trustAuthorization: authorization,
+            operations: operations,
+            cacheKeys: ["key"],
+            plannedOutputs: [output],
+            commandLine: ["swift-frontend", "-c"],
+            fs: fs
+        )
+
+        #expect(preparation.outcome == .verificationReady)
+        #expect(preparation.outcome.shouldExecuteFrontend)
+        #expect(operations.queriedKeys == ["key"])
+        #expect(operations.replayedCompilations == [1])
+        #expect(!fs.exists(output), "authorized canary preparation must scrub its shadow outputs")
+
+        operations.resetCalls()
+        let sharedHeader = temporaryDirectory.path.join("App-Swift.h")
+        let sharedHeaderPreparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .trust,
+            trustAuthorization: authorization,
+            operations: operations,
+            cacheKeys: ["key"],
+            plannedOutputs: [output, sharedHeader],
+            commandLine: ["swift-frontend", "-c", "-emit-objc-header-path", sharedHeader.str],
+            fs: fs
+        )
+        #expect(sharedHeaderPreparation.outcome == .unsupportedOutput)
+        #expect(sharedHeaderPreparation.outcome.shouldExecuteFrontend)
+        #expect(operations.queriedKeys.isEmpty)
+        #expect(operations.replayedCompilations.isEmpty)
+    }
+    #endif
+
+    @Test
     func cacheFailuresFallBackNonStrictAndFailFastStrict() throws {
         let temporaryDirectory = try NamedTemporaryDirectory()
         let fs = localFS
         let first = temporaryDirectory.path.join("first.o")
         let second = temporaryDirectory.path.join("second.swiftmodule")
+        var quarantineCount = 0
 
         let queryFailure = TestSwiftCacheOperations(queries: ["key": .failure], outputs: [:])
         let queryPreparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
@@ -330,9 +525,11 @@ fileprivate struct SwiftCacheOperationsTests {
             cacheKeys: ["key"],
             plannedOutputs: [first],
             commandLine: ["swift-frontend", "-c"],
-            fs: fs
+            fs: fs,
+            quarantineCache: { quarantineCount += 1 }
         )
         assertFallback(queryPreparation, expected: .queryError)
+        #expect(quarantineCount == 0, "query failures must not quarantine replay")
 
         let createFailure = TestSwiftCacheOperations(
             queries: ["key": .hit(1)],
@@ -345,10 +542,12 @@ fileprivate struct SwiftCacheOperationsTests {
             cacheKeys: ["key"],
             plannedOutputs: [first],
             commandLine: ["swift-frontend", "-c"],
-            fs: fs
+            fs: fs,
+            quarantineCache: { quarantineCount += 1 }
         )
         assertFallback(createPreparation, expected: .replayError)
         #expect(createPreparation.scrubSucceeded == true)
+        #expect(quarantineCount == 1)
 
         let replayFailure = TestSwiftCacheOperations(
             queries: ["one": .hit(1), "two": .hit(2)],
@@ -362,16 +561,23 @@ fileprivate struct SwiftCacheOperationsTests {
             let path = compilation == 1 ? first : second
             try fs.write(path, contents: ByteString(encodingAsUTF8: "partial-\(compilation)"))
         }
+        var replayQuarantineObservedBeforeScrub = false
         let replayPreparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
             mode: .verify,
             operations: replayFailure,
             cacheKeys: ["one", "two"],
             plannedOutputs: [first, second],
             commandLine: ["swift-frontend", "-c"],
-            fs: fs
+            fs: fs,
+            quarantineCache: {
+                quarantineCount += 1
+                replayQuarantineObservedBeforeScrub = fs.exists(first) && fs.exists(second)
+            }
         )
         assertFallback(replayPreparation, expected: .replayError)
         #expect(replayPreparation.scrubSucceeded == true)
+        #expect(quarantineCount == 2)
+        #expect(replayQuarantineObservedBeforeScrub)
         #expect(!fs.exists(first))
         #expect(!fs.exists(second))
 
@@ -382,16 +588,23 @@ fileprivate struct SwiftCacheOperationsTests {
         missingOutput.replaySideEffect = { _ in
             try fs.write(first, contents: ByteString(encodingAsUTF8: "only-one-output"))
         }
+        var manifestQuarantineObservedBeforeScrub = false
         let manifestPreparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
             mode: .verify,
             operations: missingOutput,
             cacheKeys: ["key"],
             plannedOutputs: [first, second],
             commandLine: ["swift-frontend", "-c"],
-            fs: fs
+            fs: fs,
+            quarantineCache: {
+                quarantineCount += 1
+                manifestQuarantineObservedBeforeScrub = fs.exists(first)
+            }
         )
         assertFallback(manifestPreparation, expected: .manifestError)
         #expect(manifestPreparation.scrubSucceeded == true)
+        #expect(quarantineCount == 3)
+        #expect(manifestQuarantineObservedBeforeScrub)
         #expect(!fs.exists(first))
 
         #expect(!SwiftDriverJobTaskAction.cachePreparationIsFatal(.miss, strictCASErrors: true))

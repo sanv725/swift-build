@@ -30,6 +30,11 @@ fileprivate struct SwiftBuildAcceleratorCachePolicyTests {
         #expect(SwiftBuildAcceleratorCacheMode.observe.isAcceleratorEnabled)
         #expect(SwiftBuildAcceleratorCacheMode.verify.isAcceleratorEnabled)
         #expect(!SwiftBuildAcceleratorCacheMode.trust.isAcceleratorEnabled)
+
+        #expect(!SwiftBuildAcceleratorCacheMode.stock.usesAcceleratorMaterialization)
+        #expect(!SwiftBuildAcceleratorCacheMode.observe.usesAcceleratorMaterialization)
+        #expect(SwiftBuildAcceleratorCacheMode.verify.usesAcceleratorMaterialization)
+        #expect(SwiftBuildAcceleratorCacheMode.trust.usesAcceleratorMaterialization)
     }
 
     @Test

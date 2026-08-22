@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 import Foundation
+import Synchronization
 package import SWBCore
 package import SWBCAS
 package import SWBUtil
@@ -23,6 +24,11 @@ public final class DynamicTaskOperationContext {
     package private(set) var compilationCachingDataPruner: CompilationCachingDataPruner
     package let definingTargetsByModuleName: [String: OrderedSet<ConfiguredTarget>]
     package let cas: ToolchainCAS?
+    private let acceleratorCacheQuarantined = SWBMutex(false)
+
+    package var isAcceleratorCacheQuarantined: Bool {
+        acceleratorCacheQuarantined.withLock { $0 }
+    }
 
     package init(core: Core, definingTargetsByModuleName: [String: OrderedSet<ConfiguredTarget>], cas: ToolchainCAS?) {
         self.core = core
@@ -32,6 +38,19 @@ public final class DynamicTaskOperationContext {
         self.compilationCachingDataPruner = CompilationCachingDataPruner()
         self.definingTargetsByModuleName = definingTargetsByModuleName
         self.cas = cas
+    }
+
+    /// Quarantines accelerator-cache replay for the remainder of this build.
+    ///
+    /// Returns `true` only for the caller that transitions the latch from
+    /// unquarantined to quarantined.
+    @discardableResult
+    package func quarantineAcceleratorCache() -> Bool {
+        acceleratorCacheQuarantined.withLock { quarantined in
+            guard !quarantined else { return false }
+            quarantined = true
+            return true
+        }
     }
 
     @discardableResult package func waitForCompletion() async -> DynamicTaskOperationContextCompletionToken {
@@ -48,6 +67,7 @@ public final class DynamicTaskOperationContext {
             self.swiftModuleDependencyGraph = SwiftModuleDependencyGraph()
             self.compilationCachingUploader = CompilationCachingUploader()
             self.compilationCachingDataPruner = CompilationCachingDataPruner()
+            self.acceleratorCacheQuarantined.withLock { $0 = false }
         }
     }
 

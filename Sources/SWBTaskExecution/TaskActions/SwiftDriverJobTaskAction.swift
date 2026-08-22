@@ -140,6 +140,9 @@ package enum SwiftCacheOutputError: Error, Sendable, Equatable {
 
 package enum SwiftAcceleratorCachePreparationOutcome: Sendable, Equatable {
     case unavailable
+    case unauthorizedTrust
+    case quarantined
+    case unsupportedOutput
     case cancelled
     case miss
     case wouldHit
@@ -151,6 +154,28 @@ package enum SwiftAcceleratorCachePreparationOutcome: Sendable, Equatable {
 
     package var shouldExecuteFrontend: Bool {
         self != .scrubFailure && self != .cancelled
+    }
+}
+
+/// A nonserialized capability required by direct internal `.trust` preparation.
+/// Normal builds expose no constructor. Dedicated canary builds may mint one
+/// only from the exact private environment contract below.
+package struct SwiftAcceleratorCacheTrustAuthorization: Sendable {
+    package static let environmentVariable = "SWIFTBUILD_INTERNAL_ACCELERATOR_CACHE_TRUST"
+
+    private init() {}
+
+    #if SWIFT_BUILD_ACCELERATOR_TRUST_CANARY
+    package static func parse(environment: [String: String]) -> Self? {
+        guard environment[environmentVariable] == "v1" else {
+            return nil
+        }
+        return Self()
+    }
+    #endif
+
+    package static func removeControlVariable(from environment: inout [String: String]) {
+        environment.removeValue(forKey: environmentVariable)
     }
 }
 
@@ -424,6 +449,8 @@ package struct SwiftAcceleratorCacheComparison: Sendable, Equatable {
 private enum AcceleratorCacheControlFlow: Error {
     case fallback
 }
+
+private struct SwiftAcceleratorCacheQuarantinedError: Error {}
 
 private extension TaskCacheObservation.ExclusionReason {
     init(_ reason: SwiftBuildAcceleratorCacheExclusionReason) {
@@ -844,6 +871,13 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             environment = task.environment.bindingsDictionary
         }
 
+        #if SWIFT_BUILD_ACCELERATOR_TRUST_CANARY
+        let acceleratorTrustAuthorization = SwiftAcceleratorCacheTrustAuthorization.parse(environment: environment)
+        #else
+        let acceleratorTrustAuthorization: SwiftAcceleratorCacheTrustAuthorization? = nil
+        #endif
+        SwiftAcceleratorCacheTrustAuthorization.removeControlVariable(from: &environment)
+
         #if SWIFT_BUILD_ACCELERATOR_FAULT_INJECTION
         let acceleratorFaultController = SwiftAcceleratorCacheFaultInjectionController.shared
         let acceleratorCancellationController = SwiftAcceleratorCacheCancellationController.shared
@@ -1055,7 +1089,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             } else if !acceleratorPolicy.shouldProbe {
                 observationEligibility = .ineligible
                 observationOutcome = .excluded
-            } else if acceleratorPolicy.mode == .verify,
+            } else if acceleratorPolicy.mode.usesAcceleratorMaterialization,
                       Self.hasSharedObjectiveCHeaderOutput(commandLine: options.commandLine, plannedOutputs: plannedOutputs) {
                 observationEligibility = .ineligible
                 observationExclusionReason = .unsupportedOutput
@@ -1168,6 +1202,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
 
                         let preparation = Self.prepareAcceleratorCache(
                             mode: acceleratorPolicy.mode,
+                            trustAuthorization: acceleratorTrustAuthorization,
                             operations: SwiftCASCacheOperations(databases: database),
                             cacheKeys: cacheKeys,
                             plannedOutputs: plannedOutputs,
@@ -1175,7 +1210,13 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                             fs: executionDelegate.fs,
                             claimInjectedFault: claimInjectedFault,
                             pauseAtCancellationCheckpoint: pauseAtCancellationCheckpoint,
-                            isCancelled: isCancellationRequested
+                            isCancelled: isCancellationRequested,
+                            isQuarantined: {
+                                dynamicExecutionDelegate.operationContext.isAcceleratorCacheQuarantined
+                            },
+                            quarantineCache: {
+                                dynamicExecutionDelegate.operationContext.quarantineAcceleratorCache()
+                            }
                         )
                         lookupDurationNS = preparation.lookupDurationNS
                         materializationDurationNS = preparation.replayDurationNS
@@ -1193,6 +1234,14 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                         case .unavailable:
                             observationOutcome = .unavailable
                             observationFallback = .noCAS
+                        case .unauthorizedTrust:
+                            observationOutcome = .unavailable
+                        case .quarantined:
+                            observationOutcome = .unavailable
+                        case .unsupportedOutput:
+                            observationEligibility = .ineligible
+                            observationExclusionReason = .unsupportedOutput
+                            observationOutcome = .excluded
                         case .cancelled:
                             observationOutcome = .cancelled
                         case .miss:
@@ -1214,6 +1263,16 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                         case .scrubFailure:
                             observationOutcome = .cacheError
                             observationFallback = .scrubFailure
+                        }
+
+                        // Preparation raises the latch at the exact failure
+                        // site. Keep this idempotent caller-side publication as
+                        // defense in depth if a future failure path is added.
+                        switch preparation.outcome {
+                        case .replayError, .manifestError, .scrubFailure:
+                            dynamicExecutionDelegate.operationContext.quarantineAcceleratorCache()
+                        case .unavailable, .unauthorizedTrust, .quarantined, .unsupportedOutput, .cancelled, .miss, .wouldHit, .verificationReady, .queryError:
+                            break
                         }
 
                         if Self.cachePreparationIsFatal(preparation.outcome, strictCASErrors: casOpts.enableStrictCASErrors) {
@@ -1273,6 +1332,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 if comparison.isMatch {
                     observationOutcome = .verifyMatch
                 } else {
+                    dynamicExecutionDelegate.operationContext.quarantineAcceleratorCache()
                     observationOutcome = .verifyMismatch
                     observationFallback = comparison.freshManifest == nil ? .manifestError : .mismatch
                     outputDelegate.warning("Swift accelerator cache verification found \(comparison.mismatchCount) output mismatch(es); fresh compiler outputs were retained")
@@ -1388,16 +1448,22 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         compilations: [Operations.Compilation],
         commandLine: [String],
         pauseBeforeMaterialization: (() throws -> Void)? = nil,
-        isCancelled: () -> Bool = { false }
+        isCancelled: () -> Bool = { false },
+        isQuarantined: () -> Bool = { false }
     ) throws {
+        if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
         if isCancelled() { throw CancellationError() }
         let instance = try operations.createReplayInstance(commandLine: Array(commandLine.dropFirst()))
+        if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
         if isCancelled() { throw CancellationError() }
         try pauseBeforeMaterialization?()
+        if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
         if isCancelled() { throw CancellationError() }
         for compilation in compilations {
+            if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
             if isCancelled() { throw CancellationError() }
             _ = try operations.replayCompilation(compilation, using: instance)
+            if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
             if isCancelled() { throw CancellationError() }
         }
     }
@@ -1487,6 +1553,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
 
     package static func prepareAcceleratorCache<Operations: SwiftCacheOperations>(
         mode: SwiftBuildAcceleratorCacheMode,
+        trustAuthorization: SwiftAcceleratorCacheTrustAuthorization? = nil,
         operations: Operations,
         cacheKeys: [String],
         plannedOutputs: [Path],
@@ -1495,10 +1562,22 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         injectedFault: SwiftAcceleratorCacheInjectedFault? = nil,
         claimInjectedFault: ((SwiftAcceleratorCacheInjectedFault) -> Bool)? = nil,
         pauseAtCancellationCheckpoint: ((SwiftAcceleratorCacheCancellationCheckpoint) throws -> Void)? = nil,
-        isCancelled: () -> Bool = { false }
+        isCancelled: () -> Bool = { false },
+        isQuarantined: () -> Bool = { false },
+        quarantineCache: () -> Void = {}
     ) -> SwiftAcceleratorCachePreparation {
+        guard mode != .trust || trustAuthorization != nil else {
+            return .init(outcome: .unauthorizedTrust, lookupDurationNS: 0)
+        }
+        if mode.usesAcceleratorMaterialization && isQuarantined() {
+            return .init(outcome: .quarantined, lookupDurationNS: 0)
+        }
         if isCancelled() {
             return .init(outcome: .cancelled, lookupDurationNS: 0)
+        }
+        if mode.usesAcceleratorMaterialization,
+           hasSharedObjectiveCHeaderOutput(commandLine: commandLine, plannedOutputs: plannedOutputs) {
+            return .init(outcome: .unsupportedOutput, lookupDurationNS: 0)
         }
         // The runtime controller already enforces this boundary. Keep the
         // nonserialized test seam equally narrow if it is called directly.
@@ -1531,6 +1610,9 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         case .hit(_, let outputCount) where mode == .observe:
             return .init(outcome: .wouldHit, lookupDurationNS: lookupDurationNS, cachedOutputCount: outputCount)
         case .hit(let compilations, let outputCount):
+            if isQuarantined() {
+                return .init(outcome: .quarantined, lookupDurationNS: lookupDurationNS, cachedOutputCount: outputCount)
+            }
             // Remove every valid preexisting output before replay. Otherwise an
             // incomplete replay could make a stale file look like a cache hit.
             let preScrubTimer = ElapsedTimer()
@@ -1545,6 +1627,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                     cachedOutputCount: outputCount
                 )
             } catch {
+                quarantineCache()
                 return .init(
                     outcome: .scrubFailure,
                     lookupDurationNS: lookupDurationNS,
@@ -1578,12 +1661,17 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                     pauseBeforeMaterialization: {
                         try activeCancellationPause?(.replayStage)
                     },
-                    isCancelled: isCancelled
+                    isCancelled: isCancelled,
+                    isQuarantined: isQuarantined
                 )
+                if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
                 try activeCancellationPause?(.postMaterialization)
             } catch is CancellationError {
                 outcome = .cancelled
+            } catch is SwiftAcceleratorCacheQuarantinedError {
+                outcome = .quarantined
             } catch {
+                quarantineCache()
                 outcome = .replayError
             }
             let replayDurationNS = replayTimer.elapsedTime().nanoseconds
@@ -1592,13 +1680,19 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             if outcome == .verificationReady && !isCancelled() {
                 let manifestTimer = ElapsedTimer()
                 do {
+                    if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
                     if claimAtCheckpoint(.manifestError) {
                         throw SwiftAcceleratorCacheInjectedError.injected
                     }
                     shadowManifest = try makeOutputManifest(plannedOutputs, fs: fs, isCancelled: isCancelled)
+                    if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
                 } catch is CancellationError {
                     outcome = .cancelled
+                } catch is SwiftAcceleratorCacheQuarantinedError {
+                    outcome = .quarantined
+                    shadowManifest = nil
                 } catch {
+                    quarantineCache()
                     outcome = .manifestError
                 }
                 manifestDurationNS = manifestTimer.elapsedTime().nanoseconds
@@ -1626,6 +1720,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                     shadowManifest: nil
                 )
             } catch {
+                quarantineCache()
                 totalScrubDurationNS += scrubTimer.elapsedTime().nanoseconds
                 return .init(
                     outcome: .scrubFailure,
@@ -1689,7 +1784,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         switch outcome {
         case .unavailable, .queryError, .replayError, .manifestError:
             return true
-        case .cancelled, .miss, .wouldHit, .verificationReady, .scrubFailure:
+        case .unauthorizedTrust, .quarantined, .unsupportedOutput, .cancelled, .miss, .wouldHit, .verificationReady, .scrubFailure:
             return false
         }
     }

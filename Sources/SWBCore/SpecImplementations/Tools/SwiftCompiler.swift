@@ -389,6 +389,13 @@ public enum SwiftBuildAcceleratorCacheMode: String, Codable, Sendable, Serializa
         self == .observe || self == .verify
     }
 
+    /// Modes whose cache path may materialize files into planned output
+    /// locations. `trust` remains externally unselectable; this predicate only
+    /// centralizes safety policy for internal preparation seams.
+    public var usesAcceleratorMaterialization: Bool {
+        self == .verify || self == .trust
+    }
+
     public func serialize<T: Serializer>(to serializer: T) {
         serializer.serialize(rawValue)
     }
@@ -1585,7 +1592,7 @@ public final class SwiftCompilerSpec : CompilerSpec, SpecIdentifierType, SwiftDi
                 guard cbc.scope.previewStyle == nil else { return excluded(.previews) }
                 // Generated Objective-C headers can be shared across driver jobs;
                 // verify replay must never write or scrub them.
-                guard mode != .verify || objcHeaderFilePath == nil else { return excluded(.unsupportedOutput) }
+                guard !mode.usesAcceleratorMaterialization || objcHeaderFilePath == nil else { return excluded(.unsupportedOutput) }
                 guard cbc.scope.evaluate(BuiltinMacros.SWIFT_OBJC_BRIDGING_HEADER).isEmpty else { return excluded(.bridgingHeader) }
                 guard cbc.producer.swiftMacroImplementationDescriptors?.isEmpty != false else { return excluded(.macroPlugin) }
                 guard useIntegratedDriver else { return excluded(.integratedDriverDisabled) }
