@@ -1240,8 +1240,10 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                             observationFallback = .noCAS
                         case .unauthorizedTrust:
                             observationOutcome = .unavailable
+                            observationFallback = .unauthorizedTrust
                         case .quarantined:
                             observationOutcome = .unavailable
+                            observationFallback = .buildQuarantined
                         case .unsupportedOutput:
                             observationEligibility = .ineligible
                             observationExclusionReason = .unsupportedOutput

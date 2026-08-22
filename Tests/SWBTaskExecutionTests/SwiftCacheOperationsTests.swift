@@ -1570,20 +1570,40 @@ fileprivate struct SwiftCacheOperationsTests {
     @Test
     func taskOutputDelegatePropagatesOnlyStructuredObservations() {
         let delegate = MockTaskOutputDelegate()
-        let observation = TaskCacheObservation(
-            cacheKeys: ["raw-key-stays-task-local"],
-            mode: .verify,
-            eligibility: .eligible,
-            outcome: .cacheError,
-            scrubOutcome: .succeeded,
-            fallbackReason: .replayError,
-            finalDisposition: .executed
-        )
+        let observations = [
+            TaskCacheObservation(
+                cacheKeys: ["raw-key-stays-task-local"],
+                mode: .verify,
+                eligibility: .eligible,
+                outcome: .cacheError,
+                scrubOutcome: .succeeded,
+                fallbackReason: .replayError,
+                finalDisposition: .executed
+            ),
+            TaskCacheObservation(
+                mode: .trust,
+                eligibility: .eligible,
+                outcome: .unavailable,
+                fallbackReason: .unauthorizedTrust,
+                finalDisposition: .executed
+            ),
+            TaskCacheObservation(
+                mode: .verify,
+                eligibility: .eligible,
+                outcome: .unavailable,
+                fallbackReason: .buildQuarantined,
+                finalDisposition: .executed
+            ),
+        ]
 
-        delegate.recordCacheObservation(observation)
+        for observation in observations {
+            delegate.recordCacheObservation(observation)
+        }
 
-        #expect(delegate.cacheObservations == [observation])
+        #expect(delegate.cacheObservations == observations)
         #expect(delegate.cacheObservations.first?.fallbackReason == .replayError)
+        #expect(delegate.cacheObservations.dropFirst().first?.fallbackReason == .unauthorizedTrust)
+        #expect(delegate.cacheObservations.last?.fallbackReason == .buildQuarantined)
         #expect(delegate.cacheObservations.first?.finalDisposition == .executed)
     }
 

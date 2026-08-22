@@ -143,7 +143,7 @@ package final class AcceleratorTraceWriter: @unchecked Sendable {
 
     private struct Event: Encodable, Sendable {
         let schemaMajor = 1
-        let schemaMinor = 1
+        let schemaMinor = 2
         let event: String
         let buildID: String
         let sequence: UInt64

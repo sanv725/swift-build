@@ -83,7 +83,7 @@ import SWBUtil
         #expect(events.count == 1)
         let event = try #require(events.first)
         #expect(event["schema_major"] as? Int == 1)
-        #expect(event["schema_minor"] as? Int == 1)
+        #expect(event["schema_minor"] as? Int == 2)
         #expect(event["event"] as? String == "probe")
         #expect(event["build_id"] as? String == testBuildID.uuidString.lowercased())
         #expect(event["sequence"] as? Int == 1)
@@ -276,7 +276,7 @@ import SWBUtil
         let secondPayload = try #require(observations.dropFirst().first?["payload"] as? [String: Any])
         let thirdPayload = try #require(observations.last?["payload"] as? [String: Any])
         #expect(observations.allSatisfy { $0["schema_major"] as? Int == 1 })
-        #expect(observations.allSatisfy { $0["schema_minor"] as? Int == 1 })
+        #expect(observations.allSatisfy { $0["schema_minor"] as? Int == 2 })
         let firstIdentity = try #require(firstPayload["key_identity"] as? String)
         let firstLookupID = try #require(firstPayload["lookup_id"] as? String)
         #expect(firstIdentity.hasPrefix("hmac-sha256:"))
@@ -296,6 +296,47 @@ import SWBUtil
         let outputs = try #require(firstPayload["outputs"] as? [String: Any])
         #expect(outputs["count"] as? Int == 2)
         #expect(outputs["mismatch_count"] as? Int == 0)
+    }
+
+    @Test func cacheObservationEmitsBoundedTrustControlFallbackReasons() throws {
+        let taskIdentifier = TaskIdentifier(rawValue: "trust-control-task")
+        let task = OutputParserMockTask(basenames: [], exec: "swift-frontend")
+        let sink = TestAcceleratorTraceSink()
+        let writer = makeWriter(sink: sink, privacyMode: .redacted)
+
+        writer.cacheObservations(
+            taskIdentifier: taskIdentifier,
+            task: task,
+            observations: [
+                TaskCacheObservation(
+                    mode: .trust,
+                    eligibility: .eligible,
+                    outcome: .unavailable,
+                    fallbackReason: .unauthorizedTrust,
+                    finalDisposition: .executed
+                ),
+                TaskCacheObservation(
+                    mode: .verify,
+                    eligibility: .eligible,
+                    outcome: .unavailable,
+                    fallbackReason: .buildQuarantined,
+                    finalDisposition: .executed
+                ),
+            ]
+        )
+        writer.flushForTesting()
+
+        let observations = try sink.events().filter { $0["event"] as? String == "cache_observation" }
+        #expect(observations.count == 2)
+        #expect(observations.allSatisfy { $0["schema_major"] as? Int == 1 })
+        #expect(observations.allSatisfy { $0["schema_minor"] as? Int == 2 })
+        let payloads = try observations.map { event in
+            try #require(event["payload"] as? [String: Any])
+        }
+        #expect(payloads.map { $0["outcome"] as? String } == ["unavailable", "unavailable"])
+        #expect(payloads.map { $0["fallback_reason"] as? String } == ["unauthorized_trust", "build_quarantined"])
+        #expect(payloads.allSatisfy { $0["exclusion_reason"] is NSNull })
+        #expect(payloads.allSatisfy { $0["final_disposition"] as? String == "executed" })
     }
 
     @Test func finishIsTerminalAndClosesAfterDraining() throws {

@@ -661,6 +661,8 @@ package struct TaskCacheObservation: Equatable, Sendable {
 
     package enum FallbackReason: String, Equatable, Sendable {
         case noCAS = "no_cas"
+        case unauthorizedTrust = "unauthorized_trust"
+        case buildQuarantined = "build_quarantined"
         case queryError = "query_error"
         case replayError = "replay_error"
         case manifestError = "manifest_error"
