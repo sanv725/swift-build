@@ -76,6 +76,7 @@
         /// operation unbounded.
         package static func snapshotRegularFile(
             at path: Path,
+            isCancelled: () -> Bool = { false },
             testingHook: ((SnapshotTestingEvent, FileDescriptor) throws -> Void)? = nil
         ) throws -> RegularFileSnapshot {
             let components = try absoluteComponents(of: path)
@@ -109,7 +110,7 @@
             defer { buffer.deallocate() }
 
             while remainingByteCount > 0 {
-                try Task.checkCancellation()
+                try checkCancellation(isCancelled)
                 let requestedByteCount = Int(min(Int64(snapshotChunkByteCount), remainingByteCount))
                 let readByteCount = try retryingSyscall {
                     CInt(Darwin.read(leaf.rawValue, buffer.baseAddress, requestedByteCount))
@@ -121,11 +122,11 @@
                 hashedByteCount += Int64(count)
                 remainingByteCount -= Int64(count)
                 try testingHook?(.chunkHashed(index: chunkIndex), leaf)
-                try Task.checkCancellation()
+                try checkCancellation(isCancelled)
                 chunkIndex += 1
             }
 
-            try Task.checkCancellation()
+            try checkCancellation(isCancelled)
             let after = try metadata(of: leaf)
             guard before == after else {
                 throw OperationError.fileChanged(before: before, after: after)
@@ -136,7 +137,7 @@
                     actualByteCount: hashedByteCount
                 )
             }
-            try Task.checkCancellation()
+            try checkCancellation(isCancelled)
             return RegularFileSnapshot(metadata: after, digest: hash.signature)
         }
 
@@ -264,6 +265,12 @@
             } catch {
                 try? descriptor.close()
                 throw error
+            }
+        }
+
+        private static func checkCancellation(_ isCancelled: () -> Bool) throws {
+            if isCancelled() || Task.isCancelled {
+                throw CancellationError()
             }
         }
 
