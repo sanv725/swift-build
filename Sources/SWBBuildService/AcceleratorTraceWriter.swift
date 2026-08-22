@@ -143,7 +143,11 @@ package final class AcceleratorTraceWriter: @unchecked Sendable {
 
     private struct Event: Encodable, Sendable {
         let schemaMajor = 1
+        #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+        let schemaMinor = 3
+        #else
         let schemaMinor = 2
+        #endif
         let event: String
         let buildID: String
         let sequence: UInt64

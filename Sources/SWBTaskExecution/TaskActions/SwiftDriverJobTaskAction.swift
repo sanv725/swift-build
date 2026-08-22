@@ -156,13 +156,14 @@ package enum SwiftAcceleratorCachePreparationOutcome: Sendable, Equatable {
     case miss
     case wouldHit
     case verificationReady
+    case unsafeTrustHit
     case queryError
     case replayError
     case manifestError
     case scrubFailure
 
     package var shouldExecuteFrontend: Bool {
-        self != .scrubFailure && self != .cancelled
+        self != .scrubFailure && self != .cancelled && self != .unsafeTrustHit
     }
 }
 
@@ -422,6 +423,7 @@ package struct SwiftAcceleratorCachePreparation: Sendable, Equatable {
     package let scrubSucceeded: Bool?
     package let cachedOutputCount: Int?
     package let shadowManifest: SwiftCacheOutputManifest?
+    package let replayStreams: [SwiftCacheReplayStreams]?
 
     package init(
         outcome: SwiftAcceleratorCachePreparationOutcome,
@@ -431,7 +433,8 @@ package struct SwiftAcceleratorCachePreparation: Sendable, Equatable {
         scrubDurationNS: UInt64? = nil,
         scrubSucceeded: Bool? = nil,
         cachedOutputCount: Int? = nil,
-        shadowManifest: SwiftCacheOutputManifest? = nil
+        shadowManifest: SwiftCacheOutputManifest? = nil,
+        replayStreams: [SwiftCacheReplayStreams]? = nil
     ) {
         self.outcome = outcome
         self.lookupDurationNS = lookupDurationNS
@@ -441,6 +444,7 @@ package struct SwiftAcceleratorCachePreparation: Sendable, Equatable {
         self.scrubSucceeded = scrubSucceeded
         self.cachedOutputCount = cachedOutputCount
         self.shadowManifest = shadowManifest
+        self.replayStreams = replayStreams
     }
 }
 
@@ -1301,6 +1305,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                         case .verificationReady:
                             observationOutcome = .wouldHit
                             shadowManifest = preparation.shadowManifest
+                        case .unsafeTrustHit:
+                            observationOutcome = .unsafeTrustHit
                         case .queryError:
                             observationOutcome = .cacheError
                             observationFallback = .queryError
@@ -1321,8 +1327,23 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                         switch preparation.outcome {
                         case .replayError, .manifestError, .scrubFailure:
                             dynamicExecutionDelegate.operationContext.quarantineAcceleratorCache()
-                        case .unavailable, .unauthorizedTrust, .quarantined, .unsupportedOutput, .cancelled, .miss, .wouldHit, .verificationReady, .queryError:
+                        case .unavailable, .unauthorizedTrust, .quarantined, .unsupportedOutput, .cancelled, .miss, .wouldHit, .verificationReady, .unsafeTrustHit, .queryError:
                             break
+                        }
+
+                        if Self.shouldAcceptUnsafeTrustHit(
+                            mode: acceleratorPolicy.mode,
+                            outcome: preparation.outcome
+                        ) {
+                            finalDisposition = .cacheReplayed
+                            outputDelegate.note("EXPERIMENTAL: accepted an unsafe Swift accelerator cache hit; skipped swift-frontend")
+                            for streams in preparation.replayStreams ?? [] {
+                                outputDelegate.emitOutput(ByteString(encodingAsUTF8: streams.standardOutput))
+                                outputDelegate.emitOutput(ByteString(encodingAsUTF8: streams.standardError))
+                            }
+                            outputDelegate.incrementCounter(.swiftCacheHits)
+                            outputDelegate.incrementTaskCounter(.cacheHits)
+                            return .succeeded
                         }
 
                         if Self.cachePreparationIsFatal(preparation.outcome, strictCASErrors: casOpts.enableStrictCASErrors) {
@@ -1591,16 +1612,18 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         return fileKinds
     }
 
-    /// Replays in compiler-key order and intentionally discards cached streams.
-    /// Fresh compiler execution remains the only user-visible diagnostic source.
+    /// Replays in compiler-key order. Cached streams are discarded immediately
+    /// unless capture is requested, in which case they are returned in that same
+    /// order. Callers must not publish a partial array if a later replay fails.
     package static func replayCache<Operations: SwiftCacheOperations>(
         operations: Operations,
         compilations: [Operations.Compilation],
         commandLine: [String],
+        captureStreams: Bool = false,
         pauseBeforeMaterialization: (() throws -> Void)? = nil,
         isCancelled: () -> Bool = { false },
         isQuarantined: () -> Bool = { false }
-    ) throws {
+    ) throws -> [SwiftCacheReplayStreams]? {
         if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
         if isCancelled() { throw CancellationError() }
         let instance = try operations.createReplayInstance(commandLine: Array(commandLine.dropFirst()))
@@ -1609,12 +1632,34 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         try pauseBeforeMaterialization?()
         if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
         if isCancelled() { throw CancellationError() }
+        var streams: [SwiftCacheReplayStreams]? = captureStreams ? [] : nil
+        streams?.reserveCapacity(compilations.count)
         for compilation in compilations {
             if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
             if isCancelled() { throw CancellationError() }
-            _ = try operations.replayCompilation(compilation, using: instance)
+            let replayStreams = try operations.replayCompilation(compilation, using: instance)
+            streams?.append(replayStreams)
             if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
             if isCancelled() { throw CancellationError() }
+        }
+        return streams
+    }
+
+    /// Checks only output presence and regular-file shape. The unsafe trust
+    /// experiment intentionally avoids content reads and hashing.
+    package static func validateReplayCompleteness(
+        _ paths: [Path],
+        fs: any FSProxy
+    ) throws {
+        guard !paths.isEmpty, Set(paths).count == paths.count else {
+            throw SwiftCacheOutputError.missingOutput
+        }
+        for path in paths {
+            guard fs.exists(path),
+                  !isSymlink(path, fs: fs),
+                  try fs.getFileInfo(path).isFile else {
+                throw SwiftCacheOutputError.missingOutput
+            }
         }
     }
 
@@ -1769,9 +1814,14 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         isQuarantined: () -> Bool = { false },
         quarantineCache: () -> Void = {}
     ) -> SwiftAcceleratorCachePreparation {
+        #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+        // The experimental binary plus externally selected `trust` mode is the
+        // complete activation boundary. No private runtime token is required.
+        #else
         guard mode != .trust || trustAuthorization != nil else {
             return .init(outcome: .unauthorizedTrust, lookupDurationNS: 0)
         }
+        #endif
         if mode.usesAcceleratorMaterialization && isQuarantined() {
             return .init(outcome: .quarantined, lookupDurationNS: 0)
         }
@@ -1956,6 +2006,12 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             var shadowManifest: SwiftCacheOutputManifest?
             let replayTimer = ElapsedTimer()
             var replayFailure: (any Error)?
+            var capturedReplayStreams: [SwiftCacheReplayStreams]?
+            #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+            let captureReplayStreams = mode == .trust
+            #else
+            let captureReplayStreams = false
+            #endif
             #if canImport(Darwin)
             var replayIdentitiesCaptured = false
             #endif
@@ -1963,10 +2019,11 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 if claimAtCheckpoint(.replayError) {
                     throw SwiftAcceleratorCacheInjectedError.injected
                 }
-                try replayCache(
+                capturedReplayStreams = try replayCache(
                     operations: operations,
                     compilations: compilations,
                     commandLine: commandLine,
+                    captureStreams: captureReplayStreams,
                     pauseBeforeMaterialization: {
                         try activeCancellationPause?(.replayStage)
                     },
@@ -1977,6 +2034,19 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 if let outputAccessSession {
                     try outputAccessSession.captureReplayOutputs()
                     replayIdentitiesCaptured = true
+                }
+                #endif
+                #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+                if mode == .trust {
+                    #if canImport(Darwin)
+                    if let outputAccessSession {
+                        try outputAccessSession.validateCompleteReplayOutputs(expectedCount: plannedOutputs.count)
+                    } else {
+                        try validateReplayCompleteness(plannedOutputs, fs: fs)
+                    }
+                    #else
+                    try validateReplayCompleteness(plannedOutputs, fs: fs)
+                    #endif
                 }
                 #endif
                 if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
@@ -2004,6 +2074,29 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 outcome = .replayError
             }
             let replayDurationNS = replayTimer.elapsedTime().nanoseconds
+
+            #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+            if mode == .trust, outcome == .verificationReady {
+                if isCancelled() {
+                    outcome = .cancelled
+                } else if isQuarantined() {
+                    outcome = .quarantined
+                } else if let capturedReplayStreams,
+                          capturedReplayStreams.count == compilations.count {
+                    return .init(
+                        outcome: .unsafeTrustHit,
+                        lookupDurationNS: lookupDurationNS,
+                        replayDurationNS: replayDurationNS,
+                        scrubDurationNS: totalScrubDurationNS,
+                        cachedOutputCount: outputCount,
+                        replayStreams: capturedReplayStreams
+                    )
+                } else {
+                    quarantineCache()
+                    outcome = .replayError
+                }
+            }
+            #endif
 
             var manifestDurationNS: UInt64?
             if outcome == .verificationReady && !isCancelled() {
@@ -2203,9 +2296,20 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         switch outcome {
         case .unavailable, .queryError, .replayError, .manifestError:
             return true
-        case .unauthorizedTrust, .quarantined, .unsupportedOutput, .cancelled, .miss, .wouldHit, .verificationReady, .scrubFailure:
+        case .unauthorizedTrust, .quarantined, .unsupportedOutput, .cancelled, .miss, .wouldHit, .verificationReady, .unsafeTrustHit, .scrubFailure:
             return false
         }
+    }
+
+    package static func shouldAcceptUnsafeTrustHit(
+        mode: SwiftBuildAcceleratorCacheMode,
+        outcome: SwiftAcceleratorCachePreparationOutcome
+    ) -> Bool {
+        #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+        mode == .trust && outcome == .unsafeTrustHit
+        #else
+        false
+        #endif
     }
 
     /// Upstream replay is reserved for stock mode. Observe and verify always

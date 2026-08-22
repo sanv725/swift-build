@@ -22,14 +22,22 @@ fileprivate struct SwiftBuildAcceleratorCachePolicyTests {
         #expect(SwiftBuildAcceleratorCacheMode.externallySelectedMode("") == .stock)
         #expect(SwiftBuildAcceleratorCacheMode.externallySelectedMode("stock") == .stock)
         #expect(SwiftBuildAcceleratorCacheMode.externallySelectedMode("unknown") == .stock)
+        #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+        #expect(SwiftBuildAcceleratorCacheMode.externallySelectedMode("trust") == .trust)
+        #else
         #expect(SwiftBuildAcceleratorCacheMode.externallySelectedMode("trust") == .observe)
+        #endif
         #expect(SwiftBuildAcceleratorCacheMode.externallySelectedMode(" observe\n") == .observe)
         #expect(SwiftBuildAcceleratorCacheMode.externallySelectedMode("VERIFY") == .verify)
 
         #expect(!SwiftBuildAcceleratorCacheMode.stock.isAcceleratorEnabled)
         #expect(SwiftBuildAcceleratorCacheMode.observe.isAcceleratorEnabled)
         #expect(SwiftBuildAcceleratorCacheMode.verify.isAcceleratorEnabled)
+        #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+        #expect(SwiftBuildAcceleratorCacheMode.trust.isAcceleratorEnabled)
+        #else
         #expect(!SwiftBuildAcceleratorCacheMode.trust.isAcceleratorEnabled)
+        #endif
 
         #expect(!SwiftBuildAcceleratorCacheMode.stock.usesAcceleratorMaterialization)
         #expect(!SwiftBuildAcceleratorCacheMode.observe.usesAcceleratorMaterialization)
@@ -42,7 +50,11 @@ fileprivate struct SwiftBuildAcceleratorCachePolicyTests {
         #expect(!SwiftBuildAcceleratorCachePolicy.stock.shouldProbe)
         #expect(SwiftBuildAcceleratorCachePolicy(mode: .observe, eligibility: .eligible).shouldProbe)
         #expect(SwiftBuildAcceleratorCachePolicy(mode: .verify, eligibility: .eligible).shouldProbe)
+        #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+        #expect(SwiftBuildAcceleratorCachePolicy(mode: .trust, eligibility: .eligible).shouldProbe)
+        #else
         #expect(!SwiftBuildAcceleratorCachePolicy(mode: .trust, eligibility: .eligible).shouldProbe)
+        #endif
         #expect(!SwiftBuildAcceleratorCachePolicy(mode: .observe, eligibility: .excluded(.unsupportedPlatform)).shouldProbe)
     }
 

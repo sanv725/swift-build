@@ -275,6 +275,17 @@
                 }
             }
 
+            /// Requires replay to have produced exactly one regular leaf for every
+            /// entry in the retained plan. This deliberately does not read or hash
+            /// file contents.
+            package func validateCompleteReplayOutputs(expectedCount: Int) throws {
+                try ensureOpen()
+                guard entries.count == expectedCount,
+                      entries.allSatisfy({ $0.replayLeafMetadata?.type == .regularFile }) else {
+                    throw OperationError.scrubFailed
+                }
+            }
+
             package func snapshotReplayedOutput(
                 at index: Int,
                 isCancelled: () -> Bool = { false }

@@ -623,6 +623,7 @@ package struct TaskCacheObservation: Equatable, Sendable {
         case wouldHit = "would_hit"
         case verifyMatch = "verify_match"
         case verifyMismatch = "verify_mismatch"
+        case unsafeTrustHit = "unsafe_trust_hit"
         case unavailable
         case cacheError = "cache_error"
         case cancelled

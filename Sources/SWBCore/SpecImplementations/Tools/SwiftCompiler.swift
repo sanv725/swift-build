@@ -369,7 +369,7 @@ public enum SwiftBuildAcceleratorCacheMode: String, Codable, Sendable, Serializa
     case trust
 
     /// Parses the per-build opt-in setting. `trust` is deliberately represented in
-    /// the internal state model but cannot be selected by this implementation.
+    /// the internal state model but cannot be selected by normal builds.
     public static func externallySelectedMode(_ value: String) -> Self {
         switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "observe":
@@ -377,16 +377,31 @@ public enum SwiftBuildAcceleratorCacheMode: String, Codable, Sendable, Serializa
         case "verify":
             return .verify
         case "trust":
+            #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+            return .trust
+            #else
             // `trust` is intentionally unselectable until verification has proved
             // the cache safe. Treating it as observe guarantees a fresh compile.
             return .observe
+            #endif
         default:
             return .stock
         }
     }
 
     public var isAcceleratorEnabled: Bool {
-        self == .observe || self == .verify
+        switch self {
+        case .observe, .verify:
+            return true
+        case .trust:
+            #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+            return true
+            #else
+            return false
+            #endif
+        case .stock:
+            return false
+        }
     }
 
     /// Modes whose cache path may materialize files into planned output
@@ -1569,9 +1584,11 @@ public final class SwiftCompilerSpec : CompilerSpec, SpecIdentifierType, SwiftDi
             var acceleratorCachePolicy: SwiftBuildAcceleratorCachePolicy = {
                 let rawMode = cbc.scope.evaluate(BuiltinMacros.SWIFT_BUILD_ACCELERATOR_CACHE_MODE)
                 let mode = SwiftBuildAcceleratorCacheMode.externallySelectedMode(rawMode)
+                #if !SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
                 if rawMode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == SwiftBuildAcceleratorCacheMode.trust.rawValue {
                     delegate.warning("SWIFT_BUILD_ACCELERATOR_CACHE_MODE=trust is reserved and unavailable; using observe mode")
                 }
+                #endif
                 guard mode.isAcceleratorEnabled else {
                     return .stock
                 }

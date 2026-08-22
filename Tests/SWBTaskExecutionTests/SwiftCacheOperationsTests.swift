@@ -234,24 +234,28 @@ fileprivate struct SwiftCacheOperationsTests {
     }
 
     @Test
-    func shadowReplayIsOrderedAndDoesNotExposeCachedStreams() throws {
-        let secretOutput = "cached diagnostic and stdout must stay shadowed"
+    func replayCollectsCachedStreamsInCompilerKeyOrder() throws {
         let operations = TestSwiftCacheOperations(
             queries: [:],
             outputs: [:],
-            replayStreams: .init(standardOutput: secretOutput, standardError: secretOutput)
+            replayStreamsByCompilation: [
+                1: .init(standardOutput: "stdout-1", standardError: "stderr-1"),
+                2: .init(standardOutput: "stdout-2", standardError: "stderr-2"),
+                3: .init(standardOutput: "stdout-3", standardError: "stderr-3"),
+            ]
         )
 
-        try SwiftDriverJobTaskAction.replayCache(
+        let streams = try SwiftDriverJobTaskAction.replayCache(
             operations: operations,
             compilations: [3, 1, 2],
-            commandLine: ["swift-frontend", "-frontend", "-c"]
+            commandLine: ["swift-frontend", "-frontend", "-c"],
+            captureStreams: true
         )
 
         #expect(operations.replayCommandLine == ["-frontend", "-c"])
         #expect(operations.replayedCompilations == [3, 1, 2])
-        // The helper deliberately returns Void, so cached stdout/stderr cannot
-        // become the authoritative compiler's output by accident.
+        #expect(streams?.map(\.standardOutput) == ["stdout-3", "stdout-1", "stdout-2"])
+        #expect(streams?.map(\.standardError) == ["stderr-3", "stderr-1", "stderr-2"])
     }
 
     @Test
@@ -838,11 +842,19 @@ fileprivate struct SwiftCacheOperationsTests {
             commandLine: ["swift-frontend", "-c"],
             fs: fs
         )
+        #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+        #expect(externallyRequestedTrust == .trust)
+        #expect(trustPreparation.outcome == .unsafeTrustHit)
+        #expect(!trustPreparation.outcome.shouldExecuteFrontend)
+        #expect(operations.replayedCompilations == [1])
+        #expect(try fs.read(output).asString == "cached-object")
+        #else
         #expect(externallyRequestedTrust == .observe)
         #expect(trustPreparation.outcome == .wouldHit)
         #expect(trustPreparation.outcome.shouldExecuteFrontend)
-        #expect(trustPreparation.shadowManifest == nil)
         #expect(operations.replayedCompilations.isEmpty)
+        #endif
+        #expect(trustPreparation.shadowManifest == nil)
 
         operations.resetCalls()
         let verified = SwiftDriverJobTaskAction.prepareAcceleratorCache(
@@ -857,6 +869,7 @@ fileprivate struct SwiftCacheOperationsTests {
         #expect(verified.outcome == .verificationReady)
         #expect(verified.outcome.shouldExecuteFrontend)
         #expect(verified.shadowManifest?.entries.count == 1)
+        #expect(verified.replayStreams == nil)
         #expect(verified.scrubSucceeded == true)
         #expect(operations.replayedCompilations == [1])
         #expect(!fs.exists(output))
@@ -890,7 +903,8 @@ fileprivate struct SwiftCacheOperationsTests {
         try fs.write(output, contents: ByteString(encodingAsUTF8: "fresh-frontend-owned"))
         let operations = TestSwiftCacheOperations(
             queries: ["key": .hit(1)],
-            outputs: [1: [.init(kindName: "object", isMaterialized: true)]]
+            outputs: [1: [.init(kindName: "object", isMaterialized: true)]],
+            replayStreams: .init(standardOutput: "cached-stdout", standardError: "cached-stderr")
         )
         operations.replaySideEffect = { _ in
             try fs.write(output, contents: ByteString(encodingAsUTF8: "cached-object"))
@@ -906,6 +920,20 @@ fileprivate struct SwiftCacheOperationsTests {
             fs: fs
         )
 
+        #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+        #expect(preparation.outcome == .unsafeTrustHit)
+        #expect(!preparation.outcome.shouldExecuteFrontend)
+        #expect(preparation.replayDurationNS != nil)
+        #expect(preparation.scrubDurationNS != nil)
+        #expect(preparation.scrubSucceeded == nil)
+        #expect(operations.queriedKeys == ["key"])
+        #expect(operations.replayedCompilations == [1])
+        #expect(try fs.read(output).asString == "cached-object")
+        #expect(preparation.replayStreams == [
+            .init(standardOutput: "cached-stdout", standardError: "cached-stderr")
+        ])
+        #expect(SwiftDriverJobTaskAction.shouldAcceptUnsafeTrustHit(mode: .trust, outcome: preparation.outcome))
+        #else
         #expect(preparation.outcome == .unauthorizedTrust)
         #expect(preparation.outcome.shouldExecuteFrontend)
         #expect(preparation.lookupDurationNS == 0)
@@ -915,7 +943,121 @@ fileprivate struct SwiftCacheOperationsTests {
         #expect(operations.replayedCompilations.isEmpty)
         #expect(try fs.read(output).asString == "fresh-frontend-owned")
         #expect(!SwiftDriverJobTaskAction.cachePreparationIsFatal(.unauthorizedTrust, strictCASErrors: true))
+        #expect(!SwiftDriverJobTaskAction.shouldAcceptUnsafeTrustHit(mode: .trust, outcome: .unsafeTrustHit))
+        #endif
     }
+
+    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+    @Test
+    func unsafeTrustRejectsSingleMissingReplayOutput() throws {
+        let fs = PseudoFS()
+        let output = Path("/missing.o")
+        let operations = TestSwiftCacheOperations(
+            queries: ["key": .hit(1)],
+            outputs: [1: [.init(kindName: "object", isMaterialized: true)]],
+            replayStreams: .init(standardOutput: "must-not-leak", standardError: "must-not-leak")
+        )
+
+        let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .trust,
+            operations: operations,
+            cacheKeys: ["key"],
+            expectedOutputKindGroups: [["object"]],
+            plannedOutputs: [output],
+            commandLine: ["swift-frontend", "-c"],
+            fs: fs
+        )
+
+        #expect(preparation.outcome == .replayError)
+        #expect(preparation.outcome.shouldExecuteFrontend)
+        #expect(preparation.scrubSucceeded == true)
+        #expect(preparation.replayStreams == nil)
+        #expect(operations.replayedCompilations == [1])
+        #expect(!fs.exists(output))
+    }
+
+    @Test
+    func unsafeTrustRejectsPartialMultiOutputReplayWithoutLeakingStreams() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let object = temporaryDirectory.path.join("main.o")
+        let module = temporaryDirectory.path.join("Main.swiftmodule")
+        let operations = TestSwiftCacheOperations(
+            queries: ["object-key": .hit(1), "module-key": .hit(2)],
+            outputs: [
+                1: [.init(kindName: "object", isMaterialized: true)],
+                2: [.init(kindName: "swiftmodule", isMaterialized: true)],
+            ],
+            replayStreamsByCompilation: [
+                1: .init(standardOutput: "stdout-1", standardError: "stderr-1"),
+                2: .init(standardOutput: "stdout-2", standardError: "stderr-2"),
+            ]
+        )
+        operations.replaySideEffect = { compilation in
+            if compilation == 1 {
+                try localFS.write(object, contents: ByteString(encodingAsUTF8: "cached-object"))
+            }
+        }
+
+        let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .trust,
+            operations: operations,
+            cacheKeys: ["object-key", "module-key"],
+            expectedOutputKindGroups: [["object"], ["swiftmodule"]],
+            plannedOutputs: [object, module],
+            commandLine: ["swift-frontend", "-c"],
+            fs: localFS
+        )
+
+        #expect(preparation.outcome == .replayError)
+        #expect(preparation.outcome.shouldExecuteFrontend)
+        #expect(preparation.scrubSucceeded == true)
+        #expect(preparation.replayStreams == nil)
+        #expect(operations.replayedCompilations == [1, 2])
+        #expect(!localFS.exists(object))
+        #expect(!localFS.exists(module))
+    }
+
+    @Test
+    func unsafeTrustReplayFailureDoesNotLeakPartialStreams() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let first = temporaryDirectory.path.join("first.o")
+        let second = temporaryDirectory.path.join("second.swiftmodule")
+        let operations = TestSwiftCacheOperations(
+            queries: ["one": .hit(1), "two": .hit(2)],
+            outputs: [
+                1: [.init(kindName: "object", isMaterialized: true)],
+                2: [.init(kindName: "swiftmodule", isMaterialized: true)],
+            ],
+            replayStreamsByCompilation: [
+                1: .init(standardOutput: "stdout-1", standardError: "stderr-1"),
+                2: .init(standardOutput: "stdout-2", standardError: "stderr-2"),
+            ]
+        )
+        operations.failReplayForCompilation = 2
+        operations.replaySideEffect = { compilation in
+            let path = compilation == 1 ? first : second
+            try localFS.write(path, contents: ByteString(encodingAsUTF8: "partial"))
+        }
+
+        let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .trust,
+            operations: operations,
+            cacheKeys: ["one", "two"],
+            expectedOutputKindGroups: [["object"], ["swiftmodule"]],
+            plannedOutputs: [first, second],
+            commandLine: ["swift-frontend", "-c"],
+            fs: localFS
+        )
+
+        #expect(preparation.outcome == .replayError)
+        #expect(preparation.outcome.shouldExecuteFrontend)
+        #expect(preparation.scrubSucceeded == true)
+        #expect(preparation.replayStreams == nil)
+        #expect(operations.replayedCompilations == [1, 2])
+        #expect(!localFS.exists(first))
+        #expect(!localFS.exists(second))
+    }
+    #endif
 
     @Test
     func quarantinedVerifyDoesNotTouchCacheOrOutputs() throws {
@@ -1819,7 +1961,11 @@ fileprivate struct SwiftCacheOperationsTests {
         #expect(!SwiftDriverJobTaskAction.shouldCancelBeforeFrontend(mode: .observe, isCancelled: false))
         #expect(SwiftDriverJobTaskAction.shouldCancelBeforeFrontend(mode: .observe, isCancelled: true))
         #expect(SwiftDriverJobTaskAction.shouldCancelBeforeFrontend(mode: .verify, isCancelled: true))
+        #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+        #expect(SwiftDriverJobTaskAction.shouldCancelBeforeFrontend(mode: .trust, isCancelled: true))
+        #else
         #expect(!SwiftDriverJobTaskAction.shouldCancelBeforeFrontend(mode: .trust, isCancelled: true))
+        #endif
     }
 
     @Test
@@ -1975,6 +2121,7 @@ fileprivate struct SwiftCacheOperationsTests {
         #expect(preparation.outcome == expected, sourceLocation: sourceLocation)
         #expect(preparation.outcome.shouldExecuteFrontend, sourceLocation: sourceLocation)
         #expect(preparation.shadowManifest == nil, sourceLocation: sourceLocation)
+        #expect(preparation.replayStreams == nil, sourceLocation: sourceLocation)
         #expect(!SwiftDriverJobTaskAction.cachePreparationIsFatal(expected, strictCASErrors: false), sourceLocation: sourceLocation)
         #expect(SwiftDriverJobTaskAction.cachePreparationIsFatal(expected, strictCASErrors: true), sourceLocation: sourceLocation)
     }
@@ -1994,6 +2141,7 @@ private final class TestSwiftCacheOperations: SwiftCacheOperations {
     var queries: [String: Query]
     var outputs: [Int: [SwiftCacheCachedOutput]]
     let replayStreams: SwiftCacheReplayStreams
+    let replayStreamsByCompilation: [Int: SwiftCacheReplayStreams]
     var failCreateReplay = false
     var failReplayForCompilation: Int?
     var querySideEffect: ((String) throws -> Void)?
@@ -2005,11 +2153,13 @@ private final class TestSwiftCacheOperations: SwiftCacheOperations {
     init(
         queries: [String: Query],
         outputs: [Int: [SwiftCacheCachedOutput]],
-        replayStreams: SwiftCacheReplayStreams = .init(standardOutput: "", standardError: "")
+        replayStreams: SwiftCacheReplayStreams = .init(standardOutput: "", standardError: ""),
+        replayStreamsByCompilation: [Int: SwiftCacheReplayStreams] = [:]
     ) {
         self.queries = queries
         self.outputs = outputs
         self.replayStreams = replayStreams
+        self.replayStreamsByCompilation = replayStreamsByCompilation
     }
 
     func resetCalls() {
@@ -2049,6 +2199,6 @@ private final class TestSwiftCacheOperations: SwiftCacheOperations {
         if compilation == failReplayForCompilation {
             throw TestCacheError.injected
         }
-        return replayStreams
+        return replayStreamsByCompilation[compilation] ?? replayStreams
     }
 }

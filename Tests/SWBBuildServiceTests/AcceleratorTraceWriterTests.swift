@@ -22,6 +22,12 @@ import SWBTestSupport
 import SWBTaskExecution
 import SWBUtil
 
+#if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+private let expectedAcceleratorTraceSchemaMinor = 3
+#else
+private let expectedAcceleratorTraceSchemaMinor = 2
+#endif
+
 @Suite fileprivate struct AcceleratorTraceWriterTests {
     @Test func configurationRequiresExplicitEnablementAndAbsolutePath() {
         #expect(AcceleratorTraceWriter.Configuration(environment: [:]) == nil)
@@ -83,7 +89,7 @@ import SWBUtil
         #expect(events.count == 1)
         let event = try #require(events.first)
         #expect(event["schema_major"] as? Int == 1)
-        #expect(event["schema_minor"] as? Int == 2)
+        #expect(event["schema_minor"] as? Int == expectedAcceleratorTraceSchemaMinor)
         #expect(event["event"] as? String == "probe")
         #expect(event["build_id"] as? String == testBuildID.uuidString.lowercased())
         #expect(event["sequence"] as? Int == 1)
@@ -276,7 +282,7 @@ import SWBUtil
         let secondPayload = try #require(observations.dropFirst().first?["payload"] as? [String: Any])
         let thirdPayload = try #require(observations.last?["payload"] as? [String: Any])
         #expect(observations.allSatisfy { $0["schema_major"] as? Int == 1 })
-        #expect(observations.allSatisfy { $0["schema_minor"] as? Int == 2 })
+        #expect(observations.allSatisfy { $0["schema_minor"] as? Int == expectedAcceleratorTraceSchemaMinor })
         let firstIdentity = try #require(firstPayload["key_identity"] as? String)
         let firstLookupID = try #require(firstPayload["lookup_id"] as? String)
         #expect(firstIdentity.hasPrefix("hmac-sha256:"))
@@ -329,7 +335,7 @@ import SWBUtil
         let observations = try sink.events().filter { $0["event"] as? String == "cache_observation" }
         #expect(observations.count == 2)
         #expect(observations.allSatisfy { $0["schema_major"] as? Int == 1 })
-        #expect(observations.allSatisfy { $0["schema_minor"] as? Int == 2 })
+        #expect(observations.allSatisfy { $0["schema_minor"] as? Int == expectedAcceleratorTraceSchemaMinor })
         let payloads = try observations.map { event in
             try #require(event["payload"] as? [String: Any])
         }
@@ -338,6 +344,42 @@ import SWBUtil
         #expect(payloads.allSatisfy { $0["exclusion_reason"] is NSNull })
         #expect(payloads.allSatisfy { $0["final_disposition"] as? String == "executed" })
     }
+
+    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+    @Test func unsafeTrustExperimentEmitsDistinctTerminalObservation() throws {
+        let taskIdentifier = TaskIdentifier(rawValue: "unsafe-trust-task")
+        let task = OutputParserMockTask(basenames: [], exec: "swift-frontend")
+        let sink = TestAcceleratorTraceSink()
+        let writer = makeWriter(sink: sink, privacyMode: .redacted)
+
+        writer.cacheObservations(
+            taskIdentifier: taskIdentifier,
+            task: task,
+            observations: [TaskCacheObservation(
+                mode: .trust,
+                eligibility: .eligible,
+                outcome: .unsafeTrustHit,
+                lookupDurationNS: 11,
+                materializationDurationNS: 12,
+                scrubDurationNS: 13,
+                scrubOutcome: .notRun,
+                outputCount: 1,
+                finalDisposition: .cacheReplayed
+            )]
+        )
+        writer.flushForTesting()
+
+        let event = try #require(try sink.events().first { $0["event"] as? String == "cache_observation" })
+        #expect(event["schema_minor"] as? Int == 3)
+        let payload = try #require(event["payload"] as? [String: Any])
+        #expect(payload["mode"] as? String == "trust")
+        #expect(payload["outcome"] as? String == "unsafe_trust_hit")
+        #expect(payload["scrub_outcome"] as? String == "not_run")
+        #expect(payload["final_disposition"] as? String == "cache_replayed")
+        let timings = try #require(payload["timings"] as? [String: Any])
+        #expect(timings["compiler_duration_ns"] is NSNull)
+    }
+    #endif
 
     @Test func finishIsTerminalAndClosesAfterDraining() throws {
         let sink = TestAcceleratorTraceSink()
