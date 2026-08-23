@@ -22,7 +22,9 @@ import SWBTestSupport
 import SWBTaskExecution
 import SWBUtil
 
-#if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+#if SWIFT_BUILD_ACCELERATOR_UNSAFE_REPLAY_PHASE_INSTRUMENTATION
+private let expectedAcceleratorTraceSchemaMinor = 4
+#elseif SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
 private let expectedAcceleratorTraceSchemaMinor = 3
 #else
 private let expectedAcceleratorTraceSchemaMinor = 2
@@ -345,6 +347,91 @@ private let expectedAcceleratorTraceSchemaMinor = 2
         #expect(payloads.allSatisfy { $0["final_disposition"] as? String == "executed" })
     }
 
+    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_REPLAY_PHASE_INSTRUMENTATION
+    @Test func cacheObservationEmitsReplayPhaseTimingsWithExactNullabilityAndPrivacy() throws {
+        let rawKey = "llvmcas://private-replay-key-/Users/example/Secret.swift"
+        let taskIdentifier = TaskIdentifier(rawValue: "/Users/example/private-project/Secret.swift")
+        let task = OutputParserMockTask(basenames: [], exec: "swift-frontend")
+        let sink = TestAcceleratorTraceSink()
+        let writer = makeWriter(sink: sink, privacyMode: .redacted)
+        let phaseTimings = TaskCacheObservation.ReplayPhaseTimings(
+            actionCacheQuerySumNS: 101,
+            cachedOutputInspectionSumNS: nil,
+            replayInstanceCreationDurationNS: 103,
+            replayOperationsWallDurationNS: 304,
+            opaqueReplayCallSumNS: 105,
+            streamCollectionSumNS: 106,
+            postReplayValidationDurationNS: 107
+        )
+
+        #expect(phaseTimings == TaskCacheObservation.ReplayPhaseTimings(
+            actionCacheQuerySumNS: 101,
+            cachedOutputInspectionSumNS: nil,
+            replayInstanceCreationDurationNS: 103,
+            replayOperationsWallDurationNS: 304,
+            opaqueReplayCallSumNS: 105,
+            streamCollectionSumNS: 106,
+            postReplayValidationDurationNS: 107
+        ))
+
+        writer.cacheObservations(
+            taskIdentifier: taskIdentifier,
+            task: task,
+            observations: [
+                TaskCacheObservation(
+                    cacheKeys: [rawKey],
+                    mode: .trust,
+                    eligibility: .eligible,
+                    outcome: .unsafeTrustHit,
+                    lookupDurationNS: 204,
+                    materializationDurationNS: 525,
+                    replayPhaseTimings: phaseTimings,
+                    finalDisposition: .cacheReplayed
+                ),
+                TaskCacheObservation(
+                    cacheKeys: [rawKey],
+                    mode: .observe,
+                    eligibility: .eligible,
+                    outcome: .wouldHit,
+                    lookupDurationNS: 201,
+                    finalDisposition: .executed
+                ),
+            ]
+        )
+        writer.flushForTesting()
+
+        #expect(!sink.string.contains(rawKey))
+        #expect(!sink.string.contains("Secret.swift"))
+        let observations = try sink.events().filter { $0["event"] as? String == "cache_observation" }
+        #expect(observations.count == 2)
+        #expect(observations.allSatisfy { $0["schema_minor"] as? Int == 4 })
+
+        let measuredPayload = try #require(observations.first?["payload"] as? [String: Any])
+        let measuredTimings = try #require(measuredPayload["timings"] as? [String: Any])
+        let replayPhases = try #require(measuredTimings["replay_phases"] as? [String: Any])
+        #expect(Set(replayPhases.keys) == [
+            "action_cache_query_sum_ns",
+            "cached_output_inspection_sum_ns",
+            "replay_instance_creation_duration_ns",
+            "replay_operations_wall_duration_ns",
+            "opaque_replay_call_sum_ns",
+            "stream_collection_sum_ns",
+            "post_replay_validation_duration_ns",
+        ])
+        #expect(replayPhases["action_cache_query_sum_ns"] as? Int == 101)
+        #expect(replayPhases["cached_output_inspection_sum_ns"] is NSNull)
+        #expect(replayPhases["replay_instance_creation_duration_ns"] as? Int == 103)
+        #expect(replayPhases["replay_operations_wall_duration_ns"] as? Int == 304)
+        #expect(replayPhases["opaque_replay_call_sum_ns"] as? Int == 105)
+        #expect(replayPhases["stream_collection_sum_ns"] as? Int == 106)
+        #expect(replayPhases["post_replay_validation_duration_ns"] as? Int == 107)
+
+        let absentPayload = try #require(observations.last?["payload"] as? [String: Any])
+        let absentTimings = try #require(absentPayload["timings"] as? [String: Any])
+        #expect(absentTimings["replay_phases"] is NSNull)
+    }
+    #endif
+
     #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
     @Test func unsafeTrustExperimentEmitsDistinctTerminalObservation() throws {
         let taskIdentifier = TaskIdentifier(rawValue: "unsafe-trust-task")
@@ -370,7 +457,7 @@ private let expectedAcceleratorTraceSchemaMinor = 2
         writer.flushForTesting()
 
         let event = try #require(try sink.events().first { $0["event"] as? String == "cache_observation" })
-        #expect(event["schema_minor"] as? Int == 3)
+        #expect(event["schema_minor"] as? Int == expectedAcceleratorTraceSchemaMinor)
         let payload = try #require(event["payload"] as? [String: Any])
         #expect(payload["mode"] as? String == "trust")
         #expect(payload["outcome"] as? String == "unsafe_trust_hit")

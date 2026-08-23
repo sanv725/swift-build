@@ -1020,6 +1020,93 @@ fileprivate struct SwiftCacheOperationsTests {
         #endif
     }
 
+    @Test
+    func replayStreamPhaseTimingsDefaultToAbsent() {
+        let streams = SwiftCacheReplayStreams(standardOutput: "stdout", standardError: "stderr")
+        #expect(streams.opaqueReplayCallDurationNS == nil)
+        #expect(streams.streamCollectionDurationNS == nil)
+    }
+
+    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_REPLAY_PHASE_INSTRUMENTATION
+    @Test
+    func unsafeReplayPhaseInstrumentationPopulatesReachedPhasesAndFixedStreamSums() throws {
+        let fs = PseudoFS()
+        let firstOutput = Path("/first.o")
+        let secondOutput = Path("/second.swiftmodule")
+        let operations = TestSwiftCacheOperations(
+            queries: ["first": .hit(1), "second": .hit(2)],
+            outputs: [
+                1: [.init(kindName: "object", isMaterialized: true)],
+                2: [.init(kindName: "swiftmodule", isMaterialized: true)],
+            ],
+            replayStreamsByCompilation: [
+                1: .init(
+                    standardOutput: "stdout-1",
+                    standardError: "stderr-1",
+                    opaqueReplayCallDurationNS: 17,
+                    streamCollectionDurationNS: 23
+                ),
+                2: .init(
+                    standardOutput: "stdout-2",
+                    standardError: "stderr-2",
+                    opaqueReplayCallDurationNS: 19,
+                    streamCollectionDurationNS: 29
+                ),
+            ]
+        )
+        operations.replaySideEffect = { compilation in
+            let output = compilation == 1 ? firstOutput : secondOutput
+            try fs.write(output, contents: ByteString(encodingAsUTF8: "cached-\(compilation)"))
+        }
+
+        let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .trust,
+            operations: operations,
+            cacheKeys: ["first", "second"],
+            expectedOutputKindGroups: [["object"], ["swiftmodule"]],
+            plannedOutputs: [firstOutput, secondOutput],
+            commandLine: ["swift-frontend", "-c"],
+            fs: fs
+        )
+
+        #expect(preparation.outcome == .unsafeTrustHit)
+        #expect(preparation.replayDurationNS != nil)
+        let phases = try #require(preparation.replayPhaseTimings)
+        #expect(phases.actionCacheQuerySumNS != nil)
+        #expect(phases.cachedOutputInspectionSumNS != nil)
+        #expect(phases.replayInstanceCreationDurationNS != nil)
+        #expect(phases.replayOperationsWallDurationNS != nil)
+        #expect(phases.opaqueReplayCallSumNS == 36)
+        #expect(phases.streamCollectionSumNS == 52)
+        #expect(phases.postReplayValidationDurationNS != nil)
+        #expect(preparation.replayStreams?.map(\.standardOutput) == ["stdout-1", "stdout-2"])
+    }
+
+    @Test
+    func unsafeReplayPhaseInstrumentationLeavesUnreachedPhasesAbsent() throws {
+        let operations = TestSwiftCacheOperations(queries: ["missing": .miss], outputs: [:])
+        let preparation = SwiftDriverJobTaskAction.prepareAcceleratorCache(
+            mode: .trust,
+            operations: operations,
+            cacheKeys: ["missing"],
+            expectedOutputKindGroups: [["object"]],
+            plannedOutputs: [Path("/missing.o")],
+            commandLine: ["swift-frontend", "-c"],
+            fs: PseudoFS()
+        )
+
+        #expect(preparation.outcome == .miss)
+        let phases = try #require(preparation.replayPhaseTimings)
+        #expect(phases.actionCacheQuerySumNS != nil)
+        #expect(phases.cachedOutputInspectionSumNS == nil)
+        #expect(phases.replayInstanceCreationDurationNS == nil)
+        #expect(phases.replayOperationsWallDurationNS == nil)
+        #expect(phases.opaqueReplayCallSumNS == nil)
+        #expect(phases.streamCollectionSumNS == nil)
+        #expect(phases.postReplayValidationDurationNS == nil)
+    }
+    #endif
+
     #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
     @Test
     func unsafeSemanticOutputProfilesRequirePinnedPlannedShapes() throws {

@@ -17,6 +17,13 @@ public import SWBUtil
 public import SWBLLBuild
 import SWBProtocol
 
+#if SWIFT_BUILD_ACCELERATOR_UNSAFE_REPLAY_PHASE_INSTRUMENTATION && !SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+#error("unsafe Swift cache replay phase instrumentation requires the unsafe trust experiment")
+#endif
+#if SWIFT_BUILD_ACCELERATOR_UNSAFE_REPLAY_PHASE_INSTRUMENTATION && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
+#error("unsafe Swift cache replay phase instrumentation currently supports sequential replay only")
+#endif
+
 #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
 // Candidate widths are separate compile definitions so every measured service
 // has one receipt-bound value. Omitting them preserves the commissioned width 10.
@@ -69,10 +76,19 @@ package struct SwiftCacheCachedOutput: Sendable, Equatable {
 package struct SwiftCacheReplayStreams: Sendable, Equatable {
     package let standardOutput: String
     package let standardError: String
+    package let opaqueReplayCallDurationNS: UInt64?
+    package let streamCollectionDurationNS: UInt64?
 
-    package init(standardOutput: String, standardError: String) {
+    package init(
+        standardOutput: String,
+        standardError: String,
+        opaqueReplayCallDurationNS: UInt64? = nil,
+        streamCollectionDurationNS: UInt64? = nil
+    ) {
         self.standardOutput = standardOutput
         self.standardError = standardError
+        self.opaqueReplayCallDurationNS = opaqueReplayCallDurationNS
+        self.streamCollectionDurationNS = streamCollectionDurationNS
     }
 }
 
@@ -154,8 +170,23 @@ package struct SwiftCASCacheOperations: SwiftCacheOperations {
     }
 
     package func replayCompilation(_ compilation: SwiftCachedCompilation, using instance: SwiftCacheReplayInstance) throws -> SwiftCacheReplayStreams {
+        #if SWIFT_BUILD_ACCELERATOR_UNSAFE_REPLAY_PHASE_INSTRUMENTATION
+        let opaqueReplayTimer = ElapsedTimer()
+        let result = try databases.replayCompilation(instance: instance, compilation: compilation)
+        let opaqueReplayCallDurationNS = opaqueReplayTimer.elapsedTime().nanoseconds
+        let streamCollectionTimer = ElapsedTimer()
+        let standardOutput = try result.getStdOut()
+        let standardError = try result.getStdErr()
+        return SwiftCacheReplayStreams(
+            standardOutput: standardOutput,
+            standardError: standardError,
+            opaqueReplayCallDurationNS: opaqueReplayCallDurationNS,
+            streamCollectionDurationNS: streamCollectionTimer.elapsedTime().nanoseconds
+        )
+        #else
         let result = try databases.replayCompilation(instance: instance, compilation: compilation)
         return try SwiftCacheReplayStreams(standardOutput: result.getStdOut(), standardError: result.getStdErr())
+        #endif
     }
 
     #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
@@ -562,6 +593,7 @@ package struct SwiftAcceleratorCachePreparation: Sendable, Equatable {
     package let cachedOutputCount: Int?
     package let shadowManifest: SwiftCacheOutputManifest?
     package let replayStreams: [SwiftCacheReplayStreams]?
+    package let replayPhaseTimings: TaskCacheObservation.ReplayPhaseTimings?
 
     package init(
         outcome: SwiftAcceleratorCachePreparationOutcome,
@@ -572,7 +604,8 @@ package struct SwiftAcceleratorCachePreparation: Sendable, Equatable {
         scrubSucceeded: Bool? = nil,
         cachedOutputCount: Int? = nil,
         shadowManifest: SwiftCacheOutputManifest? = nil,
-        replayStreams: [SwiftCacheReplayStreams]? = nil
+        replayStreams: [SwiftCacheReplayStreams]? = nil,
+        replayPhaseTimings: TaskCacheObservation.ReplayPhaseTimings? = nil
     ) {
         self.outcome = outcome
         self.lookupDurationNS = lookupDurationNS
@@ -583,6 +616,7 @@ package struct SwiftAcceleratorCachePreparation: Sendable, Equatable {
         self.cachedOutputCount = cachedOutputCount
         self.shadowManifest = shadowManifest
         self.replayStreams = replayStreams
+        self.replayPhaseTimings = replayPhaseTimings
     }
 }
 
@@ -1174,6 +1208,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             var verificationDurationNS: UInt64?
             var scrubDurationNS: UInt64?
             var compilerDurationNS: UInt64?
+            var observationReplayPhaseTimings: TaskCacheObservation.ReplayPhaseTimings?
             var scrubOutcome: TaskCacheObservation.ScrubOutcome = .notRun
             var observedOutputCount: Int?
             var observedOutputBytes: UInt64?
@@ -1203,6 +1238,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                         verificationDurationNS: verificationDurationNS,
                         scrubDurationNS: scrubDurationNS,
                         compilerDurationNS: compilerDurationNS,
+                        replayPhaseTimings: observationReplayPhaseTimings,
                         scrubOutcome: scrubOutcome,
                         outputCount: observedOutputCount,
                         outputBytes: observedOutputBytes,
@@ -1422,6 +1458,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                         materializationDurationNS = preparation.replayDurationNS
                         verificationDurationNS = preparation.manifestDurationNS
                         scrubDurationNS = preparation.scrubDurationNS
+                        observationReplayPhaseTimings = preparation.replayPhaseTimings
                         observedOutputCount = preparation.shadowManifest?.entries.count ?? preparation.cachedOutputCount
                         if let totalBytes = preparation.shadowManifest?.totalBytes {
                             observedOutputBytes = UInt64(totalBytes)
@@ -1695,6 +1732,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         expectedOutputKindGroups: [[String]],
         semanticOutputJobKind: SwiftCacheSemanticOutputJobKind = .other,
         allowUnsafeSemanticOutputAdapter: Bool = false,
+        recordActionCacheQueryDuration: ((UInt64) -> Void)? = nil,
+        recordCachedOutputInspectionDuration: ((UInt64) -> Void)? = nil,
         isCancelled: () -> Bool = { false }
     ) throws -> SwiftCacheProbeResult<Operations.Compilation> {
         guard !cacheKeys.isEmpty else {
@@ -1728,12 +1767,30 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         compilations.reserveCapacity(cacheKeys.count)
         for (cacheKey, expectedOutputKindNames) in zip(cacheKeys, expectedOutputKindGroups) {
             if isCancelled() { throw CancellationError() }
+            #if SWIFT_BUILD_ACCELERATOR_UNSAFE_REPLAY_PHASE_INSTRUMENTATION
+            let queriedCompilation: Operations.Compilation?
+            do {
+                let timer = ElapsedTimer()
+                defer { recordActionCacheQueryDuration?(timer.elapsedTime().nanoseconds) }
+                queriedCompilation = try operations.queryLocalCacheKey(cacheKey)
+            }
+            #else
             let queriedCompilation = try operations.queryLocalCacheKey(cacheKey)
+            #endif
             if isCancelled() { throw CancellationError() }
             guard let compilation = queriedCompilation else {
                 return .miss(.missingKey)
             }
+            #if SWIFT_BUILD_ACCELERATOR_UNSAFE_REPLAY_PHASE_INSTRUMENTATION
+            let outputs: [SwiftCacheCachedOutput]
+            do {
+                let timer = ElapsedTimer()
+                defer { recordCachedOutputInspectionDuration?(timer.elapsedTime().nanoseconds) }
+                outputs = try operations.cachedOutputs(for: compilation)
+            }
+            #else
             let outputs = try operations.cachedOutputs(for: compilation)
+            #endif
             if isCancelled() { throw CancellationError() }
             guard !outputs.isEmpty, outputs.allSatisfy(\.isMaterialized) else {
                 return .miss(.nonMaterializedOutput)
@@ -1865,12 +1922,23 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         commandLine: [String],
         captureStreams: Bool = false,
         pauseBeforeMaterialization: (() throws -> Void)? = nil,
+        recordReplayInstanceCreationDuration: ((UInt64) -> Void)? = nil,
+        recordReplayOperationsWallDuration: ((UInt64) -> Void)? = nil,
         isCancelled: () -> Bool = { false },
         isQuarantined: () -> Bool = { false }
     ) throws -> [SwiftCacheReplayStreams]? {
         if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
         if isCancelled() { throw CancellationError() }
+        #if SWIFT_BUILD_ACCELERATOR_UNSAFE_REPLAY_PHASE_INSTRUMENTATION
+        let instance: Operations.ReplayInstance
+        do {
+            let timer = ElapsedTimer()
+            defer { recordReplayInstanceCreationDuration?(timer.elapsedTime().nanoseconds) }
+            instance = try operations.createReplayInstance(commandLine: Array(commandLine.dropFirst()))
+        }
+        #else
         let instance = try operations.createReplayInstance(commandLine: Array(commandLine.dropFirst()))
+        #endif
         if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
         if isCancelled() { throw CancellationError() }
         try pauseBeforeMaterialization?()
@@ -1879,6 +1947,20 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
 
         var streams: [SwiftCacheReplayStreams]? = captureStreams ? [] : nil
         streams?.reserveCapacity(compilations.count)
+        #if SWIFT_BUILD_ACCELERATOR_UNSAFE_REPLAY_PHASE_INSTRUMENTATION
+        do {
+            let timer = ElapsedTimer()
+            defer { recordReplayOperationsWallDuration?(timer.elapsedTime().nanoseconds) }
+            for compilation in compilations {
+                if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
+                if isCancelled() { throw CancellationError() }
+                let replayStreams = try operations.replayCompilation(compilation, using: instance)
+                streams?.append(replayStreams)
+                if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
+                if isCancelled() { throw CancellationError() }
+            }
+        }
+        #else
         for compilation in compilations {
             if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
             if isCancelled() { throw CancellationError() }
@@ -1887,6 +1969,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
             if isCancelled() { throw CancellationError() }
         }
+        #endif
         return streams
     }
 
@@ -2212,6 +2295,35 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         let claimAtCheckpoint: (SwiftAcceleratorCacheInjectedFault) -> Bool = { checkpoint in
             activeInjectedFault == checkpoint || (mode == .verify && claimInjectedFault?(checkpoint) == true)
         }
+        #if SWIFT_BUILD_ACCELERATOR_UNSAFE_REPLAY_PHASE_INSTRUMENTATION
+        var actionCacheQuerySumNS: UInt64?
+        var cachedOutputInspectionSumNS: UInt64?
+        var replayInstanceCreationDurationNS: UInt64?
+        var replayOperationsWallDurationNS: UInt64?
+        var opaqueReplayCallSumNS: UInt64?
+        var streamCollectionSumNS: UInt64?
+        var postReplayValidationDurationNS: UInt64?
+
+        func addDuration(_ duration: UInt64, to total: inout UInt64?) {
+            total = (total ?? 0) &+ duration
+        }
+
+        func currentReplayPhaseTimings() -> TaskCacheObservation.ReplayPhaseTimings? {
+            .init(
+                actionCacheQuerySumNS: actionCacheQuerySumNS,
+                cachedOutputInspectionSumNS: cachedOutputInspectionSumNS,
+                replayInstanceCreationDurationNS: replayInstanceCreationDurationNS,
+                replayOperationsWallDurationNS: replayOperationsWallDurationNS,
+                opaqueReplayCallSumNS: opaqueReplayCallSumNS,
+                streamCollectionSumNS: streamCollectionSumNS,
+                postReplayValidationDurationNS: postReplayValidationDurationNS
+            )
+        }
+        #else
+        func currentReplayPhaseTimings() -> TaskCacheObservation.ReplayPhaseTimings? {
+            nil
+        }
+        #endif
         let lookupTimer = ElapsedTimer()
         let probe: SwiftCacheProbeResult<Operations.Compilation>
         do {
@@ -2223,28 +2335,57 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             #else
             let allowUnsafeSemanticOutputAdapter = false
             #endif
+            #if SWIFT_BUILD_ACCELERATOR_UNSAFE_REPLAY_PHASE_INSTRUMENTATION
+            let recordActionCacheQueryDuration: ((UInt64) -> Void)? = {
+                addDuration($0, to: &actionCacheQuerySumNS)
+            }
+            let recordCachedOutputInspectionDuration: ((UInt64) -> Void)? = {
+                addDuration($0, to: &cachedOutputInspectionSumNS)
+            }
+            #else
+            let recordActionCacheQueryDuration: ((UInt64) -> Void)? = nil
+            let recordCachedOutputInspectionDuration: ((UInt64) -> Void)? = nil
+            #endif
             probe = try probeCache(
                 operations: operations,
                 cacheKeys: cacheKeys,
                 expectedOutputKindGroups: expectedOutputKindGroups,
                 semanticOutputJobKind: semanticOutputJobKind,
                 allowUnsafeSemanticOutputAdapter: allowUnsafeSemanticOutputAdapter,
+                recordActionCacheQueryDuration: recordActionCacheQueryDuration,
+                recordCachedOutputInspectionDuration: recordCachedOutputInspectionDuration,
                 isCancelled: isCancelled
             )
             try activeCancellationPause?(.queryStage)
         } catch is CancellationError {
-            return .init(outcome: .cancelled, lookupDurationNS: lookupTimer.elapsedTime().nanoseconds)
+            return .init(
+                outcome: .cancelled,
+                lookupDurationNS: lookupTimer.elapsedTime().nanoseconds,
+                replayPhaseTimings: currentReplayPhaseTimings()
+            )
         } catch {
-            return .init(outcome: .queryError, lookupDurationNS: lookupTimer.elapsedTime().nanoseconds)
+            return .init(
+                outcome: .queryError,
+                lookupDurationNS: lookupTimer.elapsedTime().nanoseconds,
+                replayPhaseTimings: currentReplayPhaseTimings()
+            )
         }
         let lookupDurationNS = lookupTimer.elapsedTime().nanoseconds
         if isCancelled() {
-            return .init(outcome: .cancelled, lookupDurationNS: lookupDurationNS)
+            return .init(
+                outcome: .cancelled,
+                lookupDurationNS: lookupDurationNS,
+                replayPhaseTimings: currentReplayPhaseTimings()
+            )
         }
 
         switch probe {
         case .miss(.unsupportedOutput):
-            return .init(outcome: .unsupportedOutput, lookupDurationNS: lookupDurationNS)
+            return .init(
+                outcome: .unsupportedOutput,
+                lookupDurationNS: lookupDurationNS,
+                replayPhaseTimings: currentReplayPhaseTimings()
+            )
         case .miss:
             #if canImport(Darwin)
             if let activeOutputAccessPlan {
@@ -2254,23 +2395,42 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                         isCancelled: isCancelled
                     )
                 } catch is CancellationError {
-                    return .init(outcome: .cancelled, lookupDurationNS: lookupDurationNS)
+                    return .init(
+                        outcome: .cancelled,
+                        lookupDurationNS: lookupDurationNS,
+                        replayPhaseTimings: currentReplayPhaseTimings()
+                    )
                 } catch {
                     quarantineCache()
                     return .init(
                         outcome: .scrubFailure,
                         lookupDurationNS: lookupDurationNS,
-                        scrubSucceeded: false
+                        scrubSucceeded: false,
+                        replayPhaseTimings: currentReplayPhaseTimings()
                     )
                 }
             }
             #endif
-            return .init(outcome: .miss, lookupDurationNS: lookupDurationNS)
+            return .init(
+                outcome: .miss,
+                lookupDurationNS: lookupDurationNS,
+                replayPhaseTimings: currentReplayPhaseTimings()
+            )
         case .hit(_, let outputCount) where mode == .observe:
-            return .init(outcome: .wouldHit, lookupDurationNS: lookupDurationNS, cachedOutputCount: outputCount)
+            return .init(
+                outcome: .wouldHit,
+                lookupDurationNS: lookupDurationNS,
+                cachedOutputCount: outputCount,
+                replayPhaseTimings: currentReplayPhaseTimings()
+            )
         case .hit(let compilations, let outputCount):
             if isQuarantined() {
-                return .init(outcome: .quarantined, lookupDurationNS: lookupDurationNS, cachedOutputCount: outputCount)
+                return .init(
+                    outcome: .quarantined,
+                    lookupDurationNS: lookupDurationNS,
+                    cachedOutputCount: outputCount,
+                    replayPhaseTimings: currentReplayPhaseTimings()
+                )
             }
             // Remove every valid preexisting output before replay. Otherwise an
             // incomplete replay could make a stale file look like a cache hit.
@@ -2291,7 +2451,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                     lookupDurationNS: lookupDurationNS,
                     scrubDurationNS: preScrubTimer.elapsedTime().nanoseconds,
                     scrubSucceeded: true,
-                    cachedOutputCount: outputCount
+                    cachedOutputCount: outputCount,
+                    replayPhaseTimings: currentReplayPhaseTimings()
                 )
             } catch {
                 quarantineCache()
@@ -2300,7 +2461,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                     lookupDurationNS: lookupDurationNS,
                     scrubDurationNS: preScrubTimer.elapsedTime().nanoseconds,
                     scrubSucceeded: false,
-                    cachedOutputCount: outputCount
+                    cachedOutputCount: outputCount,
+                    replayPhaseTimings: currentReplayPhaseTimings()
                 )
             }
             var totalScrubDurationNS = preScrubTimer.elapsedTime().nanoseconds
@@ -2310,7 +2472,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                     lookupDurationNS: lookupDurationNS,
                     scrubDurationNS: totalScrubDurationNS,
                     scrubSucceeded: true,
-                    cachedOutputCount: outputCount
+                    cachedOutputCount: outputCount,
+                    replayPhaseTimings: currentReplayPhaseTimings()
                 )
             }
 
@@ -2341,6 +2504,17 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             #if canImport(Darwin)
             var replayIdentitiesCaptured = false
             #endif
+            #if SWIFT_BUILD_ACCELERATOR_UNSAFE_REPLAY_PHASE_INSTRUMENTATION
+            let recordReplayInstanceCreationDuration: ((UInt64) -> Void)? = {
+                replayInstanceCreationDurationNS = $0
+            }
+            let recordReplayOperationsWallDuration: ((UInt64) -> Void)? = {
+                replayOperationsWallDurationNS = $0
+            }
+            #else
+            let recordReplayInstanceCreationDuration: ((UInt64) -> Void)? = nil
+            let recordReplayOperationsWallDuration: ((UInt64) -> Void)? = nil
+            #endif
             do {
                 if claimAtCheckpoint(.replayError) {
                     throw SwiftAcceleratorCacheInjectedError.injected
@@ -2367,31 +2541,49 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                     pauseBeforeMaterialization: {
                         try activeCancellationPause?(.replayStage)
                     },
+                    recordReplayInstanceCreationDuration: recordReplayInstanceCreationDuration,
+                    recordReplayOperationsWallDuration: recordReplayOperationsWallDuration,
                     isCancelled: isCancelled,
                     isQuarantined: isQuarantined
                 )
                 #endif
-                #if canImport(Darwin)
-                if let outputAccessSession {
-                    try outputAccessSession.captureReplayOutputs()
-                    replayIdentitiesCaptured = true
+                #if SWIFT_BUILD_ACCELERATOR_UNSAFE_REPLAY_PHASE_INSTRUMENTATION
+                for streams in capturedReplayStreams ?? [] {
+                    if let duration = streams.opaqueReplayCallDurationNS {
+                        addDuration(duration, to: &opaqueReplayCallSumNS)
+                    }
+                    if let duration = streams.streamCollectionDurationNS {
+                        addDuration(duration, to: &streamCollectionSumNS)
+                    }
                 }
                 #endif
-                #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
-                if mode == .trust {
+                do {
+                    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_REPLAY_PHASE_INSTRUMENTATION
+                    let timer = ElapsedTimer()
+                    defer { postReplayValidationDurationNS = timer.elapsedTime().nanoseconds }
+                    #endif
                     #if canImport(Darwin)
                     if let outputAccessSession {
-                        try outputAccessSession.validateCompleteReplayOutputs(expectedCount: plannedOutputs.count)
-                    } else {
-                        try validateReplayCompleteness(plannedOutputs, fs: fs)
+                        try outputAccessSession.captureReplayOutputs()
+                        replayIdentitiesCaptured = true
                     }
-                    #else
-                    try validateReplayCompleteness(plannedOutputs, fs: fs)
                     #endif
+                    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+                    if mode == .trust {
+                        #if canImport(Darwin)
+                        if let outputAccessSession {
+                            try outputAccessSession.validateCompleteReplayOutputs(expectedCount: plannedOutputs.count)
+                        } else {
+                            try validateReplayCompleteness(plannedOutputs, fs: fs)
+                        }
+                        #else
+                        try validateReplayCompleteness(plannedOutputs, fs: fs)
+                        #endif
+                    }
+                    #endif
+                    if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
+                    try activeCancellationPause?(.postMaterialization)
                 }
-                #endif
-                if isQuarantined() { throw SwiftAcceleratorCacheQuarantinedError() }
-                try activeCancellationPause?(.postMaterialization)
             } catch {
                 replayFailure = error
             }
@@ -2399,6 +2591,14 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             #if canImport(Darwin)
             if let outputAccessSession, !replayIdentitiesCaptured {
                 do {
+                    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_REPLAY_PHASE_INSTRUMENTATION
+                    let timer = ElapsedTimer()
+                    defer {
+                        if postReplayValidationDurationNS == nil {
+                            postReplayValidationDurationNS = timer.elapsedTime().nanoseconds
+                        }
+                    }
+                    #endif
                     try outputAccessSession.captureReplayOutputs()
                     replayIdentitiesCaptured = true
                 } catch {
@@ -2430,7 +2630,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                         replayDurationNS: replayDurationNS,
                         scrubDurationNS: totalScrubDurationNS,
                         cachedOutputCount: outputCount,
-                        replayStreams: capturedReplayStreams
+                        replayStreams: capturedReplayStreams,
+                        replayPhaseTimings: currentReplayPhaseTimings()
                     )
                 } else {
                     quarantineCache()
@@ -2500,7 +2701,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                     scrubDurationNS: totalScrubDurationNS,
                     scrubSucceeded: true,
                     cachedOutputCount: outputCount,
-                    shadowManifest: nil
+                    shadowManifest: nil,
+                    replayPhaseTimings: currentReplayPhaseTimings()
                 )
             } catch {
                 quarantineCache()
@@ -2513,7 +2715,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                     scrubDurationNS: totalScrubDurationNS,
                     scrubSucceeded: false,
                     cachedOutputCount: outputCount,
-                    shadowManifest: nil
+                    shadowManifest: nil,
+                    replayPhaseTimings: currentReplayPhaseTimings()
                 )
             }
             totalScrubDurationNS += scrubTimer.elapsedTime().nanoseconds
@@ -2533,7 +2736,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                         scrubDurationNS: totalScrubDurationNS,
                         scrubSucceeded: true,
                         cachedOutputCount: outputCount,
-                        shadowManifest: nil
+                        shadowManifest: nil,
+                        replayPhaseTimings: currentReplayPhaseTimings()
                     )
                 } catch {
                     quarantineCache()
@@ -2545,7 +2749,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                         scrubDurationNS: totalScrubDurationNS,
                         scrubSucceeded: false,
                         cachedOutputCount: outputCount,
-                        shadowManifest: nil
+                        shadowManifest: nil,
+                        replayPhaseTimings: currentReplayPhaseTimings()
                     )
                 }
             }
@@ -2558,7 +2763,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 scrubDurationNS: totalScrubDurationNS,
                 scrubSucceeded: true,
                 cachedOutputCount: outputCount,
-                shadowManifest: shadowManifest
+                shadowManifest: shadowManifest,
+                replayPhaseTimings: currentReplayPhaseTimings()
             )
         }
     }

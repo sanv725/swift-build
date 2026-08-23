@@ -605,6 +605,34 @@ package protocol BuildOutputDelegate: TargetDiagnosticProducingDelegate {
 /// client/service protocol. Raw cache keys remain in process and are converted
 /// to keyed identities by the trace writer before an event is enqueued.
 package struct TaskCacheObservation: Equatable, Sendable {
+    package struct ReplayPhaseTimings: Equatable, Sendable {
+        package let actionCacheQuerySumNS: UInt64?
+        package let cachedOutputInspectionSumNS: UInt64?
+        package let replayInstanceCreationDurationNS: UInt64?
+        package let replayOperationsWallDurationNS: UInt64?
+        package let opaqueReplayCallSumNS: UInt64?
+        package let streamCollectionSumNS: UInt64?
+        package let postReplayValidationDurationNS: UInt64?
+
+        package init(
+            actionCacheQuerySumNS: UInt64? = nil,
+            cachedOutputInspectionSumNS: UInt64? = nil,
+            replayInstanceCreationDurationNS: UInt64? = nil,
+            replayOperationsWallDurationNS: UInt64? = nil,
+            opaqueReplayCallSumNS: UInt64? = nil,
+            streamCollectionSumNS: UInt64? = nil,
+            postReplayValidationDurationNS: UInt64? = nil
+        ) {
+            self.actionCacheQuerySumNS = actionCacheQuerySumNS
+            self.cachedOutputInspectionSumNS = cachedOutputInspectionSumNS
+            self.replayInstanceCreationDurationNS = replayInstanceCreationDurationNS
+            self.replayOperationsWallDurationNS = replayOperationsWallDurationNS
+            self.opaqueReplayCallSumNS = opaqueReplayCallSumNS
+            self.streamCollectionSumNS = streamCollectionSumNS
+            self.postReplayValidationDurationNS = postReplayValidationDurationNS
+        }
+    }
+
     package enum Mode: String, Equatable, Sendable {
         case stock
         case observe
@@ -696,6 +724,7 @@ package struct TaskCacheObservation: Equatable, Sendable {
     package let verificationDurationNS: UInt64?
     package let scrubDurationNS: UInt64?
     package let compilerDurationNS: UInt64?
+    package let replayPhaseTimings: ReplayPhaseTimings?
     package let scrubOutcome: ScrubOutcome
     package let outputCount: Int?
     package let outputBytes: UInt64?
@@ -716,6 +745,7 @@ package struct TaskCacheObservation: Equatable, Sendable {
         verificationDurationNS: UInt64? = nil,
         scrubDurationNS: UInt64? = nil,
         compilerDurationNS: UInt64? = nil,
+        replayPhaseTimings: ReplayPhaseTimings? = nil,
         scrubOutcome: ScrubOutcome = .notRun,
         outputCount: Int? = nil,
         outputBytes: UInt64? = nil,
@@ -735,6 +765,7 @@ package struct TaskCacheObservation: Equatable, Sendable {
         self.verificationDurationNS = verificationDurationNS
         self.scrubDurationNS = scrubDurationNS
         self.compilerDurationNS = compilerDurationNS
+        self.replayPhaseTimings = replayPhaseTimings
         self.scrubOutcome = scrubOutcome
         self.outputCount = outputCount
         self.outputBytes = outputBytes

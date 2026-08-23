@@ -143,7 +143,9 @@ package final class AcceleratorTraceWriter: @unchecked Sendable {
 
     private struct Event: Encodable, Sendable {
         let schemaMajor = 1
-        #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+        #if SWIFT_BUILD_ACCELERATOR_UNSAFE_REPLAY_PHASE_INSTRUMENTATION
+        let schemaMinor = 4
+        #elseif SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
         let schemaMinor = 3
         #else
         let schemaMinor = 2
@@ -363,6 +365,36 @@ package final class AcceleratorTraceWriter: @unchecked Sendable {
                 continue
             }
             let lookupID = nextLookupID()
+            var observationTimings: [String: AcceleratorTraceValue] = [
+                "lookup_duration_ns": observation.lookupDurationNS.map(AcceleratorTraceValue.unsigned) ?? .null,
+                "materialization_duration_ns": observation.materializationDurationNS.map(AcceleratorTraceValue.unsigned) ?? .null,
+                "verification_duration_ns": observation.verificationDurationNS.map(AcceleratorTraceValue.unsigned) ?? .null,
+                "scrub_duration_ns": observation.scrubDurationNS.map(AcceleratorTraceValue.unsigned) ?? .null,
+                "compiler_duration_ns": observation.compilerDurationNS.map(AcceleratorTraceValue.unsigned) ?? .null,
+            ]
+            #if SWIFT_BUILD_ACCELERATOR_UNSAFE_REPLAY_PHASE_INSTRUMENTATION
+            if let timings = observation.replayPhaseTimings {
+                let actionCacheQuery = timings.actionCacheQuerySumNS.map(AcceleratorTraceValue.unsigned) ?? .null
+                let cachedOutputInspection = timings.cachedOutputInspectionSumNS.map(AcceleratorTraceValue.unsigned) ?? .null
+                let replayInstanceCreation = timings.replayInstanceCreationDurationNS.map(AcceleratorTraceValue.unsigned) ?? .null
+                let replayOperationsWall = timings.replayOperationsWallDurationNS.map(AcceleratorTraceValue.unsigned) ?? .null
+                let opaqueReplayCall = timings.opaqueReplayCallSumNS.map(AcceleratorTraceValue.unsigned) ?? .null
+                let streamCollection = timings.streamCollectionSumNS.map(AcceleratorTraceValue.unsigned) ?? .null
+                let postReplayValidation = timings.postReplayValidationDurationNS.map(AcceleratorTraceValue.unsigned) ?? .null
+                let replayPhaseValues: [String: AcceleratorTraceValue] = [
+                    "action_cache_query_sum_ns": actionCacheQuery,
+                    "cached_output_inspection_sum_ns": cachedOutputInspection,
+                    "replay_instance_creation_duration_ns": replayInstanceCreation,
+                    "replay_operations_wall_duration_ns": replayOperationsWall,
+                    "opaque_replay_call_sum_ns": opaqueReplayCall,
+                    "stream_collection_sum_ns": streamCollection,
+                    "post_replay_validation_duration_ns": postReplayValidation,
+                ]
+                observationTimings["replay_phases"] = .object(replayPhaseValues)
+            } else {
+                observationTimings["replay_phases"] = .null
+            }
+            #endif
             emit(event: "cache_observation", payload: [
                 "task_id": .string(traceTaskID),
                 "cache_kind": .string("compiler"),
@@ -376,13 +408,7 @@ package final class AcceleratorTraceWriter: @unchecked Sendable {
                 "key_identity": keyIdentity.map(AcceleratorTraceValue.string) ?? .null,
                 "key_identity_scope": .string("trace"),
                 "key_count": .integer(observation.keyCount),
-                "timings": .object([
-                    "lookup_duration_ns": observation.lookupDurationNS.map(AcceleratorTraceValue.unsigned) ?? .null,
-                    "materialization_duration_ns": observation.materializationDurationNS.map(AcceleratorTraceValue.unsigned) ?? .null,
-                    "verification_duration_ns": observation.verificationDurationNS.map(AcceleratorTraceValue.unsigned) ?? .null,
-                    "scrub_duration_ns": observation.scrubDurationNS.map(AcceleratorTraceValue.unsigned) ?? .null,
-                    "compiler_duration_ns": observation.compilerDurationNS.map(AcceleratorTraceValue.unsigned) ?? .null,
-                ]),
+                "timings": .object(observationTimings),
                 "outputs": .object([
                     "count": observation.outputCount.map(AcceleratorTraceValue.integer) ?? .null,
                     "bytes": observation.outputBytes.map(AcceleratorTraceValue.unsigned) ?? .null,
