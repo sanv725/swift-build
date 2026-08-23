@@ -1568,7 +1568,8 @@ fileprivate struct SwiftCacheOperationsTests {
 
         let maximumParallelism = SwiftDriverJobTaskAction.unsafeParallelReplayMaximumParallelism
         let executor = UnsafePersistentSwiftCacheReplayExecutor(
-            maximumParallelism: maximumParallelism
+            maximumParallelism: maximumParallelism,
+            workerCount: maximumParallelism
         )
         let observations = SWBMutex(ObservationState())
 
@@ -1589,6 +1590,47 @@ fileprivate struct SwiftCacheOperationsTests {
         #expect(result.maximumActiveCount == maximumParallelism)
         #expect(result.workerNamesByBatch[0].count == maximumParallelism)
         #expect(result.workerNamesByBatch[1] == result.workerNamesByBatch[0])
+    }
+
+    @Test
+    func unsafePersistentReplayExecutorPreservesOuterBatchConcurrency() {
+        struct ObservationState {
+            var activeByBatch = [0, 0]
+            var maximumActiveByBatch = [0, 0]
+            var totalActive = 0
+            var maximumTotalActive = 0
+        }
+
+        let perBatchWidth = 3
+        let executor = UnsafePersistentSwiftCacheReplayExecutor(
+            maximumParallelism: perBatchWidth,
+            workerCount: perBatchWidth * 2
+        )
+        let observations = SWBMutex(ObservationState())
+
+        SWBQueue.concurrentPerform(iterations: 2) { batchIndex in
+            executor.perform(iterations: perBatchWidth) { _ in
+                observations.withLock { state in
+                    state.activeByBatch[batchIndex] += 1
+                    state.maximumActiveByBatch[batchIndex] = max(
+                        state.maximumActiveByBatch[batchIndex],
+                        state.activeByBatch[batchIndex]
+                    )
+                    state.totalActive += 1
+                    state.maximumTotalActive = max(state.maximumTotalActive, state.totalActive)
+                }
+                Thread.sleep(forTimeInterval: 0.02)
+                observations.withLock { state in
+                    state.activeByBatch[batchIndex] -= 1
+                    state.totalActive -= 1
+                }
+            }
+        }
+
+        let result = observations.withLock { $0 }
+        #expect(result.activeByBatch == [0, 0])
+        #expect(result.maximumActiveByBatch == [perBatchWidth, perBatchWidth])
+        #expect(result.maximumTotalActive == perBatchWidth * 2)
     }
 
     @Test

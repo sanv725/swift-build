@@ -57,14 +57,20 @@ package final class UnsafePersistentSwiftCacheReplayExecutor: @unchecked Sendabl
     }
 
     package let maximumParallelism: Int
+    package let workerCount: Int
     private let state = State()
     private var workers: [Thread] = []
 
-    package init(maximumParallelism: Int) {
+    package init(maximumParallelism: Int, workerCount: Int? = nil) {
         precondition(maximumParallelism > 1)
+        let workerCount = workerCount ?? maximumParallelism
+        precondition(workerCount >= maximumParallelism)
         self.maximumParallelism = maximumParallelism
-        workers = (0..<maximumParallelism).map { workerIndex in
-            let worker = Thread { [state] in
+        self.workerCount = workerCount
+        let readiness = BatchCompletion(remaining: workerCount)
+        workers = (0..<workerCount).map { workerIndex in
+            let worker = Thread { [state, readiness] in
+                readiness.complete()
                 while true {
                     let job: (@Sendable () -> Void)?
                     state.condition.lock()
@@ -96,6 +102,7 @@ package final class UnsafePersistentSwiftCacheReplayExecutor: @unchecked Sendabl
         for worker in workers {
             worker.start()
         }
+        readiness.wait()
     }
 
     deinit {
@@ -172,7 +179,17 @@ public final class DynamicTaskOperationContext {
             if let executor = executors[maximumParallelism] {
                 return executor
             }
-            let executor = UnsafePersistentSwiftCacheReplayExecutor(maximumParallelism: maximumParallelism)
+            // Swift Build already schedules several compile jobs concurrently.
+            // Keep one width-limited lane group available per active processor
+            // so persistence does not collapse that outer concurrency.
+            let workerCount = min(
+                64,
+                max(maximumParallelism, ProcessInfo.processInfo.activeProcessorCount * maximumParallelism)
+            )
+            let executor = UnsafePersistentSwiftCacheReplayExecutor(
+                maximumParallelism: maximumParallelism,
+                workerCount: workerCount
+            )
             executors[maximumParallelism] = executor
             return executor
         }
