@@ -1559,6 +1559,39 @@ fileprivate struct SwiftCacheOperationsTests {
     }
 
     @Test
+    func unsafePersistentReplayExecutorReusesItsBoundedWorkersAcrossBatches() {
+        struct ObservationState {
+            var activeCount = 0
+            var maximumActiveCount = 0
+            var workerNamesByBatch = [Set<String>(), Set<String>()]
+        }
+
+        let maximumParallelism = SwiftDriverJobTaskAction.unsafeParallelReplayMaximumParallelism
+        let executor = UnsafePersistentSwiftCacheReplayExecutor(
+            maximumParallelism: maximumParallelism
+        )
+        let observations = SWBMutex(ObservationState())
+
+        for batchIndex in 0..<2 {
+            executor.perform(iterations: maximumParallelism) { _ in
+                observations.withLock { state in
+                    state.activeCount += 1
+                    state.maximumActiveCount = max(state.maximumActiveCount, state.activeCount)
+                    state.workerNamesByBatch[batchIndex].insert(Thread.current.name ?? "")
+                }
+                Thread.sleep(forTimeInterval: 0.01)
+                observations.withLock { $0.activeCount -= 1 }
+            }
+        }
+
+        let result = observations.withLock { $0 }
+        #expect(result.activeCount == 0)
+        #expect(result.maximumActiveCount == maximumParallelism)
+        #expect(result.workerNamesByBatch[0].count == maximumParallelism)
+        #expect(result.workerNamesByBatch[1] == result.workerNamesByBatch[0])
+    }
+
+    @Test
     func unsafeParallelReplayDrainsStaggeredWorkAndPreservesCompilerKeyStreamOrder() throws {
         let compilations = Array(0..<11)
         let maximumParallelism = SwiftDriverJobTaskAction.unsafeParallelReplayMaximumParallelism

@@ -150,10 +150,26 @@ private struct UnsafeParallelSwiftCASReplayState {
 
 package struct SwiftCASCacheOperations: SwiftCacheOperations {
     package let databases: SwiftCASDatabases
+    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
+    package let unsafeReplayExecutor: UnsafePersistentSwiftCacheReplayExecutor?
+    #endif
 
     package init(databases: SwiftCASDatabases) {
         self.databases = databases
+        #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
+        self.unsafeReplayExecutor = nil
+        #endif
     }
+
+    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
+    package init(
+        databases: SwiftCASDatabases,
+        unsafeReplayExecutor: UnsafePersistentSwiftCacheReplayExecutor?
+    ) {
+        self.databases = databases
+        self.unsafeReplayExecutor = unsafeReplayExecutor
+    }
+    #endif
 
     package func queryLocalCacheKey(_ key: String) throws -> SwiftCachedCompilation? {
         try databases.queryLocalCacheKey(key)
@@ -214,7 +230,7 @@ package struct SwiftCASCacheOperations: SwiftCacheOperations {
             results: Array(repeating: nil, count: compilations.count)
         ))
         let workerCount = min(maximumParallelism, compilations.count)
-        SWBQueue.concurrentPerform(iterations: workerCount) { _ in
+        let replayWorker: @Sendable (Int) -> Void = { _ in
             while true {
                 let index = state.withLock { state -> Int? in
                     guard state.nextIndex < context.compilations.count else { return nil }
@@ -230,6 +246,12 @@ package struct SwiftCASCacheOperations: SwiftCacheOperations {
                 }
                 state.withLock { $0.results[index] = result }
             }
+        }
+        if let unsafeReplayExecutor {
+            precondition(unsafeReplayExecutor.maximumParallelism == maximumParallelism)
+            unsafeReplayExecutor.perform(iterations: workerCount, replayWorker)
+        } else {
+            SWBQueue.concurrentPerform(iterations: workerCount, replayWorker)
         }
         return state.withLock { state in
             state.results.map { result in
@@ -1440,11 +1462,23 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                         let pauseAtCancellationCheckpoint: ((SwiftAcceleratorCacheCancellationCheckpoint) throws -> Void)? = nil
                         #endif
 
+                        #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
+                        let cacheOperations = SwiftCASCacheOperations(
+                            databases: database,
+                            unsafeReplayExecutor: acceleratorPolicy.mode == .trust
+                                ? dynamicExecutionDelegate.operationContext.unsafeReplayExecutor(
+                                    maximumParallelism: Self.unsafeParallelReplayMaximumParallelism
+                                )
+                                : nil
+                        )
+                        #else
+                        let cacheOperations = SwiftCASCacheOperations(databases: database)
+                        #endif
                         let preparation = Self.prepareAcceleratorCache(
                             mode: acceleratorPolicy.mode,
                             trustAuthorization: acceleratorTrustAuthorization,
                             semanticOutputJobKind: .init(ruleInfoType: driverJob.driverJob.ruleInfoType),
-                            operations: SwiftCASCacheOperations(databases: database),
+                            operations: cacheOperations,
                             cacheKeys: cacheKeys,
                             expectedOutputKindGroups: driverJob.driverJob.cacheOutputKindGroups,
                             plannedOutputs: plannedOutputs,
