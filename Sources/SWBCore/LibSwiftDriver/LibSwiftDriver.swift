@@ -559,6 +559,18 @@ public final class LibSwiftDriver {
             for (key, value) in environment {
                 env[ProcessEnvironmentKey(key)] = value
             }
+            #if SWIFT_BUILD_ACCELERATOR_UNSAFE_REPLAY_PHASE_INSTRUMENTATION
+            if let override = ProcessInfo.processInfo.environment["SWIFTBUILD_INTERNAL_LIBSWIFTSCAN_PATH"] {
+                let overridePath = Path(override)
+                guard overridePath.isAbsolute else {
+                    throw StubError.error("SWIFTBUILD_INTERNAL_LIBSWIFTSCAN_PATH must be absolute")
+                }
+                guard FileManager.default.fileExists(atPath: overridePath.str) else {
+                    throw StubError.error("SWIFTBUILD_INTERNAL_LIBSWIFTSCAN_PATH does not exist: \(overridePath.str)")
+                }
+                env[ProcessEnvironmentKey("SWIFT_DRIVER_SWIFTSCAN_LIB")] = overridePath.str
+            }
+            #endif
             compilerExecutableDir = try TSCBasic.AbsolutePath(validating: path.dirname.str)
         case .library(libSwiftScanPath: let path):
             // Remove lib/swift/host/lib_InternalSwiftScan.dylib and add bin/swift-frontend to get a fake path to the compiler frontend.
