@@ -1352,7 +1352,14 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                             throw AcceleratorCacheControlFlow.fallback
                         }
                         let swiftModuleDependencyGraph = dynamicExecutionDelegate.operationContext.swiftModuleDependencyGraph
-                        guard let database = try swiftModuleDependencyGraph.getCASDatabases(casOptions: casOpts, compilerLocation: payload.compilerLocation) else {
+                        guard let database = try Self.getCASDatabasesForAccelerator(
+                            graph: swiftModuleDependencyGraph,
+                            casOptions: casOpts,
+                            compilerLocation: payload.compilerLocation,
+                            identifier: identifier,
+                            mode: acceleratorPolicy.mode,
+                            outputDelegate: outputDelegate
+                        ) else {
                             observationOutcome = .unavailable
                             observationFallback = .noCAS
                             if casOpts.enableStrictCASErrors {
@@ -2863,6 +2870,52 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
     /// reach the authoritative frontend, including when policy-excluded.
     package static func usesStockCacheReplayPath(mode: SwiftBuildAcceleratorCacheMode) -> Bool {
         mode == .stock
+    }
+
+    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+    /// The custom scanner is a replay-only optimization for regular target
+    /// jobs. Dependency planning and every explicit Swift/Clang module job stay
+    /// on Apple's scanner and CAS owner.
+    package static func shouldUseAcceleratorReplayCAS(
+        identifier: SwiftDriverJobIdentifier,
+        mode: SwiftBuildAcceleratorCacheMode
+    ) -> Bool {
+        guard mode == .trust else { return false }
+        guard case .targetCompile = identifier else { return false }
+        return true
+    }
+    #endif
+
+    private static func getCASDatabasesForAccelerator(
+        graph: SwiftModuleDependencyGraph,
+        casOptions: CASOptions,
+        compilerLocation: LibSwiftDriver.CompilerLocation,
+        identifier: SwiftDriverJobIdentifier,
+        mode: SwiftBuildAcceleratorCacheMode,
+        outputDelegate: any TaskOutputDelegate
+    ) throws -> SwiftCASDatabases? {
+        #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+        if shouldUseAcceleratorReplayCAS(identifier: identifier, mode: mode) {
+            do {
+                if let replayDatabase = try graph.getAcceleratorReplayCASDatabases(
+                    casOptions: casOptions,
+                    compilerLocation: compilerLocation
+                ) {
+                    return replayDatabase
+                }
+            } catch {
+                if casOptions.enableDiagnosticRemarks {
+                    outputDelegate.note(
+                        "EXPERIMENTAL: replay-only custom libSwiftScan unavailable; falling back to Apple replay CAS"
+                    )
+                }
+            }
+        }
+        #endif
+        return try graph.getCASDatabases(
+            casOptions: casOptions,
+            compilerLocation: compilerLocation
+        )
     }
 
     package static func shouldCancelBeforeFrontend(

@@ -21,6 +21,20 @@ import SWBUtil
 
 @Suite
 fileprivate struct SwiftCacheOperationsTests {
+    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+    @Test
+    func replayOnlyScannerIsLimitedToTrustedTargetJobs() {
+        let target = SwiftDriverJobTaskAction.SwiftDriverJobIdentifier.targetCompile("target")
+        let explicitDependency = SwiftDriverJobTaskAction.SwiftDriverJobIdentifier.explicitDependency
+
+        #expect(SwiftDriverJobTaskAction.shouldUseAcceleratorReplayCAS(identifier: target, mode: .trust))
+        #expect(!SwiftDriverJobTaskAction.shouldUseAcceleratorReplayCAS(identifier: explicitDependency, mode: .trust))
+        #expect(!SwiftDriverJobTaskAction.shouldUseAcceleratorReplayCAS(identifier: target, mode: .stock))
+        #expect(!SwiftDriverJobTaskAction.shouldUseAcceleratorReplayCAS(identifier: target, mode: .observe))
+        #expect(!SwiftDriverJobTaskAction.shouldUseAcceleratorReplayCAS(identifier: target, mode: .verify))
+    }
+    #endif
+
     @Test
     func probeRequiresEveryKeyAndMaterializedOutput() throws {
         let operations = TestSwiftCacheOperations(

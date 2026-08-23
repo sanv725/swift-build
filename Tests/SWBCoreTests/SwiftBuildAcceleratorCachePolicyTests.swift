@@ -75,4 +75,27 @@ fileprivate struct SwiftBuildAcceleratorCachePolicyTests {
             #expect(decoded == value)
         }
     }
+
+    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+    @Test
+    func replayOnlyScannerPathRequiresAnExplicitAbsoluteValue() throws {
+        #expect(try SwiftModuleDependencyGraph.acceleratorReplayLibSwiftScanPath(environment: [:]) == nil)
+
+        #expect(throws: (any Error).self) {
+            try SwiftModuleDependencyGraph.acceleratorReplayLibSwiftScanPath(environment: [
+                SwiftModuleDependencyGraph.acceleratorReplayLibSwiftScanEnvironmentKey: "",
+            ])
+        }
+        #expect(throws: (any Error).self) {
+            try SwiftModuleDependencyGraph.acceleratorReplayLibSwiftScanPath(environment: [
+                SwiftModuleDependencyGraph.acceleratorReplayLibSwiftScanEnvironmentKey: "relative/libSwiftScan.dylib",
+            ])
+        }
+
+        let absolutePath = try SwiftModuleDependencyGraph.acceleratorReplayLibSwiftScanPath(environment: [
+            SwiftModuleDependencyGraph.acceleratorReplayLibSwiftScanEnvironmentKey: "/tmp/libSwiftScan.dylib",
+        ])
+        #expect(absolutePath == Path("/tmp/libSwiftScan.dylib"))
+    }
+    #endif
 }

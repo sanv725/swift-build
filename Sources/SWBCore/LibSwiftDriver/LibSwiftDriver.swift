@@ -130,6 +130,19 @@ public final class SwiftModuleDependencyGraph: SwiftGlobalExplicitDependencyGrap
     }
     let oracleRegistry: Registry<OracleRegistryKey, InterModuleDependencyOracle> = .init()
 
+    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+    /// A replay-only scanner must never share opaque scanner or CAS handles with
+    /// the Apple scanner used for dependency planning. Retaining its oracle in a
+    /// separate registry keeps the custom dylib and every wrapper it creates
+    /// alive for the complete build lifetime.
+    struct AcceleratorReplayOracleRegistryKey: Hashable {
+        let compilerLocation: LibSwiftDriver.CompilerLocation
+        let libSwiftScanPath: Path
+        let casOpts: CASOptions
+    }
+    let acceleratorReplayOracleRegistry: Registry<AcceleratorReplayOracleRegistryKey, InterModuleDependencyOracle> = .init()
+    #endif
+
     private let registryQueue = SWBQueue(label: "SwiftModuleDependencyGraph", autoreleaseFrequency: .workItem)
     private var registry: [String: LibSwiftDriver] = [:]
     private var globalExplicitDependencyTracker = GlobalExplicitDependencyTracker()
@@ -272,6 +285,55 @@ public final class SwiftModuleDependencyGraph: SwiftGlobalExplicitDependencyGrap
         guard let casOpts = casOptions else { return nil }
         return try createCASDatabases(casOptions: casOpts, compilerLocation: compilerLocation)
     }
+
+    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+    package static let acceleratorReplayLibSwiftScanEnvironmentKey = "SWIFTBUILD_INTERNAL_REPLAY_LIBSWIFTSCAN_PATH"
+
+    package static func acceleratorReplayLibSwiftScanPath(environment: [String: String]) throws -> Path? {
+        guard let value = environment[acceleratorReplayLibSwiftScanEnvironmentKey] else {
+            return nil
+        }
+        guard !value.isEmpty else {
+            throw StubError.error("\(acceleratorReplayLibSwiftScanEnvironmentKey) must not be empty")
+        }
+        let path = Path(value)
+        guard path.isAbsolute else {
+            throw StubError.error("\(acceleratorReplayLibSwiftScanEnvironmentKey) must be absolute")
+        }
+        return path
+    }
+
+    /// Returns a CAS owned entirely by the replay-only scanner. This does not
+    /// modify Swift Driver's environment or the scanner used to plan modules.
+    public func getAcceleratorReplayCASDatabases(
+        casOptions: CASOptions,
+        compilerLocation: LibSwiftDriver.CompilerLocation
+    ) throws -> SwiftCASDatabases? {
+        try getAcceleratorReplayCASDatabases(
+            casOptions: casOptions,
+            compilerLocation: compilerLocation,
+            environment: ProcessInfo.processInfo.environment
+        )
+    }
+
+    package func getAcceleratorReplayCASDatabases(
+        casOptions: CASOptions,
+        compilerLocation: LibSwiftDriver.CompilerLocation,
+        environment: [String: String]
+    ) throws -> SwiftCASDatabases? {
+        guard let libSwiftScanPath = try Self.acceleratorReplayLibSwiftScanPath(environment: environment) else {
+            return nil
+        }
+        guard FileManager.default.fileExists(atPath: libSwiftScanPath.str) else {
+            throw StubError.error("\(Self.acceleratorReplayLibSwiftScanEnvironmentKey) does not exist: \(libSwiftScanPath.str)")
+        }
+        return try createAcceleratorReplayCASDatabases(
+            casOptions: casOptions,
+            compilerLocation: compilerLocation,
+            libSwiftScanPath: libSwiftScanPath
+        )
+    }
+    #endif
 
     private func register(key: String, driver: LibSwiftDriver) {
         registryQueue.async {
@@ -713,6 +775,40 @@ extension SwiftModuleDependencyGraph {
                                             pluginOptions: pluginOpts)
         return SwiftCASDatabases(cas)
     }
+
+    #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
+    /// Creates a second, replay-only scanner/CAS owner. Only string cache keys
+    /// and frontend command lines enter this boundary; opaque values obtained
+    /// from Apple's scanner are never passed to this oracle.
+    private func createAcceleratorReplayCASDatabases(
+        casOptions: CASOptions,
+        compilerLocation: LibSwiftDriver.CompilerLocation,
+        libSwiftScanPath: Path
+    ) throws -> SwiftCASDatabases {
+        func toAbsolutePath(_ path: String?) throws -> TSCBasic.AbsolutePath? {
+            guard let path else { return nil }
+            return try TSCBasic.AbsolutePath(validating: path)
+        }
+
+        let key = AcceleratorReplayOracleRegistryKey(
+            compilerLocation: compilerLocation,
+            libSwiftScanPath: libSwiftScanPath,
+            casOpts: casOptions
+        )
+        let oracle = acceleratorReplayOracleRegistry.getOrInsert(key, {
+            InterModuleDependencyOracle()
+        })
+        try oracle.verifyOrCreateScannerInstance(
+            swiftScanLibPath: TSCBasic.AbsolutePath(validating: libSwiftScanPath.str)
+        )
+        let cas = try oracle.getOrCreateCAS(
+            pluginPath: try toAbsolutePath(casOptions.pluginPath?.str),
+            onDiskPath: try toAbsolutePath(casOptions.casPath.str),
+            pluginOptions: casOptions.pluginOptions(useRemote: true)
+        )
+        return SwiftCASDatabases(cas)
+    }
+    #endif
 }
 
 /// SwiftCachedCompilation wraps CachedCompilation from SwiftDriver
