@@ -559,7 +559,7 @@ public final class LibSwiftDriver {
             for (key, value) in environment {
                 env[ProcessEnvironmentKey(key)] = value
             }
-            #if SWIFT_BUILD_ACCELERATOR_UNSAFE_REPLAY_PHASE_INSTRUMENTATION
+            #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT
             if let override = ProcessInfo.processInfo.environment["SWIFTBUILD_INTERNAL_LIBSWIFTSCAN_PATH"] {
                 let overridePath = Path(override)
                 guard overridePath.isAbsolute else {
