@@ -1092,6 +1092,11 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             environment = task.environment.bindingsDictionary
         }
 
+        #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+        let jobCASConfiguration = SwiftJobCASConfiguration.parse(environment: environment)
+        SwiftJobCASConfiguration.removeControlVariables(from: &environment)
+        #endif
+
         #if SWIFT_BUILD_ACCELERATOR_TRUST_CANARY
         let acceleratorTrustAuthorization = SwiftAcceleratorCacheTrustAuthorization.parse(environment: environment)
         #else
@@ -1281,6 +1286,88 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             }
 
             var cas: SwiftCASDatabases?
+            #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+            let jobCASPrimaryInputDigests = try? SwiftJobCASIdentity.primaryInputDigests(
+                commandLine: options.commandLine,
+                workingDirectory: task.workingDirectory,
+                fs: executionDelegate.fs
+            )
+            let jobCASIdentity: SwiftJobCASIdentity? = if jobCASConfiguration != nil,
+                                                          case .targetCompile = identifier,
+                                                          !cacheKeys.isEmpty,
+                                                          !plannedOutputs.isEmpty,
+                                                          let jobCASPrimaryInputDigests,
+                                                          !Self.hasSharedObjectiveCHeaderOutput(
+                                                            commandLine: options.commandLine,
+                                                            plannedOutputs: plannedOutputs
+                                                          ) {
+                .init(
+                    toolchainIdentity: payload.compilerLocation.compilerOrLibraryPath.str,
+                    ruleInfoType: driverJob.driverJob.ruleInfoType,
+                    moduleName: driverJob.driverJob.moduleName,
+                    primaryInputDigests: jobCASPrimaryInputDigests,
+                    producerCompilerCacheKeys: cacheKeys,
+                    commandLine: options.commandLine,
+                    outputNames: plannedOutputs.map(\.basename)
+                )
+            } else {
+                nil
+            }
+            if let jobCASConfiguration,
+               jobCASConfiguration.mode.reads,
+               let jobCASIdentity {
+                let store = SwiftJobCASStore(root: jobCASConfiguration.root)
+                let timer = ElapsedTimer()
+                let replay = store.replay(
+                    identity: jobCASIdentity,
+                    destinations: plannedOutputs,
+                    fs: executionDelegate.fs
+                )
+                let durationNS = timer.elapsedTime().nanoseconds
+                let event: SwiftJobCASEvent
+                switch replay {
+                case .hit(let outputCount, let outputBytes):
+                    event = .init(
+                        jobKey: jobCASIdentity.key,
+                        operation: "replay",
+                        outcome: "hit",
+                        durationNS: durationNS,
+                        outputCount: outputCount,
+                        outputBytes: outputBytes
+                    )
+                    try? store.recordEvent(event, fs: executionDelegate.fs)
+                    outputDelegate.note(
+                        "SWIFT_JOB_CAS outcome=hit key=\(jobCASIdentity.key) outputs=\(outputCount) bytes=\(outputBytes) duration_ns=\(durationNS)"
+                    )
+                    outputDelegate.incrementCounter(.swiftCacheHits)
+                    outputDelegate.incrementTaskCounter(.cacheHits)
+                    return .succeeded
+                case .miss:
+                    event = .init(
+                        jobKey: jobCASIdentity.key,
+                        operation: "replay",
+                        outcome: "miss",
+                        durationNS: durationNS
+                    )
+                    try? store.recordEvent(event, fs: executionDelegate.fs)
+                    outputDelegate.note(
+                        "SWIFT_JOB_CAS outcome=miss key=\(jobCASIdentity.key) duration_ns=\(durationNS) fallback=apple"
+                    )
+                case .invalid(let detail):
+                    event = .init(
+                        jobKey: jobCASIdentity.key,
+                        operation: "replay",
+                        outcome: "invalid",
+                        durationNS: durationNS,
+                        detail: detail
+                    )
+                    try? store.recordEvent(event, fs: executionDelegate.fs)
+                    outputDelegate.note(
+                        "SWIFT_JOB_CAS outcome=invalid key=\(jobCASIdentity.key) duration_ns=\(durationNS) fallback=apple"
+                    )
+                }
+            }
+            #endif
             if Self.usesStockCacheReplayPath(mode: acceleratorPolicy.mode) {
                 // Keep the upstream cache creation, pruning, replay, counters, and
                 // diagnostics path unchanged when the accelerator is disabled.
@@ -1716,6 +1803,47 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 outputDelegate.error(error)
                 return .failed
             }
+            #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+            if delegate.commandResult == .succeeded,
+               let jobCASConfiguration,
+               jobCASConfiguration.mode.writes,
+               let jobCASIdentity {
+                let store = SwiftJobCASStore(root: jobCASConfiguration.root)
+                let timer = ElapsedTimer()
+                do {
+                    let recorded = try store.record(
+                        identity: jobCASIdentity,
+                        outputs: plannedOutputs,
+                        fs: executionDelegate.fs
+                    )
+                    let durationNS = timer.elapsedTime().nanoseconds
+                    try? store.recordEvent(.init(
+                        jobKey: jobCASIdentity.key,
+                        operation: "record",
+                        outcome: recorded.actionCreated ? "created" : "present",
+                        durationNS: durationNS,
+                        outputCount: recorded.outputCount,
+                        outputBytes: recorded.outputBytes,
+                        detail: "new_blob_count=\(recorded.newBlobCount)"
+                    ), fs: executionDelegate.fs)
+                    outputDelegate.note(
+                        "SWIFT_JOB_CAS outcome=recorded key=\(jobCASIdentity.key) outputs=\(recorded.outputCount) bytes=\(recorded.outputBytes) new_blobs=\(recorded.newBlobCount) duration_ns=\(durationNS)"
+                    )
+                } catch {
+                    let durationNS = timer.elapsedTime().nanoseconds
+                    try? store.recordEvent(.init(
+                        jobKey: jobCASIdentity.key,
+                        operation: "record",
+                        outcome: "error",
+                        durationNS: durationNS,
+                        detail: String(describing: error)
+                    ), fs: executionDelegate.fs)
+                    outputDelegate.note(
+                        "SWIFT_JOB_CAS outcome=record_error key=\(jobCASIdentity.key) duration_ns=\(durationNS) fallback=completed_frontend"
+                    )
+                }
+            }
+            #endif
             // If has remote cache, start uploading task.
             if let db = cas, let casOpts = payload.casOptions, casOpts.hasRemoteCache, delegate.commandResult == .succeeded {
                 // upload only if succeed
