@@ -10,6 +10,7 @@
 #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
 
 import Foundation
+import Synchronization
 
 package import SWBUtil
 
@@ -22,16 +23,28 @@ package enum SwiftJobCASMode: String, Sendable {
     package var writes: Bool { self != .replay }
 }
 
+package enum SwiftJobCASVerification: String, Sendable {
+    case verified
+    case trustedLocal = "trusted-local"
+}
+
 package struct SwiftJobCASConfiguration: Sendable, Equatable {
     package static let rootVariable = "SWIFT_BUILD_JOB_CAS_ROOT"
     package static let modeVariable = "SWIFT_BUILD_JOB_CAS_MODE"
+    package static let verificationVariable = "SWIFT_BUILD_JOB_CAS_VERIFICATION"
 
     package let root: Path
     package let mode: SwiftJobCASMode
+    package let verification: SwiftJobCASVerification
 
-    package init(root: Path, mode: SwiftJobCASMode) {
+    package init(
+        root: Path,
+        mode: SwiftJobCASMode,
+        verification: SwiftJobCASVerification = .verified
+    ) {
         self.root = root
         self.mode = mode
+        self.verification = verification
     }
 
     package static func parse(environment: [String: String]) -> Self? {
@@ -42,12 +55,22 @@ package struct SwiftJobCASConfiguration: Sendable, Equatable {
               let mode = SwiftJobCASMode(rawValue: rawMode) else {
             return nil
         }
-        return .init(root: Path(rawRoot), mode: mode)
+        let verification: SwiftJobCASVerification
+        if let rawVerification = environment[verificationVariable] {
+            guard let parsed = SwiftJobCASVerification(rawValue: rawVerification) else {
+                return nil
+            }
+            verification = parsed
+        } else {
+            verification = .verified
+        }
+        return .init(root: Path(rawRoot), mode: mode, verification: verification)
     }
 
     package static func removeControlVariables(from environment: inout [String: String]) {
         environment.removeValue(forKey: rootVariable)
         environment.removeValue(forKey: modeVariable)
+        environment.removeValue(forKey: verificationVariable)
     }
 }
 
@@ -173,7 +196,7 @@ package struct SwiftJobCASRecordResult: Sendable, Equatable {
 }
 
 package struct SwiftJobCASEvent: Codable, Sendable, Equatable {
-    package static let schema = "swift-build-job-cas-event-v1"
+    package static let schema = "swift-build-job-cas-event-v2"
 
     package let schema: String
     package let timestampUnixNS: UInt64
@@ -185,6 +208,13 @@ package struct SwiftJobCASEvent: Codable, Sendable, Equatable {
     package let outputCount: Int?
     package let outputBytes: UInt64?
     package let detail: String?
+    package let verification: String?
+    package let actionLookupDurationNS: UInt64?
+    package let actionReadDurationNS: UInt64?
+    package let actionValidationDurationNS: UInt64?
+    package let blobReadDurationNS: UInt64?
+    package let blobVerificationDurationNS: UInt64?
+    package let outputPublicationDurationNS: UInt64?
 
     package init(
         jobKey: String,
@@ -193,7 +223,9 @@ package struct SwiftJobCASEvent: Codable, Sendable, Equatable {
         durationNS: UInt64,
         outputCount: Int? = nil,
         outputBytes: UInt64? = nil,
-        detail: String? = nil
+        detail: String? = nil,
+        verification: SwiftJobCASVerification? = nil,
+        replayTimings: SwiftJobCASReplayTimings? = nil
     ) {
         self.schema = Self.schema
         self.timestampUnixNS = UInt64(Date().timeIntervalSince1970 * 1_000_000_000)
@@ -205,7 +237,25 @@ package struct SwiftJobCASEvent: Codable, Sendable, Equatable {
         self.outputCount = outputCount
         self.outputBytes = outputBytes
         self.detail = detail
+        self.verification = verification?.rawValue
+        self.actionLookupDurationNS = replayTimings?.actionLookupDurationNS
+        self.actionReadDurationNS = replayTimings?.actionReadDurationNS
+        self.actionValidationDurationNS = replayTimings?.actionValidationDurationNS
+        self.blobReadDurationNS = replayTimings?.blobReadDurationNS
+        self.blobVerificationDurationNS = replayTimings?.blobVerificationDurationNS
+        self.outputPublicationDurationNS = replayTimings?.outputPublicationDurationNS
     }
+}
+
+package struct SwiftJobCASReplayTimings: Sendable, Equatable {
+    package var actionLookupDurationNS: UInt64 = 0
+    package var actionReadDurationNS: UInt64 = 0
+    package var actionValidationDurationNS: UInt64 = 0
+    package var blobReadDurationNS: UInt64 = 0
+    package var blobVerificationDurationNS: UInt64 = 0
+    package var outputPublicationDurationNS: UInt64 = 0
+
+    package init() {}
 }
 
 package struct SwiftJobCASStore: Sendable {
@@ -243,11 +293,35 @@ package struct SwiftJobCASStore: Sendable {
         destinations: [Path],
         fs: any FSProxy
     ) -> SwiftJobCASReplayOutcome {
+        var timings = SwiftJobCASReplayTimings()
+        return replay(
+            identity: identity,
+            destinations: destinations,
+            verification: .verified,
+            timings: &timings,
+            fs: fs
+        )
+    }
+
+    package func replay(
+        identity: SwiftJobCASIdentity,
+        destinations: [Path],
+        verification: SwiftJobCASVerification,
+        timings: inout SwiftJobCASReplayTimings,
+        fs: any FSProxy
+    ) -> SwiftJobCASReplayOutcome {
         let actionPath = path(kind: "actions", digest: identity.key, suffix: ".json")
-        guard fs.exists(actionPath) else { return .miss }
+        let lookupTimer = ElapsedTimer()
+        let actionExists = fs.exists(actionPath)
+        timings.actionLookupDurationNS = lookupTimer.elapsedTime().nanoseconds
+        guard actionExists else { return .miss }
 
         do {
-            let action = try decode(Action.self, from: fs.read(actionPath))
+            let actionReadTimer = ElapsedTimer()
+            let actionBytes = try fs.read(actionPath)
+            timings.actionReadDurationNS = actionReadTimer.elapsedTime().nanoseconds
+            let actionValidationTimer = ElapsedTimer()
+            let action = try decode(Action.self, from: actionBytes)
             guard action.schema == Action.schema,
                   action.jobKey == identity.key,
                   action.toolchainIdentity == identity.toolchainIdentity,
@@ -262,6 +336,45 @@ package struct SwiftJobCASStore: Sendable {
                   action.outputs.map(\.name) == identity.outputNames else {
                 return .invalid("action manifest does not match the planned job")
             }
+            timings.actionValidationDurationNS = actionValidationTimer.elapsedTime().nanoseconds
+
+            if verification == .trustedLocal {
+                var blobs: [Path] = []
+                blobs.reserveCapacity(action.outputs.count)
+                let blobInspectionTimer = ElapsedTimer()
+                for output in action.outputs {
+                    let blobPath = path(kind: "blobs", digest: output.blob)
+                    let info = try fs.getFileInfo(blobPath)
+                    guard info.isFile, info.size >= 0, UInt64(info.size) == output.size else {
+                        return .invalid("referenced blob is absent or has the wrong size")
+                    }
+                    blobs.append(blobPath)
+                }
+                timings.blobReadDurationNS = blobInspectionTimer.elapsedTime().nanoseconds
+
+                let publicationTimer = ElapsedTimer()
+                var published: [Path] = []
+                do {
+                    for (destination, blob) in zip(destinations, blobs) {
+                        try fs.createDirectory(destination.dirname, recursive: true)
+                        if fs.exists(destination) {
+                            try fs.remove(destination)
+                        }
+                        try fs.copy(blob, to: destination)
+                        published.append(destination)
+                    }
+                } catch {
+                    for destination in published {
+                        try? fs.remove(destination)
+                    }
+                    throw error
+                }
+                timings.outputPublicationDurationNS = publicationTimer.elapsedTime().nanoseconds
+                return .hit(
+                    outputCount: action.outputs.count,
+                    outputBytes: action.outputs.reduce(0) { $0 + $1.size }
+                )
+            }
 
             var materialized: [ByteString] = []
             materialized.reserveCapacity(action.outputs.count)
@@ -271,19 +384,26 @@ package struct SwiftJobCASStore: Sendable {
                 guard fs.exists(blobPath) else {
                     return .invalid("referenced blob is absent")
                 }
+                let blobReadTimer = ElapsedTimer()
                 let contents = try fs.read(blobPath)
-                guard UInt64(contents.bytes.count) == output.size,
-                      SwiftJobCASIdentity.digest(bytes: contents) == output.blob else {
+                timings.blobReadDurationNS += blobReadTimer.elapsedTime().nanoseconds
+                let verificationTimer = ElapsedTimer()
+                let valid = UInt64(contents.bytes.count) == output.size
+                    && SwiftJobCASIdentity.digest(bytes: contents) == output.blob
+                timings.blobVerificationDurationNS += verificationTimer.elapsedTime().nanoseconds
+                guard valid else {
                     return .invalid("referenced blob failed content verification")
                 }
                 totalBytes += output.size
                 materialized.append(contents)
             }
 
+            let publicationTimer = ElapsedTimer()
             for (destination, contents) in zip(destinations, materialized) {
                 try fs.createDirectory(destination.dirname, recursive: true)
                 try fs.write(destination, contents: contents, atomically: true)
             }
+            timings.outputPublicationDurationNS = publicationTimer.elapsedTime().nanoseconds
             return .hit(outputCount: action.outputs.count, outputBytes: totalBytes)
         } catch {
             return .invalid(String(describing: error))
@@ -370,14 +490,19 @@ package struct SwiftJobCASStore: Sendable {
     package func recordEvent(_ event: SwiftJobCASEvent, fs: any FSProxy) throws {
         let eventDirectory = root.join("events")
         try fs.createDirectory(eventDirectory, recursive: true)
-        let filename = "\(event.timestampUnixNS)-\(event.processID)-\(UUID().uuidString.lowercased()).json"
-        try fs.write(eventDirectory.join(filename), contents: try encode(event), atomically: true)
+        var bytes = try encode(event)
+        bytes += ByteString(encodingAsUTF8: "\n")
+        try Self.eventWriteLock.withLock {
+            try fs.append(eventDirectory.join("events-v2.jsonl"), contents: bytes)
+        }
     }
 
     private func path(kind: String, digest: String, suffix: String = "") -> Path {
         let prefix = String(digest.prefix(2))
         return root.join(kind).join(prefix).join(digest + suffix)
     }
+
+    private static let eventWriteLock = SWBMutex<Void>(())
 
     private func encode<T: Encodable>(_ value: T) throws -> ByteString {
         let encoder = JSONEncoder()

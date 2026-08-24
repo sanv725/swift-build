@@ -31,10 +31,25 @@ fileprivate struct SwiftJobCASTests {
             SwiftJobCASConfiguration.rootVariable: "/tmp/job-cas",
             SwiftJobCASConfiguration.modeVariable: "read-write",
         ]) == .init(root: Path("/tmp/job-cas"), mode: .readWrite))
+        #expect(SwiftJobCASConfiguration.parse(environment: [
+            SwiftJobCASConfiguration.rootVariable: "/tmp/job-cas",
+            SwiftJobCASConfiguration.modeVariable: "replay",
+            SwiftJobCASConfiguration.verificationVariable: "trusted-local",
+        ]) == .init(
+            root: Path("/tmp/job-cas"),
+            mode: .replay,
+            verification: .trustedLocal
+        ))
+        #expect(SwiftJobCASConfiguration.parse(environment: [
+            SwiftJobCASConfiguration.rootVariable: "/tmp/job-cas",
+            SwiftJobCASConfiguration.modeVariable: "replay",
+            SwiftJobCASConfiguration.verificationVariable: "unknown",
+        ]) == nil)
 
         var environment = [
             SwiftJobCASConfiguration.rootVariable: "/tmp/job-cas",
             SwiftJobCASConfiguration.modeVariable: "replay",
+            SwiftJobCASConfiguration.verificationVariable: "verified",
             "RETAINED": "yes",
         ]
         SwiftJobCASConfiguration.removeControlVariables(from: &environment)
@@ -231,6 +246,47 @@ fileprivate struct SwiftJobCASTests {
     }
 
     @Test
+    func trustedLocalReplaySkipsDigestVerificationAndUsesClonePublication() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let root = temporaryDirectory.path.join("job-cas")
+        let producer = temporaryDirectory.path.join("producer")
+        let consumer = temporaryDirectory.path.join("consumer")
+        let producerOutput = producer.join("Leaf.o")
+        let consumerOutput = consumer.join("Leaf.o")
+        try localFS.createDirectory(producer, recursive: true)
+        try localFS.write(producerOutput, contents: ByteString(encodingAsUTF8: "object-v1"))
+
+        let store = SwiftJobCASStore(root: root)
+        let identity = SwiftJobCASIdentity(
+            toolchainIdentity: "/toolchain/swift-frontend",
+            ruleInfoType: "Compile",
+            moduleName: "Fixture",
+            primaryInputDigests: ["Leaf.swift=content-v1"],
+            producerCompilerCacheKeys: ["llvmcas://producer"],
+            commandLine: ["swift-frontend", "-c", "Leaf.swift"],
+            outputNames: ["Leaf.o"]
+        )
+        _ = try store.record(identity: identity, outputs: [producerOutput], fs: localFS)
+        let original = ByteString(encodingAsUTF8: "object-v1")
+        let digest = SwiftJobCASIdentity.digest(bytes: original)
+        let blob = root.join("blobs").join(String(digest.prefix(2))).join(digest)
+        try localFS.write(blob, contents: ByteString(encodingAsUTF8: "object-v2"), atomically: true)
+
+        var timings = SwiftJobCASReplayTimings()
+        let replay = store.replay(
+            identity: identity,
+            destinations: [consumerOutput],
+            verification: .trustedLocal,
+            timings: &timings,
+            fs: localFS
+        )
+        #expect(replay == .hit(outputCount: 1, outputBytes: 9))
+        #expect(try localFS.read(consumerOutput) == ByteString(encodingAsUTF8: "object-v2"))
+        #expect(timings.blobVerificationDurationNS == 0)
+        #expect(timings.outputPublicationDurationNS > 0)
+    }
+
+    @Test
     func writesMachineReadableMetricsEvents() throws {
         let temporaryDirectory = try NamedTemporaryDirectory()
         let store = SwiftJobCASStore(root: temporaryDirectory.path.join("job-cas"))
@@ -246,7 +302,8 @@ fileprivate struct SwiftJobCASTests {
         let events = try localFS.listdir(store.root.join("events"))
         #expect(events.count == 1)
         let payload = try localFS.read(store.root.join("events").join(events[0])).asString
-        #expect(payload.contains("\"schema\":\"swift-build-job-cas-event-v1\""))
+        #expect(events == ["events-v2.jsonl"])
+        #expect(payload.contains("\"schema\":\"swift-build-job-cas-event-v2\""))
         #expect(payload.contains("\"outcome\":\"hit\""))
         #expect(payload.contains("\"durationNS\":123"))
     }

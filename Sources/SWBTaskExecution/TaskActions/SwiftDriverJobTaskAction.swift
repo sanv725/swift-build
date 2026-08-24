@@ -1318,12 +1318,16 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                let jobCASIdentity {
                 let store = SwiftJobCASStore(root: jobCASConfiguration.root)
                 let timer = ElapsedTimer()
+                var replayTimings = SwiftJobCASReplayTimings()
                 let replay = store.replay(
                     identity: jobCASIdentity,
                     destinations: plannedOutputs,
+                    verification: jobCASConfiguration.verification,
+                    timings: &replayTimings,
                     fs: executionDelegate.fs
                 )
                 let durationNS = timer.elapsedTime().nanoseconds
+                let phaseFields = "verification=\(jobCASConfiguration.verification.rawValue) action_lookup_ns=\(replayTimings.actionLookupDurationNS) action_read_ns=\(replayTimings.actionReadDurationNS) action_validation_ns=\(replayTimings.actionValidationDurationNS) blob_read_ns=\(replayTimings.blobReadDurationNS) blob_verification_ns=\(replayTimings.blobVerificationDurationNS) publication_ns=\(replayTimings.outputPublicationDurationNS)"
                 let event: SwiftJobCASEvent
                 switch replay {
                 case .hit(let outputCount, let outputBytes):
@@ -1333,11 +1337,15 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                         outcome: "hit",
                         durationNS: durationNS,
                         outputCount: outputCount,
-                        outputBytes: outputBytes
+                        outputBytes: outputBytes,
+                        verification: jobCASConfiguration.verification,
+                        replayTimings: replayTimings
                     )
+                    let eventTimer = ElapsedTimer()
                     try? store.recordEvent(event, fs: executionDelegate.fs)
+                    let eventDurationNS = eventTimer.elapsedTime().nanoseconds
                     outputDelegate.note(
-                        "SWIFT_JOB_CAS outcome=hit key=\(jobCASIdentity.key) outputs=\(outputCount) bytes=\(outputBytes) duration_ns=\(durationNS)"
+                        "SWIFT_JOB_CAS outcome=hit key=\(jobCASIdentity.key) outputs=\(outputCount) bytes=\(outputBytes) duration_ns=\(durationNS) event_ns=\(eventDurationNS) \(phaseFields)"
                     )
                     outputDelegate.incrementCounter(.swiftCacheHits)
                     outputDelegate.incrementTaskCounter(.cacheHits)
@@ -1347,11 +1355,15 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                         jobKey: jobCASIdentity.key,
                         operation: "replay",
                         outcome: "miss",
-                        durationNS: durationNS
+                        durationNS: durationNS,
+                        verification: jobCASConfiguration.verification,
+                        replayTimings: replayTimings
                     )
+                    let eventTimer = ElapsedTimer()
                     try? store.recordEvent(event, fs: executionDelegate.fs)
+                    let eventDurationNS = eventTimer.elapsedTime().nanoseconds
                     outputDelegate.note(
-                        "SWIFT_JOB_CAS outcome=miss key=\(jobCASIdentity.key) duration_ns=\(durationNS) fallback=apple"
+                        "SWIFT_JOB_CAS outcome=miss key=\(jobCASIdentity.key) duration_ns=\(durationNS) event_ns=\(eventDurationNS) \(phaseFields) fallback=apple"
                     )
                 case .invalid(let detail):
                     event = .init(
@@ -1359,11 +1371,15 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                         operation: "replay",
                         outcome: "invalid",
                         durationNS: durationNS,
-                        detail: detail
+                        detail: detail,
+                        verification: jobCASConfiguration.verification,
+                        replayTimings: replayTimings
                     )
+                    let eventTimer = ElapsedTimer()
                     try? store.recordEvent(event, fs: executionDelegate.fs)
+                    let eventDurationNS = eventTimer.elapsedTime().nanoseconds
                     outputDelegate.note(
-                        "SWIFT_JOB_CAS outcome=invalid key=\(jobCASIdentity.key) duration_ns=\(durationNS) fallback=apple"
+                        "SWIFT_JOB_CAS outcome=invalid key=\(jobCASIdentity.key) duration_ns=\(durationNS) event_ns=\(eventDurationNS) \(phaseFields) fallback=apple"
                     )
                 }
             }
