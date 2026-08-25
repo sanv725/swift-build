@@ -1093,12 +1093,23 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         }
 
         #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
-        let jobCASConfiguration = SwiftJobCASConfiguration.parse(environment: environment)
+        // Xcode launches an overridden build service outside the wrapper's
+        // arbitrary environment and does not reliably copy user build settings
+        // into dynamic task environments. A native service launcher therefore
+        // scopes experiment controls to this process. Prefer an explicit task
+        // value when present, but otherwise consume the service-scoped value.
+        let experimentControlEnvironment = ProcessInfo.processInfo.environment.merging(
+            environment,
+            uniquingKeysWith: { _, taskValue in taskValue }
+        )
+        let jobCASConfiguration = SwiftJobCASConfiguration.parse(
+            environment: experimentControlEnvironment
+        )
         SwiftJobCASConfiguration.removeControlVariables(from: &environment)
         let dependencyShadowConfigurationPath: Path?
         do {
             dependencyShadowConfigurationPath = try SwiftDependencyShadowConfiguration.path(
-                environment: environment
+                environment: experimentControlEnvironment
             )
         } catch {
             dependencyShadowConfigurationPath = nil
