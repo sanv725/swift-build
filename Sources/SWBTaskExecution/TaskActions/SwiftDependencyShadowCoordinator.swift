@@ -22,6 +22,7 @@ package struct SwiftDependencyShadowConfiguration: Codable, Sendable, Equatable 
     package enum Mode: String, Codable, Sendable {
         case record
         case observe
+        case admit
     }
 
     package let schema: String
@@ -72,6 +73,24 @@ package struct SwiftDependencyShadowConfiguration: Codable, Sendable, Equatable 
         self.recordToolchainIdentity = toolchainIdentity
         self.recordPathPolicyIdentity = pathPolicyIdentity
         self.recordSourceIdentities = sourceIdentities.sorted()
+    }
+
+    package init(
+        admittingManifestAt previousManifestPath: String,
+        resultPath: String,
+        changedSourceIdentity: String,
+        pathMappings: [SwiftDependencyPathMapping]
+    ) {
+        self.schema = Self.schema
+        self.mode = .admit
+        self.previousManifestPath = previousManifestPath
+        self.resultPath = resultPath
+        self.changedSourceIdentities = [changedSourceIdentity]
+        self.pathMappings = pathMappings
+        self.recordModuleName = nil
+        self.recordToolchainIdentity = nil
+        self.recordPathPolicyIdentity = nil
+        self.recordSourceIdentities = nil
     }
 
     package static func path(environment: [String: String]) throws -> Path? {
@@ -154,6 +173,10 @@ package final class SwiftDependencyShadowCoordinator: @unchecked Sendable {
                 from: Data(manifestBytes.bytes)
             )
             try self.init(configuration: configuration, previousManifest: manifest)
+        case .admit:
+            throw StubError.error(
+                "Swift dependency admission configuration requires the admission coordinator."
+            )
         }
     }
 
@@ -201,6 +224,10 @@ package final class SwiftDependencyShadowCoordinator: @unchecked Sendable {
                 previousManifest: previousManifest,
                 expectedSourceIdentities: sourceIdentities,
                 changedSourceIdentities: Set(configuration.changedSourceIdentities)
+            )
+        case .admit:
+            throw StubError.error(
+                "Swift dependency admission configuration requires the admission coordinator."
             )
         }
         self.configuration = configuration
@@ -347,6 +374,10 @@ package final class SwiftDependencyShadowCoordinator: @unchecked Sendable {
                     predictedCount: predicted.count,
                     actualCount: actual.count,
                     pendingCount: pending.count
+                )
+            case .admit:
+                throw StubError.error(
+                    "Swift dependency admission configuration requires the admission coordinator."
                 )
             }
         }

@@ -70,6 +70,13 @@ public struct SwiftDependencyInvalidationScheduler: Sendable {
         mutableCompilationCounts
     }
 
+    public func dependencyFingerprintDigests(
+        for sourceIdentity: String
+    ) -> [String]? {
+        compiledAgainstDependencies[sourceIdentity]
+            ?? previousEntries[sourceIdentity]?.dependencyFingerprintDigests
+    }
+
     public var isComplete: Bool {
         pendingSources.isEmpty
     }

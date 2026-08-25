@@ -1304,27 +1304,103 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 workingDirectory: task.workingDirectory,
                 fs: executionDelegate.fs
             )
-            let jobCASIdentity: SwiftJobCASIdentity? = if jobCASConfiguration != nil,
-                                                          case .targetCompile = identifier,
-                                                          !cacheKeys.isEmpty,
-                                                          !plannedOutputs.isEmpty,
-                                                          let jobCASPrimaryInputDigests,
-                                                          !Self.hasSharedObjectiveCHeaderOutput(
-                                                            commandLine: options.commandLine,
-                                                            plannedOutputs: plannedOutputs
-                                                          ) {
-                .init(
+            func qualifiedDependencyPath(_ rawPath: String?) -> Path? {
+                guard let rawPath else { return nil }
+                let path = Path(rawPath)
+                return path.isAbsolute ? path : task.workingDirectory.join(path)
+            }
+            let dependencyPrimaryPath = qualifiedDependencyPath(
+                Self.uniqueArgumentValue(after: "-primary-file", in: options.commandLine)
+            )
+            let dependencyOutputPath = qualifiedDependencyPath(
+                Self.uniqueArgumentValue(
+                    after: "-emit-reference-dependencies-path",
+                    in: options.commandLine
+                )
+            )
+            var dependencyRuntimeCoordinator: SwiftDependencyRuntimeCoordinator?
+            var dependencyAdmissionDecision: SwiftDependencyAdmissionDecision?
+            if case .targetCompile = identifier,
+               let dependencyShadowConfigurationPath,
+               let dependencyPrimaryPath,
+               dependencyOutputPath != nil {
+                do {
+                    let runtimeCoordinator = try dynamicExecutionDelegate.operationContext
+                        .swiftDependencyRuntimeCoordinator(
+                            configurationPath: dependencyShadowConfigurationPath,
+                            fs: executionDelegate.fs
+                        )
+                    dependencyRuntimeCoordinator = runtimeCoordinator
+                    if case .admission(let admissionCoordinator) = runtimeCoordinator {
+                        if jobCASConfiguration?.mode.reads != true
+                            || cacheKeys.isEmpty
+                            || plannedOutputs.isEmpty
+                            || jobCASPrimaryInputDigests == nil
+                            || Self.hasSharedObjectiveCHeaderOutput(
+                                commandLine: options.commandLine,
+                                plannedOutputs: plannedOutputs
+                            ) {
+                            admissionCoordinator.abort(reason: "ineligible_job_cas")
+                        }
+                        dependencyAdmissionDecision = await admissionCoordinator
+                            .admissionDecision(
+                                moduleName: driverJob.driverJob.moduleName,
+                                primaryPath: dependencyPrimaryPath
+                            )
+                        if case .appleFallback(_, let reason) = dependencyAdmissionDecision,
+                           reason == "cancelled",
+                           isCancellationRequested() {
+                            return .cancelled
+                        }
+                    }
+                } catch {
+                    outputDelegate.note(
+                        "SWIFT_DEPENDENCY_ADMISSION outcome=invalid_configuration fallback=apple error=\(error.localizedDescription)"
+                    )
+                }
+            }
+            func makeJobCASIdentity(
+                dependencyFingerprintDigests: [String]?
+            ) -> SwiftJobCASIdentity? {
+                guard jobCASConfiguration != nil,
+                      case .targetCompile = identifier,
+                      !cacheKeys.isEmpty,
+                      !plannedOutputs.isEmpty,
+                      let jobCASPrimaryInputDigests,
+                      !Self.hasSharedObjectiveCHeaderOutput(
+                        commandLine: options.commandLine,
+                        plannedOutputs: plannedOutputs
+                      ) else {
+                    return nil
+                }
+                return .init(
                     toolchainIdentity: payload.compilerLocation.compilerOrLibraryPath.str,
                     ruleInfoType: driverJob.driverJob.ruleInfoType,
                     moduleName: driverJob.driverJob.moduleName,
                     primaryInputDigests: jobCASPrimaryInputDigests,
+                    dependencyFingerprintDigests: dependencyFingerprintDigests,
                     producerCompilerCacheKeys: cacheKeys,
                     commandLine: options.commandLine,
                     outputNames: plannedOutputs.map(\.basename)
                 )
-            } else {
-                nil
             }
+            let jobCASIdentity: SwiftJobCASIdentity?
+            if dependencyShadowConfigurationPath != nil {
+                if case .admission = dependencyRuntimeCoordinator,
+                   case .replayReusable(_, let dependencyFingerprintDigests) = dependencyAdmissionDecision {
+                    jobCASIdentity = makeJobCASIdentity(
+                        dependencyFingerprintDigests: dependencyFingerprintDigests
+                    )
+                } else if case .shadow = dependencyRuntimeCoordinator {
+                    jobCASIdentity = makeJobCASIdentity(dependencyFingerprintDigests: nil)
+                } else {
+                    jobCASIdentity = nil
+                }
+            } else {
+                jobCASIdentity = makeJobCASIdentity(dependencyFingerprintDigests: nil)
+            }
+            var jobCASRecordIdentity = jobCASIdentity
+            var dependencyAdmissionReplayMiss = false
             if let jobCASConfiguration,
                jobCASConfiguration.mode.reads,
                let jobCASIdentity {
@@ -1359,10 +1435,21 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                     outputDelegate.note(
                         "SWIFT_JOB_CAS outcome=hit key=\(jobCASIdentity.key) outputs=\(outputCount) bytes=\(outputBytes) duration_ns=\(durationNS) event_ns=\(eventDurationNS) \(phaseFields)"
                     )
+                    if case .replayReusable(let sourceIdentity, _) = dependencyAdmissionDecision {
+                        if case .admission(let admissionCoordinator) = dependencyRuntimeCoordinator {
+                            admissionCoordinator.recordReplayHit(sourceIdentity: sourceIdentity)
+                        }
+                        outputDelegate.note(
+                            "SWIFT_DEPENDENCY_ADMISSION outcome=replayed source=\(sourceIdentity) planning=apple"
+                        )
+                    }
                     outputDelegate.incrementCounter(.swiftCacheHits)
                     outputDelegate.incrementTaskCounter(.cacheHits)
                     return .succeeded
                 case .miss:
+                    if case .admission = dependencyRuntimeCoordinator {
+                        dependencyAdmissionReplayMiss = true
+                    }
                     event = .init(
                         jobKey: jobCASIdentity.key,
                         operation: "replay",
@@ -1378,6 +1465,9 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                         "SWIFT_JOB_CAS outcome=miss key=\(jobCASIdentity.key) duration_ns=\(durationNS) event_ns=\(eventDurationNS) \(phaseFields) fallback=apple"
                     )
                 case .invalid(let detail):
+                    if case .admission = dependencyRuntimeCoordinator {
+                        dependencyAdmissionReplayMiss = true
+                    }
                     event = .init(
                         jobKey: jobCASIdentity.key,
                         operation: "replay",
@@ -1828,54 +1918,83 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             }
 
             if let error = delegate.executionError {
+                #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+                if case .admission(let admissionCoordinator) = dependencyRuntimeCoordinator {
+                    admissionCoordinator.abort(reason: "frontend_error")
+                }
+                #endif
                 outputDelegate.error(error)
                 return .failed
             }
             #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
-            if delegate.commandResult == .succeeded,
-               case .targetCompile = identifier,
-               let dependencyShadowConfigurationPath,
-               let rawPrimaryPath = Self.uniqueArgumentValue(
-                   after: "-primary-file",
-                   in: options.commandLine
-               ),
-               let rawDependencyPath = Self.uniqueArgumentValue(
-                   after: "-emit-reference-dependencies-path",
-                   in: options.commandLine
-               ) {
-                do {
-                    let unqualifiedPrimaryPath = Path(rawPrimaryPath)
-                    let primaryPath = unqualifiedPrimaryPath.isAbsolute
-                        ? unqualifiedPrimaryPath
-                        : task.workingDirectory.join(unqualifiedPrimaryPath)
-                    let unqualifiedDependencyPath = Path(rawDependencyPath)
-                    let dependencyPath = unqualifiedDependencyPath.isAbsolute
-                        ? unqualifiedDependencyPath
-                        : task.workingDirectory.join(unqualifiedDependencyPath)
-                    let coordinator = try dynamicExecutionDelegate.operationContext
-                        .swiftDependencyShadowCoordinator(
-                            configurationPath: dependencyShadowConfigurationPath,
-                            fs: executionDelegate.fs
-                        )
-                    let summary = try coordinator.observeFrontend(
-                        moduleName: driverJob.driverJob.moduleName,
-                        primaryPath: primaryPath,
-                        dependencyPath: dependencyPath,
-                        fs: executionDelegate.fs
-                    )
-                    outputDelegate.note(
-                        "SWIFT_DEPENDENCY_SHADOW outcome=\(summary.outcome) predicted=\(summary.predictedCount) actual=\(summary.actualCount) pending=\(summary.pendingCount) candidate_replay=disabled planning=apple"
-                    )
-                } catch {
-                    outputDelegate.note(
-                        "SWIFT_DEPENDENCY_SHADOW outcome=invalid_observation candidate_replay=disabled fallback=apple error=\(error.localizedDescription)"
-                    )
+            if case .targetCompile = identifier,
+               let dependencyRuntimeCoordinator,
+               let dependencyPrimaryPath,
+               let dependencyOutputPath {
+                switch dependencyRuntimeCoordinator {
+                case .shadow(let shadowCoordinator):
+                    if delegate.commandResult == .succeeded {
+                        do {
+                            let summary = try shadowCoordinator.observeFrontend(
+                                moduleName: driverJob.driverJob.moduleName,
+                                primaryPath: dependencyPrimaryPath,
+                                dependencyPath: dependencyOutputPath,
+                                fs: executionDelegate.fs
+                            )
+                            outputDelegate.note(
+                                "SWIFT_DEPENDENCY_SHADOW outcome=\(summary.outcome) predicted=\(summary.predictedCount) actual=\(summary.actualCount) pending=\(summary.pendingCount) candidate_replay=disabled planning=apple"
+                            )
+                        } catch {
+                            outputDelegate.note(
+                                "SWIFT_DEPENDENCY_SHADOW outcome=invalid_observation candidate_replay=disabled fallback=apple error=\(error.localizedDescription)"
+                            )
+                        }
+                    }
+                case .admission(let admissionCoordinator):
+                    switch dependencyAdmissionDecision {
+                    case .executeChanged(let sourceIdentity)?,
+                         .executeAffected(let sourceIdentity)?:
+                        if delegate.commandResult == .succeeded {
+                            do {
+                                let completion = try admissionCoordinator.completeFrontend(
+                                    sourceIdentity: sourceIdentity,
+                                    dependencyPath: dependencyOutputPath
+                                )
+                                jobCASRecordIdentity = makeJobCASIdentity(
+                                    dependencyFingerprintDigests: completion
+                                        .dependencyFingerprintDigests
+                                )
+                                outputDelegate.note(
+                                    "SWIFT_DEPENDENCY_ADMISSION outcome=\(completion.outcome) source=\(sourceIdentity) predicted=\(completion.predictedCount) actual=\(completion.actualCount) pending=\(completion.pendingCount) planning=apple"
+                                )
+                            } catch {
+                                admissionCoordinator.abort(reason: "invalid_projection")
+                                outputDelegate.note(
+                                    "SWIFT_DEPENDENCY_ADMISSION outcome=invalid_projection fallback=apple error=\(error.localizedDescription)"
+                                )
+                            }
+                        } else {
+                            admissionCoordinator.abort(reason: "frontend_failed")
+                        }
+                    case .replayReusable(let sourceIdentity, _)?
+                        where dependencyAdmissionReplayMiss:
+                        if delegate.commandResult == .succeeded {
+                            admissionCoordinator.recordReplayFallbackExecution(
+                                sourceIdentity: sourceIdentity
+                            )
+                            outputDelegate.note(
+                                "SWIFT_DEPENDENCY_ADMISSION outcome=replay_miss source=\(sourceIdentity) fallback=apple"
+                            )
+                        }
+                    case .appleFallback?, .replayReusable?, nil:
+                        break
+                    }
                 }
             }
             if delegate.commandResult == .succeeded,
                let jobCASConfiguration,
                jobCASConfiguration.mode.writes,
-               let jobCASIdentity {
+               let jobCASIdentity = jobCASRecordIdentity {
                 let store = SwiftJobCASStore(root: jobCASConfiguration.root)
                 let timer = ElapsedTimer()
                 do {

@@ -143,8 +143,8 @@ public final class DynamicTaskOperationContext {
     package let cas: ToolchainCAS?
     private let acceleratorCacheQuarantined = SWBMutex(false)
     #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
-    private let swiftDependencyShadowCoordinators = SWBMutex(
-        [String: SwiftDependencyShadowCoordinator]()
+    private let swiftDependencyRuntimeCoordinators = SWBMutex(
+        [String: SwiftDependencyRuntimeCoordinator]()
     )
     #endif
     #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
@@ -179,18 +179,31 @@ public final class DynamicTaskOperationContext {
     }
 
     #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
-    package func swiftDependencyShadowCoordinator(
+    package func swiftDependencyRuntimeCoordinator(
         configurationPath: Path,
         fs: any FSProxy
-    ) throws -> SwiftDependencyShadowCoordinator {
-        try swiftDependencyShadowCoordinators.withLock { coordinators in
+    ) throws -> SwiftDependencyRuntimeCoordinator {
+        try swiftDependencyRuntimeCoordinators.withLock { coordinators in
             if let coordinator = coordinators[configurationPath.str] {
                 return coordinator
             }
-            let coordinator = try SwiftDependencyShadowCoordinator(
-                configurationPath: configurationPath,
-                fs: fs
+            let configurationBytes = try fs.read(configurationPath)
+            let configuration = try JSONDecoder().decode(
+                SwiftDependencyShadowConfiguration.self,
+                from: Data(configurationBytes.bytes)
             )
+            let coordinator: SwiftDependencyRuntimeCoordinator = switch configuration.mode {
+            case .record, .observe:
+                .shadow(try SwiftDependencyShadowCoordinator(
+                    configurationPath: configurationPath,
+                    fs: fs
+                ))
+            case .admit:
+                .admission(try SwiftDependencyAdmissionCoordinator(
+                    configurationPath: configurationPath,
+                    fs: fs
+                ))
+            }
             coordinators[configurationPath.str] = coordinator
             return coordinator
         }
@@ -236,7 +249,7 @@ public final class DynamicTaskOperationContext {
             self.compilationCachingDataPruner = CompilationCachingDataPruner()
             self.acceleratorCacheQuarantined.withLock { $0 = false }
             #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
-            self.swiftDependencyShadowCoordinators.withLock { $0.removeAll() }
+            self.swiftDependencyRuntimeCoordinators.withLock { $0.removeAll() }
             #endif
         }
     }
