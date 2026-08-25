@@ -1,9 +1,9 @@
 #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
 import Foundation
-import SWBCore
+public import SWBCore
 import SWBUtil
 
-package enum DirectLinkPlanExporter {
+enum DirectLinkPlanExporter {
     private struct Manifest: Codable {
         static let schema = "swift-build-direct-link-plan-v1"
 
@@ -47,7 +47,7 @@ package enum DirectLinkPlanExporter {
         }
     }
 
-    package static func export(
+    static func export(
         task: any ExecutableTask,
         commandLine: [String],
         fs: any FSProxy
