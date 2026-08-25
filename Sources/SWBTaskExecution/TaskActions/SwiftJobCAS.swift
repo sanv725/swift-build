@@ -76,7 +76,8 @@ package struct SwiftJobCASConfiguration: Sendable, Equatable {
 
 package struct SwiftJobCASIdentity: Sendable, Equatable {
     package static let schema = "swift-build-job-cas-identity-v4"
-    package static let inputIdentityMode = "aggressive-primary-input-v1"
+    package static let primaryOnlyInputIdentityMode = "aggressive-primary-input-v1"
+    package static let dependencyAwareInputIdentityMode = "compiler-dependency-api-fingerprints-v1"
 
     package let key: String
     package let toolchainIdentity: String
@@ -84,7 +85,9 @@ package struct SwiftJobCASIdentity: Sendable, Equatable {
     package let moduleName: String
     package let commandLineDigest: String
     package let commandLine: [String]
+    package let inputIdentityMode: String
     package let primaryInputDigests: [String]
+    package let dependencyFingerprintDigests: [String]?
     package let producerCompilerCacheKeys: [String]
     package let outputNames: [String]
 
@@ -93,6 +96,7 @@ package struct SwiftJobCASIdentity: Sendable, Equatable {
         ruleInfoType: String,
         moduleName: String,
         primaryInputDigests: [String],
+        dependencyFingerprintDigests: [String]? = nil,
         producerCompilerCacheKeys: [String],
         commandLine: [String],
         outputNames: [String]
@@ -101,18 +105,29 @@ package struct SwiftJobCASIdentity: Sendable, Equatable {
         self.ruleInfoType = ruleInfoType
         self.moduleName = moduleName
         self.primaryInputDigests = primaryInputDigests
+        self.dependencyFingerprintDigests = dependencyFingerprintDigests
+        let resolvedInputIdentityMode = dependencyFingerprintDigests == nil
+            ? Self.primaryOnlyInputIdentityMode
+            : Self.dependencyAwareInputIdentityMode
+        self.inputIdentityMode = resolvedInputIdentityMode
         self.producerCompilerCacheKeys = producerCompilerCacheKeys
         self.outputNames = outputNames
         let normalizedCommandLine = Self.normalizedCommandLine(commandLine)
         self.commandLine = normalizedCommandLine
         self.commandLineDigest = Self.digest(fields: ["command-line-v2"] + normalizedCommandLine)
-        self.key = Self.digest(fields: [
+        var keyFields = [
             Self.schema,
             toolchainIdentity,
             ruleInfoType,
             moduleName,
             commandLineDigest,
-        ] + [Self.inputIdentityMode] + primaryInputDigests + ["outputs-v1"] + outputNames)
+            resolvedInputIdentityMode,
+        ] + primaryInputDigests
+        if let dependencyFingerprintDigests {
+            keyFields += ["dependency-fingerprints-v1"] + dependencyFingerprintDigests.sorted()
+        }
+        keyFields += ["outputs-v1"] + outputNames
+        self.key = Self.digest(fields: keyFields)
     }
 
     package static func digest(bytes: ByteString) -> String {
@@ -278,6 +293,7 @@ package struct SwiftJobCASStore: Sendable {
         let commandLine: [String]
         let inputIdentityMode: String
         let primaryInputDigests: [String]
+        let dependencyFingerprintDigests: [String]?
         let producerCompilerCacheKeys: [String]
         let outputs: [Output]
     }
@@ -329,8 +345,9 @@ package struct SwiftJobCASStore: Sendable {
                   action.moduleName == identity.moduleName,
                   action.commandLineDigest == identity.commandLineDigest,
                   action.commandLine == identity.commandLine,
-                  action.inputIdentityMode == SwiftJobCASIdentity.inputIdentityMode,
+                  action.inputIdentityMode == identity.inputIdentityMode,
                   action.primaryInputDigests == identity.primaryInputDigests,
+                  action.dependencyFingerprintDigests == identity.dependencyFingerprintDigests,
                   action.outputs.count == destinations.count,
                   action.outputs.map(\.ordinal) == Array(destinations.indices),
                   action.outputs.map(\.name) == identity.outputNames else {
@@ -452,8 +469,9 @@ package struct SwiftJobCASStore: Sendable {
             moduleName: identity.moduleName,
             commandLineDigest: identity.commandLineDigest,
             commandLine: identity.commandLine,
-            inputIdentityMode: SwiftJobCASIdentity.inputIdentityMode,
+            inputIdentityMode: identity.inputIdentityMode,
             primaryInputDigests: identity.primaryInputDigests,
+            dependencyFingerprintDigests: identity.dependencyFingerprintDigests,
             producerCompilerCacheKeys: identity.producerCompilerCacheKeys,
             outputs: manifestOutputs
         )
@@ -471,6 +489,7 @@ package struct SwiftJobCASStore: Sendable {
                   existing.commandLine == action.commandLine,
                   existing.inputIdentityMode == action.inputIdentityMode,
                   existing.primaryInputDigests == action.primaryInputDigests,
+                  existing.dependencyFingerprintDigests == action.dependencyFingerprintDigests,
                   existing.outputs == action.outputs else {
                 throw StubError.error("job CAS action collision for \(identity.key)")
             }

@@ -83,6 +83,70 @@ fileprivate struct SwiftJobCASTests {
     }
 
     @Test
+    func dependencyFingerprintsGeneralizeIdentityWithoutChangingLegacyKeys() {
+        let legacy = identity(
+            primaryInputDigests: ["/__swiftbuild_opt__/source/Caller.swift=caller-content"]
+        )
+        let explicitLegacy = SwiftJobCASIdentity(
+            toolchainIdentity: legacy.toolchainIdentity,
+            ruleInfoType: legacy.ruleInfoType,
+            moduleName: legacy.moduleName,
+            primaryInputDigests: legacy.primaryInputDigests,
+            dependencyFingerprintDigests: nil,
+            producerCompilerCacheKeys: legacy.producerCompilerCacheKeys,
+            commandLine: legacy.commandLine,
+            outputNames: legacy.outputNames
+        )
+        let first = SwiftJobCASIdentity(
+            toolchainIdentity: legacy.toolchainIdentity,
+            ruleInfoType: legacy.ruleInfoType,
+            moduleName: legacy.moduleName,
+            primaryInputDigests: legacy.primaryInputDigests,
+            dependencyFingerprintDigests: [
+                "top-level|interface||callee|api-a",
+                "nominal|interface|s:7Fixture4TypeV||api-b",
+            ],
+            producerCompilerCacheKeys: legacy.producerCompilerCacheKeys,
+            commandLine: legacy.commandLine,
+            outputNames: legacy.outputNames
+        )
+        let reordered = SwiftJobCASIdentity(
+            toolchainIdentity: legacy.toolchainIdentity,
+            ruleInfoType: legacy.ruleInfoType,
+            moduleName: legacy.moduleName,
+            primaryInputDigests: legacy.primaryInputDigests,
+            dependencyFingerprintDigests: [
+                "nominal|interface|s:7Fixture4TypeV||api-b",
+                "top-level|interface||callee|api-a",
+            ],
+            producerCompilerCacheKeys: legacy.producerCompilerCacheKeys,
+            commandLine: legacy.commandLine,
+            outputNames: legacy.outputNames
+        )
+        let changedAPI = SwiftJobCASIdentity(
+            toolchainIdentity: legacy.toolchainIdentity,
+            ruleInfoType: legacy.ruleInfoType,
+            moduleName: legacy.moduleName,
+            primaryInputDigests: legacy.primaryInputDigests,
+            dependencyFingerprintDigests: [
+                "top-level|interface||callee|api-changed",
+                "nominal|interface|s:7Fixture4TypeV||api-b",
+            ],
+            producerCompilerCacheKeys: legacy.producerCompilerCacheKeys,
+            commandLine: legacy.commandLine,
+            outputNames: legacy.outputNames
+        )
+
+        #expect(legacy.key == explicitLegacy.key)
+        #expect(legacy.key == "4b9be270a9feed37964d1781060ad693b9f19639bbde4b36ddfc0ec8db7cabde")
+        #expect(legacy.inputIdentityMode == SwiftJobCASIdentity.primaryOnlyInputIdentityMode)
+        #expect(first.inputIdentityMode == SwiftJobCASIdentity.dependencyAwareInputIdentityMode)
+        #expect(first.key == reordered.key)
+        #expect(first.key != legacy.key)
+        #expect(first.key != changedAPI.key)
+    }
+
+    @Test
     func identityNormalizesSchedulerNumberedSupplementaryOutputMaps() {
         let first = SwiftJobCASIdentity(
             toolchainIdentity: "/toolchain/swift-frontend",
