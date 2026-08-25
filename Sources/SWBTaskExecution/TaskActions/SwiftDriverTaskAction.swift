@@ -26,6 +26,49 @@ private enum SwiftDriverPlanCacheMode: String {
     var canWrite: Bool { self == .record || self == .readWrite }
 }
 
+#if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+private struct SwiftDriverDependencyPlanObservationConfiguration {
+    static let modeVariable = "SWIFT_BUILD_DRIVER_PLAN_COMPATIBILITY_MODE"
+    static let manifestPathVariable = "SWIFT_BUILD_DRIVER_PLAN_DEPENDENCY_MANIFEST"
+    static let planInputIdentityVariable = "SWIFT_BUILD_DRIVER_PLAN_INPUT_IDENTITY"
+
+    let manifestPath: Path
+    let planInputIdentity: String
+
+    init?(environment: [String: String]) throws {
+        guard let mode = environment[Self.modeVariable], mode != "off" else { return nil }
+        guard mode == "observe" else {
+            throw StubError.error("\(Self.modeVariable) must be off or observe.")
+        }
+        guard let rawManifestPath = environment[Self.manifestPathVariable],
+              Path(rawManifestPath).isAbsolute else {
+            throw StubError.error("\(Self.manifestPathVariable) must be an absolute path in observe mode.")
+        }
+        guard let planInputIdentity = environment[Self.planInputIdentityVariable],
+              planInputIdentity.count == 64,
+              planInputIdentity.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
+            throw StubError.error("\(Self.planInputIdentityVariable) must be a lowercase SHA-256 digest.")
+        }
+        self.manifestPath = Path(rawManifestPath)
+        self.planInputIdentity = planInputIdentity
+    }
+}
+
+private struct SwiftDriverDependencyPlanObservationRecord: Codable {
+    static let schema = "swift-build-driver-plan-observation-record-v1"
+
+    let schema: String
+    let exactActionKey: String
+    let binding: SwiftDependencyPlanBinding
+
+    init(exactActionKey: String, binding: SwiftDependencyPlanBinding) {
+        self.schema = Self.schema
+        self.exactActionKey = exactActionKey
+        self.binding = binding
+    }
+}
+#endif
+
 private struct SwiftDriverPlanCacheConfiguration {
     static let rootVariable = "SWIFT_BUILD_DRIVER_PLAN_CACHE_ROOT"
     static let modeVariable = "SWIFT_BUILD_DRIVER_PLAN_CACHE_MODE"
@@ -34,6 +77,9 @@ private struct SwiftDriverPlanCacheConfiguration {
     let root: Path
     let mode: SwiftDriverPlanCacheMode
     let key: String
+    #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+    let dependencyObservation: SwiftDriverDependencyPlanObservationConfiguration?
+    #endif
 
     init?(environment: [String: String]) throws {
         guard let rawMode = environment[Self.modeVariable],
@@ -56,19 +102,38 @@ private struct SwiftDriverPlanCacheConfiguration {
         self.root = root
         self.mode = mode
         self.key = key
+        #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+        self.dependencyObservation = try SwiftDriverDependencyPlanObservationConfiguration(
+            environment: environment
+        )
+        #endif
     }
 
     var actionPath: Path {
-        root.join("actions").join(String(key.prefix(2))).join("\(key).msgpack")
+        actionPath(for: key)
     }
 
     var casSnapshotPath: Path {
-        root.join("cas").join(String(key.prefix(2))).join(key)
+        casSnapshotPath(for: key)
     }
 
     var directPlanPath: Path {
         root.join("direct").join(String(key.prefix(2))).join("\(key).json")
     }
+
+    func actionPath(for actionKey: String) -> Path {
+        root.join("actions").join(String(actionKey.prefix(2))).join("\(actionKey).msgpack")
+    }
+
+    func casSnapshotPath(for actionKey: String) -> Path {
+        root.join("cas").join(String(actionKey.prefix(2))).join(actionKey)
+    }
+
+    #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+    func dependencyObservationPath(for lookupIdentity: String) -> Path {
+        root.join("compatible").join(String(lookupIdentity.prefix(2))).join("\(lookupIdentity).json")
+    }
+    #endif
 
     func publishCASSnapshot(from source: Path) throws {
         let fileManager = FileManager.default
@@ -156,6 +221,56 @@ private struct SwiftDriverDirectPlanManifest: Codable {
         jobs = snapshot.plannedBuild.plannedTargetJobs.map(Job.init)
     }
 }
+
+#if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+private func dependencyPlanJobs(
+    from snapshot: SwiftDriverPlanCacheSnapshot
+) -> [SwiftDependencyPlanBinding.Job] {
+    let plannedJobs = snapshot.explicitModuleJobs + snapshot.plannedBuild.plannedTargetJobs
+    let identitiesByKey = Dictionary(uniqueKeysWithValues: plannedJobs.map { job in
+        let commandLine = job.driverJob.commandLine.map(\.asString)
+        let primaryIndices = commandLine.indices.filter { index in
+            commandLine[index] == "-primary-file" && commandLine.indices.contains(index + 1)
+        }
+        let primarySourceIdentity = primaryIndices.count == 1
+            ? commandLine[primaryIndices[0] + 1]
+            : nil
+        var identityFields = [
+            "swift-build-dependency-plan-job-v1",
+            primarySourceIdentity ?? "",
+            job.driverJob.ruleInfoType,
+            job.driverJob.moduleName,
+        ]
+        identityFields.append(contentsOf: job.driverJob.outputs.map(\.str))
+        let context = SHA256Context()
+        for field in identityFields {
+            let bytes = Array(field.utf8)
+            context.add(number: UInt64(bytes.count))
+            context.add(bytes: bytes)
+        }
+        return (String(describing: job.key), context.signature.asString)
+    })
+    return plannedJobs.map { job in
+        let commandLine = job.driverJob.commandLine.map(\.asString)
+        let primaryIndices = commandLine.indices.filter { index in
+            commandLine[index] == "-primary-file" && commandLine.indices.contains(index + 1)
+        }
+        let primarySourceIdentity = primaryIndices.count == 1
+            ? commandLine[primaryIndices[0] + 1]
+            : nil
+        return .init(
+            identity: identitiesByKey[String(describing: job.key)]!,
+            primarySourceIdentity: primarySourceIdentity,
+            dependencies: job.dependencies.map {
+                let key = String(describing: $0)
+                return identitiesByKey[key] ?? "missing:\(key)"
+            },
+            commandShape: [job.driverJob.ruleInfoType, job.driverJob.moduleName],
+            outputShape: job.driverJob.outputs.map(\.str)
+        )
+    }
+}
+#endif
 #endif
 
 final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAction {
@@ -212,12 +327,36 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
             var planCacheWriteDurationNS: UInt64 = 0
             var planCacheBytes = 0
             var directPlanBytes = 0
+            #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+            var dependencyObservationManifest: SwiftDependencyModuleManifest?
+            var dependencyObservationOutcome = "off"
+            var dependencyObservationLookupIdentity = "none"
+            var dependencyObservationCandidateKey = "none"
+            var dependencyObservationCandidateBinding: SwiftDependencyPlanBinding?
+            #endif
             do {
                 planCacheConfiguration = try SwiftDriverPlanCacheConfiguration(environment: environment)
             } catch {
                 planCacheOutcome = "invalid_configuration"
                 outputDelegate.note("SWIFT_DRIVER_PLAN_CACHE outcome=invalid_configuration fallback=apple error=\(error.localizedDescription)")
             }
+            #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+            if let observation = planCacheConfiguration?.dependencyObservation {
+                do {
+                    let manifestBytes = try executionDelegate.fs.read(observation.manifestPath)
+                    dependencyObservationManifest = try JSONDecoder().decode(
+                        SwiftDependencyModuleManifest.self,
+                        from: Data(manifestBytes.bytes)
+                    )
+                    dependencyObservationOutcome = "ready"
+                } catch {
+                    dependencyObservationOutcome = "invalid_manifest"
+                    outputDelegate.note(
+                        "SWIFT_DRIVER_PLAN_COMPATIBILITY outcome=invalid_manifest replay=disabled fallback=apple error=\(error.localizedDescription)"
+                    )
+                }
+            }
+            #endif
             if let planCacheConfiguration, planCacheConfiguration.mode.canRead {
                 let readTimer = ElapsedTimer()
                 if executionDelegate.fs.exists(planCacheConfiguration.actionPath) {
@@ -250,6 +389,50 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                     }
                 } else {
                     planCacheOutcome = "miss"
+                    #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+                    if let observation = planCacheConfiguration.dependencyObservation,
+                       let manifest = dependencyObservationManifest {
+                        do {
+                            let lookupIdentity = try SwiftDependencyPlanBinding.lookupIdentity(
+                                moduleManifest: manifest,
+                                planInputIdentity: observation.planInputIdentity
+                            )
+                            dependencyObservationLookupIdentity = lookupIdentity
+                            let observationPath = planCacheConfiguration.dependencyObservationPath(
+                                for: lookupIdentity
+                            )
+                            guard executionDelegate.fs.exists(observationPath) else {
+                                dependencyObservationOutcome = "miss"
+                                throw StubError.error("No compatible Swift Driver plan observation exists.")
+                            }
+                            let recordBytes = try executionDelegate.fs.read(observationPath)
+                            let record = try JSONDecoder().decode(
+                                SwiftDriverDependencyPlanObservationRecord.self,
+                                from: Data(recordBytes.bytes)
+                            )
+                            guard record.schema == SwiftDriverDependencyPlanObservationRecord.schema,
+                                  record.exactActionKey.count == 64,
+                                  record.exactActionKey.allSatisfy({ $0.isHexDigit && !$0.isUppercase }),
+                                  executionDelegate.fs.exists(planCacheConfiguration.actionPath(for: record.exactActionKey)),
+                                  executionDelegate.fs.exists(planCacheConfiguration.casSnapshotPath(for: record.exactActionKey)) else {
+                                throw StubError.error("Compatible Swift Driver plan observation is incomplete.")
+                            }
+                            guard case .compatible = record.binding.observe(
+                                currentManifest: manifest,
+                                currentPlanInputIdentity: observation.planInputIdentity
+                            ) else {
+                                throw StubError.error("Compatible Swift Driver plan observation failed validation.")
+                            }
+                            dependencyObservationCandidateKey = record.exactActionKey
+                            dependencyObservationCandidateBinding = record.binding
+                            dependencyObservationOutcome = "compatible"
+                        } catch {
+                            if dependencyObservationOutcome != "miss" {
+                                dependencyObservationOutcome = "invalid"
+                            }
+                        }
+                    }
+                    #endif
                 }
                 planCacheReadDurationNS = readTimer.elapsedTime().nanoseconds
             }
@@ -346,6 +529,49 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                             atomically: true
                         )
                     }
+                    #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+                    if let observation = planCacheConfiguration.dependencyObservation,
+                       let manifest = dependencyObservationManifest {
+                        do {
+                            let binding = try SwiftDependencyPlanBinding(
+                                moduleManifest: manifest,
+                                planInputIdentity: observation.planInputIdentity,
+                                jobs: dependencyPlanJobs(from: snapshot)
+                            )
+                            let record = SwiftDriverDependencyPlanObservationRecord(
+                                exactActionKey: planCacheConfiguration.key,
+                                binding: binding
+                            )
+                            let observationBytes = try JSONEncoder().encode(record)
+                            let observationPath = planCacheConfiguration.dependencyObservationPath(
+                                for: binding.lookupIdentity
+                            )
+                            try executionDelegate.fs.createDirectory(observationPath.dirname, recursive: true)
+                            try executionDelegate.fs.write(
+                                observationPath,
+                                contents: ByteString(observationBytes),
+                                atomically: true
+                            )
+                            dependencyObservationLookupIdentity = binding.lookupIdentity
+                            if let candidateBinding = dependencyObservationCandidateBinding {
+                                dependencyObservationOutcome = candidateBinding.planStructureIdentity
+                                    == binding.planStructureIdentity
+                                    ? "compatible_confirmed_recorded"
+                                    : "structure_mismatch_recorded"
+                            } else {
+                                dependencyObservationCandidateKey = planCacheConfiguration.key
+                                dependencyObservationOutcome = dependencyObservationOutcome == "ready"
+                                    ? "recorded"
+                                    : "\(dependencyObservationOutcome)_recorded"
+                            }
+                        } catch {
+                            dependencyObservationOutcome = "record_error"
+                            outputDelegate.note(
+                                "SWIFT_DRIVER_PLAN_COMPATIBILITY outcome=record_error replay=disabled fallback=apple error=\(error.localizedDescription)"
+                            )
+                        }
+                    }
+                    #endif
                     planCacheOutcome = "recorded"
                 } catch {
                     planCacheOutcome = "record_error"
@@ -357,6 +583,13 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                 outputDelegate.note(
                     "SWIFT_DRIVER_PLAN_CACHE outcome=\(planCacheOutcome) key=\(planCacheConfiguration?.key ?? "none") bytes=\(planCacheBytes) direct_plan_bytes=\(directPlanBytes) duration_ns=\(planCacheTimer.elapsedTime().nanoseconds) read_ns=\(planCacheReadDurationNS) apple_plan_ns=\(planCachePlanDurationNS) write_ns=\(planCacheWriteDurationNS)"
                 )
+                #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+                if planCacheConfiguration?.dependencyObservation != nil {
+                    outputDelegate.note(
+                        "SWIFT_DRIVER_PLAN_COMPATIBILITY outcome=\(dependencyObservationOutcome) lookup=\(dependencyObservationLookupIdentity) candidate_key=\(dependencyObservationCandidateKey) candidate_replay=disabled planning=\(plannedFromCache ? "exact_cache" : "apple")"
+                    )
+                }
+                #endif
             }
             #endif
         }
