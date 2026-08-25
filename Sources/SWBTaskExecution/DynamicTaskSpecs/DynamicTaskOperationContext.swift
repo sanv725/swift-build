@@ -142,6 +142,11 @@ public final class DynamicTaskOperationContext {
     package let definingTargetsByModuleName: [String: OrderedSet<ConfiguredTarget>]
     package let cas: ToolchainCAS?
     private let acceleratorCacheQuarantined = SWBMutex(false)
+    #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+    private let swiftDependencyShadowCoordinators = SWBMutex(
+        [String: SwiftDependencyShadowCoordinator]()
+    )
+    #endif
     #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
     private let unsafeReplayExecutors = SWBMutex([Int: UnsafePersistentSwiftCacheReplayExecutor]())
     #endif
@@ -172,6 +177,25 @@ public final class DynamicTaskOperationContext {
             return true
         }
     }
+
+    #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+    package func swiftDependencyShadowCoordinator(
+        configurationPath: Path,
+        fs: any FSProxy
+    ) throws -> SwiftDependencyShadowCoordinator {
+        try swiftDependencyShadowCoordinators.withLock { coordinators in
+            if let coordinator = coordinators[configurationPath.str] {
+                return coordinator
+            }
+            let coordinator = try SwiftDependencyShadowCoordinator(
+                configurationPath: configurationPath,
+                fs: fs
+            )
+            coordinators[configurationPath.str] = coordinator
+            return coordinator
+        }
+    }
+    #endif
 
     #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
     package func unsafeReplayExecutor(maximumParallelism: Int) -> UnsafePersistentSwiftCacheReplayExecutor {
@@ -211,6 +235,9 @@ public final class DynamicTaskOperationContext {
             self.compilationCachingUploader = CompilationCachingUploader()
             self.compilationCachingDataPruner = CompilationCachingDataPruner()
             self.acceleratorCacheQuarantined.withLock { $0 = false }
+            #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+            self.swiftDependencyShadowCoordinators.withLock { $0.removeAll() }
+            #endif
         }
     }
 

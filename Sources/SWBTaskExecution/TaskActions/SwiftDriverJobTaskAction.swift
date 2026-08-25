@@ -1095,6 +1095,18 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
         let jobCASConfiguration = SwiftJobCASConfiguration.parse(environment: environment)
         SwiftJobCASConfiguration.removeControlVariables(from: &environment)
+        let dependencyShadowConfigurationPath: Path?
+        do {
+            dependencyShadowConfigurationPath = try SwiftDependencyShadowConfiguration.path(
+                environment: environment
+            )
+        } catch {
+            dependencyShadowConfigurationPath = nil
+            outputDelegate.note(
+                "SWIFT_DEPENDENCY_SHADOW outcome=invalid_configuration candidate_replay=disabled fallback=apple error=\(error.localizedDescription)"
+            )
+        }
+        SwiftDependencyShadowConfiguration.removeControlVariable(from: &environment)
         #endif
 
         #if SWIFT_BUILD_ACCELERATOR_TRUST_CANARY
@@ -1820,6 +1832,49 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 return .failed
             }
             #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+            if delegate.commandResult == .succeeded,
+               case .targetCompile = identifier,
+               let dependencyShadowConfigurationPath {
+                do {
+                    guard let rawPrimaryPath = Self.uniqueArgumentValue(
+                        after: "-primary-file",
+                        in: options.commandLine
+                    ), let rawDependencyPath = Self.uniqueArgumentValue(
+                        after: "-emit-reference-dependencies-path",
+                        in: options.commandLine
+                    ) else {
+                        throw StubError.error(
+                            "Swift dependency shadow requires one primary and one reference-dependencies output."
+                        )
+                    }
+                    let unqualifiedPrimaryPath = Path(rawPrimaryPath)
+                    let primaryPath = unqualifiedPrimaryPath.isAbsolute
+                        ? unqualifiedPrimaryPath
+                        : task.workingDirectory.join(unqualifiedPrimaryPath)
+                    let unqualifiedDependencyPath = Path(rawDependencyPath)
+                    let dependencyPath = unqualifiedDependencyPath.isAbsolute
+                        ? unqualifiedDependencyPath
+                        : task.workingDirectory.join(unqualifiedDependencyPath)
+                    let coordinator = try dynamicExecutionDelegate.operationContext
+                        .swiftDependencyShadowCoordinator(
+                            configurationPath: dependencyShadowConfigurationPath,
+                            fs: executionDelegate.fs
+                        )
+                    let summary = try coordinator.observeFrontend(
+                        moduleName: driverJob.driverJob.moduleName,
+                        primaryPath: primaryPath,
+                        dependencyPath: dependencyPath,
+                        fs: executionDelegate.fs
+                    )
+                    outputDelegate.note(
+                        "SWIFT_DEPENDENCY_SHADOW outcome=\(summary.outcome) predicted=\(summary.predictedCount) actual=\(summary.actualCount) pending=\(summary.pendingCount) candidate_replay=disabled planning=apple"
+                    )
+                } catch {
+                    outputDelegate.note(
+                        "SWIFT_DEPENDENCY_SHADOW outcome=invalid_observation candidate_replay=disabled fallback=apple error=\(error.localizedDescription)"
+                    )
+                }
+            }
             if delegate.commandResult == .succeeded,
                let jobCASConfiguration,
                jobCASConfiguration.mode.writes,
@@ -3259,4 +3314,17 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 activityReporter: dynamicExecutionDelegate)
         }
     }
+
+    #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+    private static func uniqueArgumentValue(
+        after option: String,
+        in commandLine: [String]
+    ) -> String? {
+        let indices = commandLine.indices.filter { index in
+            commandLine[index] == option && commandLine.indices.contains(index + 1)
+        }
+        guard indices.count == 1 else { return nil }
+        return commandLine[indices[0] + 1]
+    }
+    #endif
 }

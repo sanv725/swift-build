@@ -62,6 +62,10 @@ public struct SwiftDependencyInvalidationScheduler: Sendable {
         pendingSources.sorted()
     }
 
+    public var affectedSourceIdentities: [String] {
+        affectedSources.sorted()
+    }
+
     public var compilationCounts: [String: Int] {
         mutableCompilationCounts
     }
