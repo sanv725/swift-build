@@ -76,6 +76,37 @@ fileprivate struct SwiftDependencyModuleManifestTests {
         ))
         #expect(apiCone.affectedSources == [Self.callerIdentity, Self.providerIdentity])
         #expect(apiCone.reusableSources == [Self.unrelatedIdentity])
+
+        var bodyScheduler = try SwiftDependencyInvalidationScheduler(
+            previousManifest: base.manifest,
+            expectedSourceIdentities: Self.allSources,
+            changedSourceIdentities: changedProvider
+        )
+        try bodyScheduler.recordCompiledProjection(
+            body.projections[Self.providerIdentity]!,
+            for: Self.providerIdentity
+        )
+        #expect(bodyScheduler.isComplete)
+        let bodySchedulerResult = try bodyScheduler.result()
+        #expect(bodySchedulerResult.invalidationCone == bodyCone)
+
+        var apiScheduler = try SwiftDependencyInvalidationScheduler(
+            previousManifest: base.manifest,
+            expectedSourceIdentities: Self.allSources,
+            changedSourceIdentities: changedProvider
+        )
+        try apiScheduler.recordCompiledProjection(
+            api.projections[Self.providerIdentity]!,
+            for: Self.providerIdentity
+        )
+        #expect(apiScheduler.pendingSourceIdentities == [Self.callerIdentity])
+        try apiScheduler.recordCompiledProjection(
+            api.projections[Self.callerIdentity]!,
+            for: Self.callerIdentity
+        )
+        #expect(apiScheduler.isComplete)
+        let apiSchedulerResult = try apiScheduler.result()
+        #expect(apiSchedulerResult.invalidationCone == apiCone)
     }
 
     @Test
