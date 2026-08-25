@@ -133,7 +133,18 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
         )
         let preclassifiedChangedSource: String?
         let fixedPointResult: SwiftDependencyFixedPointResult?
-        if configuration.preclassifiedBodyEdit == true {
+        if let proof = configuration.preclassifiedBodyEditProof {
+            let changedSource = configuration.changedSourceIdentities[0]
+            try Self.validate(
+                proof: proof,
+                changedSource: changedSource,
+                pathMappings: configuration.pathMappings,
+                fs: fs
+            )
+            try scheduler.preclassifyChangedSourceAsInterfaceStable(changedSource)
+            preclassifiedChangedSource = changedSource
+            fixedPointResult = try scheduler.result()
+        } else if configuration.preclassifiedBodyEdit == true {
             let changedSource = configuration.changedSourceIdentities[0]
             try scheduler.preclassifyChangedSourceAsInterfaceStable(changedSource)
             preclassifiedChangedSource = changedSource
@@ -152,6 +163,49 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
             preclassifiedChangedSource: preclassifiedChangedSource,
             fixedPointResult: fixedPointResult
         ))
+    }
+
+    private static func validate(
+        proof: SwiftDependencyBodyEditProof,
+        changedSource: String,
+        pathMappings: [SwiftDependencyPathMapping],
+        fs: any FSProxy
+    ) throws {
+        func isSHA256(_ value: String) -> Bool {
+            value.utf8.count == 64 && value.utf8.allSatisfy {
+                ($0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9"))
+                    || ($0 >= UInt8(ascii: "a") && $0 <= UInt8(ascii: "f"))
+            }
+        }
+
+        guard proof.schema == SwiftDependencyBodyEditProof.schema,
+              proof.classifierVersion == SwiftDependencyBodyEditProof.classifierVersion,
+              proof.sourceIdentity == changedSource,
+              isSHA256(proof.baselineSHA256),
+              isSHA256(proof.candidateSHA256),
+              proof.baselineSHA256 != proof.candidateSHA256,
+              isSHA256(proof.surfaceSHA256),
+              !proof.changedBodyOrdinals.isEmpty,
+              proof.changedBodyOrdinals == Array(Set(proof.changedBodyOrdinals)).sorted(),
+              proof.changedBodyOrdinals.allSatisfy({ $0 >= 0 }) else {
+            throw StubError.error("Swift dependency body-edit proof is invalid.")
+        }
+        let sourcePath = pathMappings.lazy.compactMap { mapping -> Path? in
+            guard changedSource == mapping.virtualPrefix
+                    || changedSource.hasPrefix(mapping.virtualPrefix + "/") else {
+                return nil
+            }
+            return Path(mapping.physicalPrefix + changedSource.dropFirst(mapping.virtualPrefix.count))
+        }.first
+        guard let sourcePath, sourcePath.isAbsolute, fs.exists(sourcePath) else {
+            throw StubError.error("Swift dependency body-edit proof source cannot be resolved.")
+        }
+        let bytes = try fs.read(sourcePath)
+        let hash = SHA256Context()
+        hash.add(bytes: bytes)
+        guard hash.signature.asString == proof.candidateSHA256 else {
+            throw StubError.error("Swift dependency body-edit proof does not match the active source.")
+        }
     }
 
     package func admissionDecision(
@@ -225,6 +279,9 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
                     let outcome = replaysComplete && !state.replayFallbackSources.isEmpty
                         ? "replay_fallback"
                         : "admitted"
+                    let persistedOutcome = replaysComplete
+                        ? outcome
+                        : "admitted_pending_replays"
                     return .init(
                         completion: .init(
                             outcome: outcome,
@@ -235,11 +292,11 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
                             pendingCount: 0
                         ),
                         resumptions: [],
-                        result: replaysComplete ? makeResult(
-                            outcome: outcome,
+                        result: makeResult(
+                            outcome: persistedOutcome,
                             fixedPoint: fixedPoint,
                             actualExecutionCounts: state.actualExecutionCounts
-                        ) : nil
+                        )
                     )
                 }
                 guard state.abortedReason == nil,

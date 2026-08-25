@@ -15,6 +15,35 @@ import Synchronization
 package import SWBCore
 package import SWBUtil
 
+package struct SwiftDependencyBodyEditProof: Codable, Sendable, Equatable {
+    package static let schema = "swift-build-body-edit-preclassification-proof-v1"
+    package static let classifierVersion = "swift-lexical-body-surface-v1"
+
+    package let schema: String
+    package let classifierVersion: String
+    package let sourceIdentity: String
+    package let baselineSHA256: String
+    package let candidateSHA256: String
+    package let surfaceSHA256: String
+    package let changedBodyOrdinals: [Int]
+
+    package init(
+        sourceIdentity: String,
+        baselineSHA256: String,
+        candidateSHA256: String,
+        surfaceSHA256: String,
+        changedBodyOrdinals: [Int]
+    ) {
+        self.schema = Self.schema
+        self.classifierVersion = Self.classifierVersion
+        self.sourceIdentity = sourceIdentity
+        self.baselineSHA256 = baselineSHA256
+        self.candidateSHA256 = candidateSHA256
+        self.surfaceSHA256 = surfaceSHA256
+        self.changedBodyOrdinals = changedBodyOrdinals
+    }
+}
+
 package struct SwiftDependencyShadowConfiguration: Codable, Sendable, Equatable {
     package static let schema = "swift-build-dependency-shadow-configuration-v1"
     package static let pathVariable = "SWIFT_BUILD_DEPENDENCY_SHADOW_CONFIG"
@@ -36,6 +65,7 @@ package struct SwiftDependencyShadowConfiguration: Codable, Sendable, Equatable 
     package let recordPathPolicyIdentity: String?
     package let recordSourceIdentities: [String]?
     package let preclassifiedBodyEdit: Bool?
+    package let preclassifiedBodyEditProof: SwiftDependencyBodyEditProof?
 
     package init(
         previousManifestPath: String,
@@ -54,6 +84,7 @@ package struct SwiftDependencyShadowConfiguration: Codable, Sendable, Equatable 
         self.recordPathPolicyIdentity = nil
         self.recordSourceIdentities = nil
         self.preclassifiedBodyEdit = nil
+        self.preclassifiedBodyEditProof = nil
     }
 
     package init(
@@ -76,6 +107,7 @@ package struct SwiftDependencyShadowConfiguration: Codable, Sendable, Equatable 
         self.recordPathPolicyIdentity = pathPolicyIdentity
         self.recordSourceIdentities = sourceIdentities.sorted()
         self.preclassifiedBodyEdit = nil
+        self.preclassifiedBodyEditProof = nil
     }
 
     package init(
@@ -83,7 +115,8 @@ package struct SwiftDependencyShadowConfiguration: Codable, Sendable, Equatable 
         resultPath: String,
         changedSourceIdentity: String,
         pathMappings: [SwiftDependencyPathMapping],
-        preclassifiedBodyEdit: Bool = false
+        preclassifiedBodyEdit: Bool = false,
+        preclassifiedBodyEditProof: SwiftDependencyBodyEditProof? = nil
     ) {
         self.schema = Self.schema
         self.mode = .admit
@@ -96,6 +129,7 @@ package struct SwiftDependencyShadowConfiguration: Codable, Sendable, Equatable 
         self.recordPathPolicyIdentity = nil
         self.recordSourceIdentities = nil
         self.preclassifiedBodyEdit = preclassifiedBodyEdit ? true : nil
+        self.preclassifiedBodyEditProof = preclassifiedBodyEditProof
     }
 
     package static func path(environment: [String: String]) throws -> Path? {

@@ -78,9 +78,24 @@ fileprivate struct SwiftDependencyAdmissionCoordinatorTests {
     @Test
     func preclassifiedBodyEditNeverSuspendsReusablePrimaries() async throws {
         let temporaryDirectory = try NamedTemporaryDirectory()
+        let candidatePath = temporaryDirectory.path.join("Provider.swift")
+        let candidate = ByteString(encodingAsUTF8: "func provider() -> Int { 727 }\n")
+        try localFS.write(candidatePath, contents: candidate)
+        let candidateHash = SHA256Context()
+        candidateHash.add(bytes: candidate)
         let coordinator = try makeCoordinator(
             temporaryDirectory: temporaryDirectory,
-            preclassifiedBodyEdit: true
+            preclassifiedBodyEditProof: .init(
+                sourceIdentity: provider,
+                baselineSHA256: String(repeating: "a", count: 64),
+                candidateSHA256: candidateHash.signature.asString,
+                surfaceSHA256: String(repeating: "b", count: 64),
+                changedBodyOrdinals: [0]
+            ),
+            pathMappings: [.init(
+                physicalPrefix: temporaryDirectory.path.str,
+                virtualPrefix: "/^src"
+            )]
         )
 
         let callerDecision = await coordinator.admissionDecision(
@@ -120,6 +135,53 @@ fileprivate struct SwiftDependencyAdmissionCoordinatorTests {
         let result = try readResult(temporaryDirectory: temporaryDirectory)
         #expect(result.outcome == "admitted")
         #expect(result.predictedAffectedSources == [provider])
+        #expect(result.predictedReusableSources == [caller, unrelated])
+        #expect(result.actualExecutedSources == [provider])
+    }
+
+    @Test
+    func rejectsAStalePreclassifiedBodyEditProof() throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        try localFS.write(
+            temporaryDirectory.path.join("Provider.swift"),
+            contents: ByteString(encodingAsUTF8: "func provider() -> Int { 728 }\n")
+        )
+        #expect(throws: (any Error).self) {
+            try makeCoordinator(
+                temporaryDirectory: temporaryDirectory,
+                preclassifiedBodyEditProof: .init(
+                    sourceIdentity: provider,
+                    baselineSHA256: String(repeating: "a", count: 64),
+                    candidateSHA256: String(repeating: "c", count: 64),
+                    surfaceSHA256: String(repeating: "b", count: 64),
+                    changedBodyOrdinals: [0]
+                ),
+                pathMappings: [.init(
+                    physicalPrefix: temporaryDirectory.path.str,
+                    virtualPrefix: "/^src"
+                )]
+            )
+        }
+    }
+
+    @Test
+    func persistsAdmissionWhenIncrementalPlanningOmitsReusablePrimaries() async throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let coordinator = try makeCoordinator(
+            temporaryDirectory: temporaryDirectory,
+            preclassifiedBodyEdit: true
+        )
+        #expect(await coordinator.admissionDecision(
+            moduleName: "AdmissionFixture",
+            primaryPath: Path(provider)
+        ) == .executeChanged(sourceIdentity: provider))
+        let completion = try coordinator.completeProjection(
+            providerProjection(fingerprint: "provider-v1"),
+            sourceIdentity: provider
+        )
+        #expect(completion.outcome == "admitted")
+        let result = try readResult(temporaryDirectory: temporaryDirectory)
+        #expect(result.outcome == "admitted_pending_replays")
         #expect(result.predictedReusableSources == [caller, unrelated])
         #expect(result.actualExecutedSources == [provider])
     }
@@ -230,14 +292,17 @@ fileprivate struct SwiftDependencyAdmissionCoordinatorTests {
 
     private func makeCoordinator(
         temporaryDirectory: NamedTemporaryDirectory,
-        preclassifiedBodyEdit: Bool = false
+        preclassifiedBodyEdit: Bool = false,
+        preclassifiedBodyEditProof: SwiftDependencyBodyEditProof? = nil,
+        pathMappings: [SwiftDependencyPathMapping] = []
     ) throws -> SwiftDependencyAdmissionCoordinator {
         let configuration = SwiftDependencyShadowConfiguration(
             admittingManifestAt: temporaryDirectory.path.join("manifest.json").str,
             resultPath: temporaryDirectory.path.join("result.json").str,
             changedSourceIdentity: provider,
-            pathMappings: [],
-            preclassifiedBodyEdit: preclassifiedBodyEdit
+            pathMappings: pathMappings,
+            preclassifiedBodyEdit: preclassifiedBodyEdit,
+            preclassifiedBodyEditProof: preclassifiedBodyEditProof
         )
         return try .init(
             configuration: configuration,
