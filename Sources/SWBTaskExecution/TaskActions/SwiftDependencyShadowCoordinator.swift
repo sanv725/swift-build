@@ -35,6 +35,7 @@ package struct SwiftDependencyShadowConfiguration: Codable, Sendable, Equatable 
     package let recordToolchainIdentity: String?
     package let recordPathPolicyIdentity: String?
     package let recordSourceIdentities: [String]?
+    package let preclassifiedBodyEdit: Bool?
 
     package init(
         previousManifestPath: String,
@@ -52,6 +53,7 @@ package struct SwiftDependencyShadowConfiguration: Codable, Sendable, Equatable 
         self.recordToolchainIdentity = nil
         self.recordPathPolicyIdentity = nil
         self.recordSourceIdentities = nil
+        self.preclassifiedBodyEdit = nil
     }
 
     package init(
@@ -73,13 +75,15 @@ package struct SwiftDependencyShadowConfiguration: Codable, Sendable, Equatable 
         self.recordToolchainIdentity = toolchainIdentity
         self.recordPathPolicyIdentity = pathPolicyIdentity
         self.recordSourceIdentities = sourceIdentities.sorted()
+        self.preclassifiedBodyEdit = nil
     }
 
     package init(
         admittingManifestAt previousManifestPath: String,
         resultPath: String,
         changedSourceIdentity: String,
-        pathMappings: [SwiftDependencyPathMapping]
+        pathMappings: [SwiftDependencyPathMapping],
+        preclassifiedBodyEdit: Bool = false
     ) {
         self.schema = Self.schema
         self.mode = .admit
@@ -91,6 +95,7 @@ package struct SwiftDependencyShadowConfiguration: Codable, Sendable, Equatable 
         self.recordToolchainIdentity = nil
         self.recordPathPolicyIdentity = nil
         self.recordSourceIdentities = nil
+        self.preclassifiedBodyEdit = preclassifiedBodyEdit ? true : nil
     }
 
     package static func path(environment: [String: String]) throws -> Path? {

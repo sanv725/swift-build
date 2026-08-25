@@ -63,6 +63,7 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
 
     private struct State {
         var scheduler: SwiftDependencyInvalidationScheduler
+        var preclassifiedChangedSource: String?
         var dispatchedSources: Set<String> = []
         var waiters: [String: [Waiter]] = [:]
         var actualExecutionCounts: [String: Int] = [:]
@@ -125,17 +126,32 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
             throw StubError.error("Swift dependency admission result path must be absolute.")
         }
         let sourceIdentities = previousManifest.sources.map(\.sourceIdentity)
-        let scheduler = try SwiftDependencyInvalidationScheduler(
+        var scheduler = try SwiftDependencyInvalidationScheduler(
             previousManifest: previousManifest,
             expectedSourceIdentities: sourceIdentities,
             changedSourceIdentities: Set(configuration.changedSourceIdentities)
         )
+        let preclassifiedChangedSource: String?
+        let fixedPointResult: SwiftDependencyFixedPointResult?
+        if configuration.preclassifiedBodyEdit == true {
+            let changedSource = configuration.changedSourceIdentities[0]
+            try scheduler.preclassifyChangedSourceAsInterfaceStable(changedSource)
+            preclassifiedChangedSource = changedSource
+            fixedPointResult = try scheduler.result()
+        } else {
+            preclassifiedChangedSource = nil
+            fixedPointResult = nil
+        }
         self.configuration = configuration
         self.previousManifest = previousManifest
         self.expectedSources = Set(sourceIdentities)
         self.resultPath = resultPath
         self.fs = fs
-        self.state = SWBMutex(.init(scheduler: scheduler))
+        self.state = SWBMutex(.init(
+            scheduler: scheduler,
+            preclassifiedChangedSource: preclassifiedChangedSource,
+            fixedPointResult: fixedPointResult
+        ))
     }
 
     package func admissionDecision(
@@ -185,6 +201,47 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
         let transition: CompletionTransition
         do {
             transition = try state.withLock { state in
+                if state.preclassifiedChangedSource == sourceIdentity {
+                    guard state.dispatchedSources.remove(sourceIdentity) != nil else {
+                        throw StubError.error(
+                            "Swift dependency admission completed an undispatched preclassified source."
+                        )
+                    }
+                    try state.scheduler.recordPreclassifiedProjection(
+                        projection,
+                        for: sourceIdentity
+                    )
+                    state.actualExecutionCounts[sourceIdentity, default: 0] += 1
+                    let fixedPoint = try state.scheduler.result()
+                    state.fixedPointResult = fixedPoint
+                    guard let dependencyFingerprintDigests = state.scheduler
+                        .dependencyFingerprintDigests(for: sourceIdentity) else {
+                        throw StubError.error(
+                            "Swift dependency admission could not resolve preclassified dependencies."
+                        )
+                    }
+                    let reusableCount = fixedPoint.invalidationCone.reusableSources.count
+                    let replaysComplete = state.replayCompletedSources.count == reusableCount
+                    let outcome = replaysComplete && !state.replayFallbackSources.isEmpty
+                        ? "replay_fallback"
+                        : "admitted"
+                    return .init(
+                        completion: .init(
+                            outcome: outcome,
+                            sourceIdentity: sourceIdentity,
+                            dependencyFingerprintDigests: dependencyFingerprintDigests,
+                            predictedCount: fixedPoint.invalidationCone.affectedSources.count,
+                            actualCount: state.actualExecutionCounts.count,
+                            pendingCount: 0
+                        ),
+                        resumptions: [],
+                        result: replaysComplete ? makeResult(
+                            outcome: outcome,
+                            fixedPoint: fixedPoint,
+                            actualExecutionCounts: state.actualExecutionCounts
+                        ) : nil
+                    )
+                }
                 guard state.abortedReason == nil,
                       state.dispatchedSources.remove(sourceIdentity) != nil,
                       state.scheduler.pendingSourceIdentities.contains(sourceIdentity) else {
@@ -360,6 +417,22 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
                 resumptions.append((
                     continuation,
                     .appleFallback(sourceIdentity: sourceIdentity, reason: reason)
+                ))
+                return
+            }
+            if state.preclassifiedChangedSource == sourceIdentity {
+                guard !state.dispatchedSources.contains(sourceIdentity) else {
+                    state.abortedReason = "duplicate_source"
+                    resumptions.append((
+                        continuation,
+                        .appleFallback(sourceIdentity: sourceIdentity, reason: "duplicate_source")
+                    ))
+                    return
+                }
+                state.dispatchedSources.insert(sourceIdentity)
+                resumptions.append((
+                    continuation,
+                    .executeChanged(sourceIdentity: sourceIdentity)
                 ))
                 return
             }

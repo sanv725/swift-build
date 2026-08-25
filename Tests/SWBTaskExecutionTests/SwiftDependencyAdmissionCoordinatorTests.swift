@@ -76,6 +76,55 @@ fileprivate struct SwiftDependencyAdmissionCoordinatorTests {
     }
 
     @Test
+    func preclassifiedBodyEditNeverSuspendsReusablePrimaries() async throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let coordinator = try makeCoordinator(
+            temporaryDirectory: temporaryDirectory,
+            preclassifiedBodyEdit: true
+        )
+
+        let callerDecision = await coordinator.admissionDecision(
+            moduleName: "AdmissionFixture",
+            primaryPath: Path(caller)
+        )
+        #expect(callerDecision == .replayReusable(
+            sourceIdentity: caller,
+            dependencyFingerprintDigests: try baselineCallerDependencyDigests()
+        ))
+        let unrelatedDecision = await coordinator.admissionDecision(
+            moduleName: "AdmissionFixture",
+            primaryPath: Path(unrelated)
+        )
+        #expect(unrelatedDecision == .replayReusable(
+            sourceIdentity: unrelated,
+            dependencyFingerprintDigests: []
+        ))
+        #expect(coordinator.snapshot().waitingSources.isEmpty)
+
+        let providerDecision = await coordinator.admissionDecision(
+            moduleName: "AdmissionFixture",
+            primaryPath: Path(provider)
+        )
+        #expect(providerDecision == .executeChanged(sourceIdentity: provider))
+        coordinator.recordReplayHit(sourceIdentity: caller)
+        coordinator.recordReplayHit(sourceIdentity: unrelated)
+
+        let completion = try coordinator.completeProjection(
+            providerProjection(fingerprint: "provider-v1"),
+            sourceIdentity: provider
+        )
+        #expect(completion.outcome == "admitted")
+        #expect(completion.predictedCount == 1)
+        #expect(completion.actualCount == 1)
+        #expect(completion.pendingCount == 0)
+        let result = try readResult(temporaryDirectory: temporaryDirectory)
+        #expect(result.outcome == "admitted")
+        #expect(result.predictedAffectedSources == [provider])
+        #expect(result.predictedReusableSources == [caller, unrelated])
+        #expect(result.actualExecutedSources == [provider])
+    }
+
+    @Test
     func APIEditReleasesAffectedCallerBeforeReusablePrimary() async throws {
         let temporaryDirectory = try NamedTemporaryDirectory()
         let coordinator = try makeCoordinator(temporaryDirectory: temporaryDirectory)
@@ -180,13 +229,15 @@ fileprivate struct SwiftDependencyAdmissionCoordinatorTests {
     }
 
     private func makeCoordinator(
-        temporaryDirectory: NamedTemporaryDirectory
+        temporaryDirectory: NamedTemporaryDirectory,
+        preclassifiedBodyEdit: Bool = false
     ) throws -> SwiftDependencyAdmissionCoordinator {
         let configuration = SwiftDependencyShadowConfiguration(
             admittingManifestAt: temporaryDirectory.path.join("manifest.json").str,
             resultPath: temporaryDirectory.path.join("result.json").str,
             changedSourceIdentity: provider,
-            pathMappings: []
+            pathMappings: [],
+            preclassifiedBodyEdit: preclassifiedBodyEdit
         )
         return try .init(
             configuration: configuration,

@@ -81,6 +81,67 @@ public struct SwiftDependencyInvalidationScheduler: Sendable {
         pendingSources.isEmpty
     }
 
+    /// Completes the initial changed source without waiting for frontend
+    /// execution when a trusted, external classifier has already proved the
+    /// edit cannot change its declaration surface. The real compiler
+    /// projection must still be supplied later for validation and for the next
+    /// manifest.
+    public mutating func preclassifyChangedSourceAsInterfaceStable(
+        _ sourceIdentity: String
+    ) throws {
+        guard pendingSources == [sourceIdentity],
+              affectedSources == [sourceIdentity],
+              let previousEntry = previousEntries[sourceIdentity] else {
+            throw StubError.error("Swift dependency preclassification requires the sole initial changed source.")
+        }
+        pendingSources.remove(sourceIdentity)
+        compiledAgainstDependencies[sourceIdentity] = previousEntry.dependencyFingerprintDigests
+        mutableCompilationCounts[sourceIdentity] = 1
+    }
+
+    /// Replaces the retained projection after the preclassified source really
+    /// compiles. Every reusable source must still resolve to its retained
+    /// dependency digests; otherwise the external classification was unsound.
+    public mutating func recordPreclassifiedProjection(
+        _ projection: SwiftDependencyFingerprintProjection,
+        for sourceIdentity: String
+    ) throws {
+        guard pendingSources.isEmpty,
+              affectedSources == [sourceIdentity],
+              mutableCompilationCounts[sourceIdentity] == 1,
+              let previousEntry = previousEntries[sourceIdentity],
+              projection.schema == SwiftDependencyFingerprintProjection.schema,
+              projection.compilerVersion == previousManifest.compilerVersion,
+              projection.sourceFileInterfaceFingerprint
+                == previousEntry.projection.sourceFileInterfaceFingerprint else {
+            throw StubError.error("Swift dependency preclassification did not retain the compiler interface fingerprint.")
+        }
+
+        projectionsBySource[sourceIdentity] = projection
+        let orderedSources = previousManifest.sources.map(\.sourceIdentity)
+        let projections = orderedSources.compactMap { projectionsBySource[$0] }
+        guard projections.count == orderedSources.count,
+              let providers = SwiftDependencyFingerprintResolver.providerFingerprints(from: projections) else {
+            throw StubError.error("Swift dependency preclassification could not resolve the updated provider set.")
+        }
+        let resolvedDependencies = Dictionary(uniqueKeysWithValues: orderedSources.map { identity in
+            (
+                identity,
+                SwiftDependencyFingerprintResolver.localIdentityDigests(
+                    for: projectionsBySource[identity]!,
+                    providers: providers
+                )
+            )
+        })
+        for identity in orderedSources where identity != sourceIdentity {
+            guard resolvedDependencies[identity]
+                    == previousEntries[identity]?.dependencyFingerprintDigests else {
+                throw StubError.error("Swift dependency preclassification changed a reusable source dependency identity.")
+            }
+        }
+        compiledAgainstDependencies[sourceIdentity] = resolvedDependencies[sourceIdentity]!
+    }
+
     /// Records the compiler projection produced for one pending source and
     /// schedules every direct or previously compiled caller whose dependency
     /// fingerprints are now stale. A caller may be re-enqueued if a provider
