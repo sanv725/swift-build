@@ -57,6 +57,7 @@ enum DirectLinkPlanExporter {
             task.ruleInfo.first == "Ld",
             let root = environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_ROOT"],
             environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_MODE"] == "record"
+                || environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_MODE"] == "read-write"
         else {
             return
         }
