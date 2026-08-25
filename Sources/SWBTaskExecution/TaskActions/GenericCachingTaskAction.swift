@@ -65,6 +65,20 @@ public final class GenericCachingTaskAction: TaskAction {
     }
 
     override public func performTaskAction(_ task: any ExecutableTask, dynamicExecutionDelegate: any DynamicTaskExecutionDelegate, executionDelegate: any TaskExecutionDelegate, clientDelegate: any TaskExecutionClientDelegate, outputDelegate: any TaskOutputDelegate) async -> CommandResult {
+        #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+        do {
+            try DirectLinkPlanExporter.export(
+                task: task,
+                commandLine: Array(task.commandLineAsStrings),
+                fs: executionDelegate.fs
+            )
+        } catch {
+            outputDelegate.emitWarning(
+                "Unable to export direct link plan: \(error.localizedDescription)"
+            )
+        }
+        #endif
+
         func emitCacheDebuggingRemark(_ message: String) {
             if enableCacheDebuggingRemarks {
                 outputDelegate.remark(message)
