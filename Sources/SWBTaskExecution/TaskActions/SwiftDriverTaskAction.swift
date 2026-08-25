@@ -66,6 +66,10 @@ private struct SwiftDriverPlanCacheConfiguration {
         root.join("cas").join(String(key.prefix(2))).join(key)
     }
 
+    var directPlanPath: Path {
+        root.join("direct").join(String(key.prefix(2))).join("\(key).json")
+    }
+
     func publishCASSnapshot(from source: Path) throws {
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: source.str) else {
@@ -112,6 +116,44 @@ private struct SwiftDriverPlanCacheConfiguration {
             }
             throw error
         }
+    }
+}
+
+private struct SwiftDriverDirectPlanManifest: Codable {
+    static let schema = "swift-build-direct-swift-plan-v1"
+
+    struct Job: Codable {
+        let key: String
+        let dependencies: [String]
+        let ruleInfoType: String
+        let moduleName: String
+        let workingDirectory: String
+        let commandLine: [String]
+        let inputs: [String]
+        let outputs: [String]
+        let cacheKeys: [String]
+
+        init(_ job: LibSwiftDriver.PlannedBuild.PlannedSwiftDriverJob) {
+            key = String(describing: job.key)
+            dependencies = job.dependencies.map { String(describing: $0) }
+            ruleInfoType = job.driverJob.ruleInfoType
+            moduleName = job.driverJob.moduleName
+            workingDirectory = job.workingDirectory.str
+            commandLine = job.driverJob.commandLine.map(\.asString)
+            inputs = job.driverJob.inputs.map(\.str)
+            outputs = job.driverJob.outputs.map(\.str)
+            cacheKeys = job.driverJob.cacheKeys
+        }
+    }
+
+    let schema: String
+    let actionKey: String
+    let jobs: [Job]
+
+    init(actionKey: String, snapshot: SwiftDriverPlanCacheSnapshot) {
+        schema = Self.schema
+        self.actionKey = actionKey
+        jobs = snapshot.plannedBuild.plannedTargetJobs.map(Job.init)
     }
 }
 #endif
@@ -169,6 +211,7 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
             var planCachePlanDurationNS: UInt64 = 0
             var planCacheWriteDurationNS: UInt64 = 0
             var planCacheBytes = 0
+            var directPlanBytes = 0
             do {
                 planCacheConfiguration = try SwiftDriverPlanCacheConfiguration(environment: environment)
             } catch {
@@ -273,6 +316,12 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                     let snapshot = try await dependencyGraph.planCacheSnapshot(for: driverPayload.uniqueID)
                     let bytes = MsgPackSerializer.serialize(snapshot)
                     planCacheBytes = bytes.count
+                    let directPlan = SwiftDriverDirectPlanManifest(
+                        actionKey: planCacheConfiguration.key,
+                        snapshot: snapshot
+                    )
+                    let directBytes = try JSONEncoder().encode(directPlan)
+                    directPlanBytes = directBytes.count
                     guard let casOptions = driverPayload.casOptions else {
                         throw StubError.error("Swift Driver plan recording requires a compilation CAS.")
                     }
@@ -285,6 +334,18 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                     } else {
                         try executionDelegate.fs.write(planCacheConfiguration.actionPath, contents: bytes, atomically: true)
                     }
+                    try executionDelegate.fs.createDirectory(planCacheConfiguration.directPlanPath.dirname, recursive: true)
+                    if executionDelegate.fs.exists(planCacheConfiguration.directPlanPath) {
+                        guard try executionDelegate.fs.read(planCacheConfiguration.directPlanPath) == ByteString(directBytes) else {
+                            throw StubError.error("Swift Driver direct plan conflict for exact key.")
+                        }
+                    } else {
+                        try executionDelegate.fs.write(
+                            planCacheConfiguration.directPlanPath,
+                            contents: ByteString(directBytes),
+                            atomically: true
+                        )
+                    }
                     planCacheOutcome = "recorded"
                 } catch {
                     planCacheOutcome = "record_error"
@@ -294,7 +355,7 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
             }
             if planCacheConfiguration != nil {
                 outputDelegate.note(
-                    "SWIFT_DRIVER_PLAN_CACHE outcome=\(planCacheOutcome) key=\(planCacheConfiguration?.key ?? "none") bytes=\(planCacheBytes) duration_ns=\(planCacheTimer.elapsedTime().nanoseconds) read_ns=\(planCacheReadDurationNS) apple_plan_ns=\(planCachePlanDurationNS) write_ns=\(planCacheWriteDurationNS)"
+                    "SWIFT_DRIVER_PLAN_CACHE outcome=\(planCacheOutcome) key=\(planCacheConfiguration?.key ?? "none") bytes=\(planCacheBytes) direct_plan_bytes=\(directPlanBytes) duration_ns=\(planCacheTimer.elapsedTime().nanoseconds) read_ns=\(planCacheReadDurationNS) apple_plan_ns=\(planCachePlanDurationNS) write_ns=\(planCacheWriteDurationNS)"
                 )
             }
             #endif
