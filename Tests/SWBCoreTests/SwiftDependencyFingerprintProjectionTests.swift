@@ -3,7 +3,7 @@
 // This source file is part of the Swift open source project
 //
 // Copyright (c) 2026 Apple Inc. and the Swift project authors
-// Licensed under Apache License v2.0 with Runtime Exception
+// Licensed under Apache License v2.0 with Runtime Library Exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -45,7 +45,7 @@ fileprivate struct SwiftDependencyFingerprintProjectionTests {
     }
 
     @Test
-    func resolvesUsesAndRejectsMissingOrConflictingProviders() throws {
+    func resolvesUsesAndAggregatesMultipleProviders() throws {
         let key = SwiftDependencyFingerprintProjection.Key(
             kind: "top-level",
             aspect: "interface",
@@ -83,9 +83,13 @@ fileprivate struct SwiftDependencyFingerprintProjectionTests {
             providedInterfaces: [.init(key: key, fingerprint: "callee-api-b")],
             dependedInterfaces: []
         )
-        #expect(SwiftDependencyFingerprintResolver.providerFingerprints(
+        let aggregated = try #require(SwiftDependencyFingerprintResolver.providerFingerprints(
             from: [provider, conflicting]
-        ) == nil)
+        ))
+        #expect(aggregated[key]?.hasPrefix("aggregate-v1:") == true)
+        #expect(aggregated == SwiftDependencyFingerprintResolver.providerFingerprints(
+            from: [conflicting, provider]
+        ))
     }
 
     @Test

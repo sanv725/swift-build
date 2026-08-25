@@ -3,7 +3,7 @@
 // This source file is part of the Swift open source project
 //
 // Copyright (c) 2026 Apple Inc. and the Swift project authors
-// Licensed under Apache License v2.0 with Runtime Exception
+// Licensed under Apache License v2.0 with Runtime Library Exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -14,6 +14,23 @@ import Foundation
 import TSCBasic
 
 public import SWBUtil
+
+public struct SwiftDependencyPathMapping: Codable, Sendable, Equatable, Hashable {
+    public let physicalPrefix: String
+    public let virtualPrefix: String
+
+    public init(physicalPrefix: String, virtualPrefix: String) {
+        self.physicalPrefix = physicalPrefix
+        self.virtualPrefix = virtualPrefix
+    }
+
+    public func map(_ value: String) -> String? {
+        guard value == physicalPrefix || value.hasPrefix(physicalPrefix + "/") else {
+            return nil
+        }
+        return virtualPrefix + value.dropFirst(physicalPrefix.count)
+    }
+}
 
 /// A portable, deterministic projection of the fine-grained dependency nodes
 /// emitted by the Swift frontend in one `.swiftdeps` file.
@@ -78,7 +95,11 @@ public struct SwiftDependencyFingerprintProjection: Codable, Sendable, Equatable
         self.dependedInterfaces = Array(Set(dependedInterfaces)).sorted()
     }
 
-    public static func read(from path: Path) throws -> Self {
+    public static func read(
+        from path: Path,
+        sourceIdentity: String? = nil,
+        pathMappings: [SwiftDependencyPathMapping] = []
+    ) throws -> Self {
         guard path.isAbsolute else {
             throw StubError.error("Swift dependency projection requires an absolute .swiftdeps path.")
         }
@@ -99,11 +120,21 @@ public struct SwiftDependencyFingerprintProjection: Codable, Sendable, Equatable
             var uses: [Key] = []
             graph.forEachNode { node in
                 guard node.key.aspect == .interface else { return }
+                let kind = node.key.designator.kindName
+                let rawName = node.key.designator.name?.lookup(in: table)
+                let normalizedName: String?
+                if kind == "source file", let sourceIdentity {
+                    normalizedName = sourceIdentity
+                } else if let rawName {
+                    normalizedName = normalize(rawName, with: pathMappings)
+                } else {
+                    normalizedName = nil
+                }
                 let key = Key(
-                    kind: node.key.designator.kindName,
+                    kind: kind,
                     aspect: "interface",
                     context: node.key.designator.context?.lookup(in: table),
-                    name: node.key.designator.name?.lookup(in: table)
+                    name: normalizedName
                 )
                 switch node.definitionVsUse {
                 case .definition:
@@ -125,27 +156,47 @@ public struct SwiftDependencyFingerprintProjection: Codable, Sendable, Equatable
             )
         }
     }
+
+    private static func normalize(
+        _ value: String,
+        with mappings: [SwiftDependencyPathMapping]
+    ) -> String {
+        for mapping in mappings.sorted(by: {
+            $0.physicalPrefix.utf8.count > $1.physicalPrefix.utf8.count
+        }) {
+            if let mapped = mapping.map(value) { return mapped }
+        }
+        return value
+    }
 }
 
 public enum SwiftDependencyFingerprintResolver {
-    /// Builds the current definition-key to API-fingerprint map. Conflicting
-    /// providers are rejected because choosing one would make reuse unsound.
+    /// Builds the current definition-key to API-fingerprint map. Multiple
+    /// providers of one lookup key are aggregated so changing any overload or
+    /// extension provider invalidates users of that key.
     public static func providerFingerprints(
         from projections: [SwiftDependencyFingerprintProjection]
     ) -> [SwiftDependencyFingerprintProjection.Key: String]? {
-        var result: [SwiftDependencyFingerprintProjection.Key: String] = [:]
+        var buckets: [SwiftDependencyFingerprintProjection.Key: Set<String>] = [:]
         for projection in projections {
             guard projection.schema == SwiftDependencyFingerprintProjection.schema else { return nil }
             for definition in projection.providedInterfaces {
                 guard let fingerprint = definition.fingerprint
                     ?? projection.sourceFileInterfaceFingerprint else { continue }
-                if let existing = result[definition.key], existing != fingerprint {
-                    return nil
-                }
-                result[definition.key] = fingerprint
+                buckets[definition.key, default: []].insert(fingerprint)
             }
         }
-        return result
+        return buckets.mapValues { fingerprints in
+            let sorted = fingerprints.sorted()
+            guard sorted.count > 1 else { return sorted[0] }
+            let context = SHA256Context()
+            for fingerprint in sorted {
+                let bytes = Array(fingerprint.utf8)
+                context.add(number: UInt64(bytes.count))
+                context.add(bytes: bytes)
+            }
+            return "aggregate-v1:" + context.signature.asString
+        }
     }
 
     /// Resolves every interface use to the current provider fingerprint and
