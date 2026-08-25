@@ -1834,19 +1834,16 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
             if delegate.commandResult == .succeeded,
                case .targetCompile = identifier,
-               let dependencyShadowConfigurationPath {
+               let dependencyShadowConfigurationPath,
+               let rawPrimaryPath = Self.uniqueArgumentValue(
+                   after: "-primary-file",
+                   in: options.commandLine
+               ),
+               let rawDependencyPath = Self.uniqueArgumentValue(
+                   after: "-emit-reference-dependencies-path",
+                   in: options.commandLine
+               ) {
                 do {
-                    guard let rawPrimaryPath = Self.uniqueArgumentValue(
-                        after: "-primary-file",
-                        in: options.commandLine
-                    ), let rawDependencyPath = Self.uniqueArgumentValue(
-                        after: "-emit-reference-dependencies-path",
-                        in: options.commandLine
-                    ) else {
-                        throw StubError.error(
-                            "Swift dependency shadow requires one primary and one reference-dependencies output."
-                        )
-                    }
                     let unqualifiedPrimaryPath = Path(rawPrimaryPath)
                     let primaryPath = unqualifiedPrimaryPath.isAbsolute
                         ? unqualifiedPrimaryPath
