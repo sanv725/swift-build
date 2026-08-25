@@ -46,6 +46,60 @@ public protocol SwiftGlobalExplicitDependencyGraph : AnyObject {
     func explicitDependencies(for job: LibSwiftDriver.PlannedBuild.PlannedSwiftDriverJob) -> [LibSwiftDriver.PlannedBuild.PlannedSwiftDriverJob]
 }
 
+#if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+/// Complete execution-facing result of one integrated Swift Driver planning
+/// phase. The wrapper's exact action key owns compatibility and invalidation.
+public struct SwiftDriverPlanCacheSnapshot: Serializable {
+    public static let schemaVersion = 1
+
+    public let schemaVersion: Int
+    public let plannedBuild: LibSwiftDriver.PlannedBuild.CacheSnapshot
+    public let explicitModuleJobs: [LibSwiftDriver.PlannedBuild.PlannedSwiftDriverJob]
+    public let swiftmodulesNeedingRegistration: [String]
+    public let planningDependencies: [String]
+    public let transitiveDependencyModuleNames: [String]
+
+    public init(
+        plannedBuild: LibSwiftDriver.PlannedBuild.CacheSnapshot,
+        explicitModuleJobs: [LibSwiftDriver.PlannedBuild.PlannedSwiftDriverJob],
+        swiftmodulesNeedingRegistration: [String],
+        planningDependencies: [String],
+        transitiveDependencyModuleNames: [String]
+    ) {
+        self.schemaVersion = Self.schemaVersion
+        self.plannedBuild = plannedBuild
+        self.explicitModuleJobs = explicitModuleJobs
+        self.swiftmodulesNeedingRegistration = swiftmodulesNeedingRegistration
+        self.planningDependencies = planningDependencies
+        self.transitiveDependencyModuleNames = transitiveDependencyModuleNames
+    }
+
+    public func serialize<T>(to serializer: T) where T: Serializer {
+        serializer.serializeAggregate(6) {
+            serializer.serialize(schemaVersion)
+            serializer.serialize(plannedBuild)
+            serializer.serialize(explicitModuleJobs)
+            serializer.serialize(swiftmodulesNeedingRegistration)
+            serializer.serialize(planningDependencies)
+            serializer.serialize(transitiveDependencyModuleNames)
+        }
+    }
+
+    public init(from deserializer: any Deserializer) throws {
+        try deserializer.beginAggregate(6)
+        try schemaVersion = deserializer.deserialize()
+        guard schemaVersion == Self.schemaVersion else {
+            throw StubError.error("Unsupported Swift Driver plan cache schema \(schemaVersion).")
+        }
+        try plannedBuild = deserializer.deserialize()
+        try explicitModuleJobs = deserializer.deserialize()
+        try swiftmodulesNeedingRegistration = deserializer.deserialize()
+        try planningDependencies = deserializer.deserialize()
+        try transitiveDependencyModuleNames = deserializer.deserialize()
+    }
+}
+#endif
+
 /// Keeps track of all of the explicit module dependency build jobs as depended on by individual target builds
 private struct GlobalExplicitDependencyTracker {
     /// Maps a SwiftDriverJob's UniqueID to its index in this store
@@ -190,12 +244,18 @@ public final class SwiftModuleDependencyGraph: SwiftGlobalExplicitDependencyGrap
     }
 
     public func querySwiftmodulesNeedingRegistrationForDebugging(for key: String) throws -> [String] {
-        let graph = try registryQueue.blocking_sync {
+        let driver = try registryQueue.blocking_sync {
             guard let driver = registry[key] else {
                 throw StubError.error("Unable to find jobs for key \(key). Be sure to plan the build ahead of fetching results.")
             }
-            return driver.intermoduleDependencyGraph
+            return driver
         }
+        #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+        if let cached = driver.cachedPlanQueryResults {
+            return cached.swiftmodulesNeedingRegistration
+        }
+        #endif
+        let graph = driver.intermoduleDependencyGraph
         guard let graph else { return [] }
         var swiftmodulePaths: [String] = []
         swiftmodulePaths.reserveCapacity(graph.modules.values.count)
@@ -222,12 +282,18 @@ public final class SwiftModuleDependencyGraph: SwiftGlobalExplicitDependencyGrap
     }
 
     public func queryPlanningDependencies(for key: String) throws -> [String] {
-        let graph = try registryQueue.blocking_sync {
+        let driver = try registryQueue.blocking_sync {
             guard let driver = registry[key] else {
                 throw StubError.error("Unable to find jobs for key \(key). Be sure to plan the build ahead of fetching results.")
             }
-            return driver.intermoduleDependencyGraph
+            return driver
         }
+        #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+        if let cached = driver.cachedPlanQueryResults {
+            return cached.planningDependencies
+        }
+        #endif
+        let graph = driver.intermoduleDependencyGraph
         guard let graph else { return [] }
         var fileDependencies: [String] = []
         fileDependencies.reserveCapacity(graph.modules.values.count * 10)
@@ -251,18 +317,93 @@ public final class SwiftModuleDependencyGraph: SwiftGlobalExplicitDependencyGrap
     }
 
     public func queryTransitiveDependencyModuleNames(for key: String) async throws -> [String] {
-        let graph = try await registryQueue.sync {
+        let driver = try await registryQueue.sync {
             guard let driver = self.registry[key] else {
                 throw StubError.error("Unable to find jobs for key \(key). Be sure to plan the build ahead of fetching results.")
             }
-            return driver.intermoduleDependencyGraph
+            return driver
         }
+        #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+        if let cached = driver.cachedPlanQueryResults {
+            return cached.transitiveDependencyModuleNames
+        }
+        #endif
+        let graph = driver.intermoduleDependencyGraph
         guard let graph else { return [] }
         // This calculation is a bit awkward because we cannot directly access the ID of the main module, just its info object
         let directDependencies = graph.mainModule.directDependencies ?? []
         let transitiveDependencies = Set(directDependencies + SWBUtil.transitiveClosure(directDependencies, successors: { moduleID in graph.modules[moduleID]?.directDependencies ?? [] }).0)
         return transitiveDependencies.map(\.moduleName)
     }
+
+    #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+    public func planCacheSnapshot(for key: String) async throws -> SwiftDriverPlanCacheSnapshot {
+        let plannedBuild = try queryPlannedBuild(for: key)
+        let plan = plannedBuild.cacheSnapshot()
+        return SwiftDriverPlanCacheSnapshot(
+            plannedBuild: plan,
+            explicitModuleJobs: getExplicitDependencyBuildJobs(
+                for: Array(plan.explicitModuleBuildJobKeys).sorted()
+            ),
+            swiftmodulesNeedingRegistration: try querySwiftmodulesNeedingRegistrationForDebugging(for: key),
+            planningDependencies: try queryPlanningDependencies(for: key),
+            transitiveDependencyModuleNames: try await queryTransitiveDependencyModuleNames(for: key)
+        )
+    }
+
+    public func installCachedPlan(
+        key: String,
+        compilerLocation: LibSwiftDriver.CompilerLocation,
+        target: ConfiguredTarget,
+        args: [String],
+        workingDirectory: Path,
+        tempDirPath: Path,
+        explicitModulesTempDirPath: Path,
+        environment: [String: String],
+        eagerCompilationEnabled: Bool,
+        casOptions: CASOptions?,
+        snapshot: SwiftDriverPlanCacheSnapshot
+    ) throws {
+        guard eagerCompilationEnabled else {
+            throw StubError.error("Swift Driver plan replay currently requires eager compilation.")
+        }
+        guard snapshot.plannedBuild.workingDirectory == workingDirectory else {
+            throw StubError.error("Cached Swift Driver working directory does not match the current task.")
+        }
+        let isPristine = registryQueue.blocking_sync {
+            registry.isEmpty && globalExplicitDependencyTracker.plannedExplicitDependencyJobs.isEmpty
+        }
+        guard isPristine else {
+            throw StubError.error("Swift Driver plan replay currently requires a pristine single-target graph.")
+        }
+
+        var producerMap = snapshot.plannedBuild.producerMap
+        let expectedExplicitKeys = snapshot.plannedBuild.explicitModuleBuildJobKeys
+        let installedExplicitKeys = try addExplicitDependencyBuildJobs(
+            snapshot.explicitModuleJobs.map(\.driverJob),
+            workingDirectory: workingDirectory,
+            producerMap: &producerMap
+        )
+        guard installedExplicitKeys == expectedExplicitKeys else {
+            throw StubError.error("Cached Swift Driver explicit-module keys did not reproduce.")
+        }
+
+        let cachedDriver = try LibSwiftDriver(
+            cachedPlan: snapshot,
+            graph: self,
+            compilerLocation: compilerLocation,
+            target: target,
+            workingDirectory: workingDirectory,
+            tempDirPath: tempDirPath,
+            explicitModulesTempDirPath: explicitModulesTempDirPath,
+            commandLine: args,
+            environment: environment,
+            eagerCompilationEnabled: eagerCompilationEnabled,
+            casOptions: casOptions
+        )
+        register(key: key, driver: cachedDriver)
+    }
+    #endif
 
     /// Serialize incremental build state for the given key and removes its state from memory
     public func cleanUpForAllKeys() -> [SWBUtil.Diagnostic] {
@@ -584,8 +725,12 @@ public final class LibSwiftDriver {
     private let resolver: ArgsResolver
     private let explicitModulesResolver: ArgsResolver
     private let executor: Executor
-    private var driver: SwiftDriver.Driver
-    private let diagnosticsEngine: TSCBasic.DiagnosticsEngine
+    private var driver: SwiftDriver.Driver?
+    private let diagnosticsEngine: TSCBasic.DiagnosticsEngine?
+
+    #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+    fileprivate let cachedPlanQueryResults: SwiftDriverPlanCacheSnapshot?
+    #endif
 
     private var _plannedBuild: PlannedBuild?
 
@@ -614,6 +759,9 @@ public final class LibSwiftDriver {
         self.explicitModulesResolver = try ArgsResolver(fileSystem: fileSystem, temporaryDirectory: VirtualPath(path: explicitModulesTempDirPath.str))
         self.executor = Executor(resolver: resolver, explicitModulesResolver: explicitModulesResolver, explicitDependencyGraph: graph, workingDirectory: workingDirectory, fileSystem: fileSystem, env: environment, eagerCompilationEnabled: eagerCompilationEnabled)
         self.diagnosticsEngine = diagnosticsEngine
+        #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+        self.cachedPlanQueryResults = nil
+        #endif
         var env = ProcessEnvironmentBlock()
         let compilerExecutableDir: TSCBasic.AbsolutePath?
         switch compilerLocation {
@@ -645,7 +793,8 @@ public final class LibSwiftDriver {
         }
         let key = SwiftModuleDependencyGraph.OracleRegistryKey(compilerLocation: compilerLocation, casOpts: casOptions)
         let oracle = graph?.oracleRegistry.getOrInsert(key, { InterModuleDependencyOracle() })
-        self.driver = try Driver(args: commandLine, envBlock: env, diagnosticsOutput: .engine(diagnosticsEngine), executor: executor, compilerIntegratedTooling: false, compilerExecutableDir: compilerExecutableDir, interModuleDependencyOracle: oracle)
+        let driver = try Driver(args: commandLine, envBlock: env, diagnosticsOutput: .engine(diagnosticsEngine), executor: executor, compilerIntegratedTooling: false, compilerExecutableDir: compilerExecutableDir, interModuleDependencyOracle: oracle)
+        self.driver = driver
         if let scanOracle = oracle, let scanLib = try driver.getSwiftScanLibPath() {
             // Errors instantiating the scanner are potentially recoverable, so suppress them here. Truly fatal errors
             // will be diagnosed later.
@@ -653,9 +802,111 @@ public final class LibSwiftDriver {
         }
     }
 
+    #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+    fileprivate init(
+        cachedPlan: SwiftDriverPlanCacheSnapshot,
+        graph: SwiftModuleDependencyGraph,
+        compilerLocation: CompilerLocation,
+        target: ConfiguredTarget,
+        workingDirectory: Path,
+        tempDirPath: Path,
+        explicitModulesTempDirPath: Path,
+        commandLine: [String],
+        environment: [String: String],
+        eagerCompilationEnabled: Bool,
+        casOptions: CASOptions?
+    ) throws {
+        self.target = target
+        self.workingDirectory = workingDirectory
+        self.tempDirPath = tempDirPath
+        self.commandLine = commandLine
+        self.eagerCompilationEnabled = eagerCompilationEnabled
+        self.compilerLocation = compilerLocation
+        let fileSystem = localFileSystem
+        self.resolver = try ArgsResolver(
+            fileSystem: fileSystem,
+            temporaryDirectory: VirtualPath(path: tempDirPath.str)
+        )
+        self.explicitModulesResolver = try ArgsResolver(
+            fileSystem: fileSystem,
+            temporaryDirectory: VirtualPath(path: explicitModulesTempDirPath.str)
+        )
+        self.executor = Executor(
+            resolver: resolver,
+            explicitModulesResolver: explicitModulesResolver,
+            explicitDependencyGraph: graph,
+            workingDirectory: workingDirectory,
+            fileSystem: fileSystem,
+            env: environment,
+            eagerCompilationEnabled: eagerCompilationEnabled
+        )
+        let diagnosticsEngine = TSCBasic.DiagnosticsEngine(handlers: [])
+        self.diagnosticsEngine = diagnosticsEngine
+        var processEnvironment = ProcessEnvironmentBlock()
+        let compilerExecutableDir: TSCBasic.AbsolutePath?
+        switch compilerLocation {
+        case .path(let path):
+            for (key, value) in environment {
+                processEnvironment[ProcessEnvironmentKey(key)] = value
+            }
+            compilerExecutableDir = try TSCBasic.AbsolutePath(validating: path.dirname.str)
+        case .library(libSwiftScanPath: let path):
+            let fakeFrontendPath = path.dirname.dirname.dirname.dirname.join("bin/swift-frontend")
+            for (key, value) in environment {
+                processEnvironment[ProcessEnvironmentKey(key)] = value
+            }
+            processEnvironment.merge(
+                [
+                    "SWIFT_DRIVER_SWIFT_FRONTEND_EXEC": fakeFrontendPath.str,
+                    "SWIFT_DRIVER_SWIFTSCAN_LIB": path.str,
+                ],
+                uniquingKeysWith: { first, _ in first }
+            )
+            compilerExecutableDir = try TSCBasic.AbsolutePath(validating: fakeFrontendPath.dirname.str)
+        }
+        let oracleKey = SwiftModuleDependencyGraph.OracleRegistryKey(
+            compilerLocation: compilerLocation,
+            casOpts: casOptions
+        )
+        let oracle = graph.oracleRegistry.getOrInsert(
+            oracleKey,
+            { InterModuleDependencyOracle() }
+        )
+        let driver = try Driver(
+            args: commandLine,
+            envBlock: processEnvironment,
+            diagnosticsOutput: .engine(diagnosticsEngine),
+            executor: executor,
+            compilerIntegratedTooling: false,
+            compilerExecutableDir: compilerExecutableDir,
+            interModuleDependencyOracle: oracle
+        )
+        self.driver = driver
+        if let scanLib = try driver.getSwiftScanLibPath() {
+            try? oracle.verifyOrCreateScannerInstance(swiftScanLibPath: scanLib)
+        }
+        self._plannedBuild = PlannedBuild(
+            cacheSnapshot: cachedPlan.plannedBuild,
+            argsResolver: resolver,
+            explicitModulesResolver: explicitModulesResolver,
+            globalExplicitDependencyJobGraph: graph
+        )
+        self.intermoduleDependencyGraph = nil
+        self.cachedPlanQueryResults = cachedPlan
+    }
+    #endif
+
     private func run(dryRun: Bool = false) -> (success: Bool, diagnostics: [SWBUtil.Diagnostic], jobs: [Job]) {
+        guard var driver, let diagnosticsEngine else {
+            return (
+                false,
+                [SWBUtil.Diagnostic(behavior: .error, location: .unknown, data: DiagnosticData("Cached Swift Driver cannot execute the normal planning path.", component: .swiftCompilerError))],
+                []
+            )
+        }
+        defer { self.driver = driver }
         let driverDiagnostics: () -> [SWBUtil.Diagnostic] = {
-            self.driver.diagnosticEngine.diagnostics.map({ .build(from: $0) })
+            driver.diagnosticEngine.diagnostics.map({ .build(from: $0) })
         }
 
         do {
@@ -688,6 +939,8 @@ public final class LibSwiftDriver {
     /// (e.g. "next compile won't be incremental"). Uses a snapshot-delta of the accumulated
     /// diagnostics engine so only diagnostics produced by this call are returned.
     public func writeIncrementalBuildInformation() -> [SWBUtil.Diagnostic] {
+        guard var driver, let diagnosticsEngine else { return [] }
+        defer { self.driver = driver }
         let beforeCount = diagnosticsEngine.diagnostics.count
         driver.writeIncrementalBuildInformation(plannedBuild.driverTargetJobs)
         return diagnosticsEngine.diagnostics.dropFirst(beforeCount).map { .build(from: $0) }

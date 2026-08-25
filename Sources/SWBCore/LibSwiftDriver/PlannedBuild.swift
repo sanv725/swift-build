@@ -260,6 +260,60 @@ extension LibSwiftDriver {
             }
         }
 
+        #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+        /// Serializable execution-facing portion of an integrated-driver plan.
+        ///
+        /// This deliberately excludes Swift Driver's incremental bookkeeping.
+        /// Experimental replay is admitted only when the wrapper restores the
+        /// exact base build state and supplies an exact content-addressed key.
+        public struct CacheSnapshot: Serializable {
+            public let plannedTargetJobs: [PlannedSwiftDriverJob]
+            public let producerMap: [Path: JobKey]
+            public let explicitModuleBuildJobKeys: Set<JobKey>
+            public let compilationRequirementsIndices: Range<JobIndex>
+            public let compilationIndices: Range<JobIndex>
+            public let afterCompilationIndices: Range<JobIndex>
+            public let verificationIndices: Range<JobIndex>
+            public let workingDirectory: Path
+
+            fileprivate init(plannedBuild: PlannedBuild) {
+                self.plannedTargetJobs = plannedBuild.plannedTargetJobs
+                self.producerMap = plannedBuild.producerMap
+                self.explicitModuleBuildJobKeys = plannedBuild.explicitModuleBuildJobKeys
+                self.compilationRequirementsIndices = plannedBuild.compilationRequirementsIndices
+                self.compilationIndices = plannedBuild.compilationIndices
+                self.afterCompilationIndices = plannedBuild.afterCompilationIndices
+                self.verificationIndices = plannedBuild.verificationIndices
+                self.workingDirectory = plannedBuild.workingDirectory
+            }
+
+            public func serialize<T>(to serializer: T) where T: Serializer {
+                serializer.serializeAggregate(8) {
+                    serializer.serialize(plannedTargetJobs)
+                    serializer.serialize(producerMap)
+                    serializer.serialize(explicitModuleBuildJobKeys)
+                    serializer.serialize(compilationRequirementsIndices)
+                    serializer.serialize(compilationIndices)
+                    serializer.serialize(afterCompilationIndices)
+                    serializer.serialize(verificationIndices)
+                    serializer.serialize(workingDirectory)
+                }
+            }
+
+            public init(from deserializer: any Deserializer) throws {
+                try deserializer.beginAggregate(8)
+                try plannedTargetJobs = deserializer.deserialize()
+                try producerMap = deserializer.deserialize()
+                try explicitModuleBuildJobKeys = deserializer.deserialize()
+                try compilationRequirementsIndices = deserializer.deserialize()
+                try compilationIndices = deserializer.deserialize()
+                try afterCompilationIndices = deserializer.deserialize()
+                try verificationIndices = deserializer.deserialize()
+                try workingDirectory = deserializer.deserialize()
+            }
+        }
+        #endif
+
         /// All target jobs to build (does not include jobs to build explicit dependencies)
         private var plannedTargetJobs: [PlannedSwiftDriverJob]
 
@@ -294,6 +348,10 @@ extension LibSwiftDriver {
 
         private var jobsUnfinished: Set<JobKey>
 
+        #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+        private let isCachedPlan: Bool
+        #endif
+
         internal init(workload: SwiftDriver.DriverExecutorWorkload, argsResolver: ArgsResolver, explicitModulesResolver: ArgsResolver, jobExecutionDelegate: (any JobExecutionDelegate)?, globalExplicitDependencyJobGraph: (any SwiftGlobalExplicitDependencyGraph)?, workingDirectory: Path, eagerCompilationEnabled: Bool) throws {
             self.globalExplicitDependencyJobGraph = globalExplicitDependencyJobGraph
             self.argsResolver = argsResolver
@@ -317,7 +375,45 @@ extension LibSwiftDriver {
 
             self.jobExecutionDelegate = jobExecutionDelegate
             self.dispatchQueue = SWBQueue(label: "org.swift.swift-build.SwiftDriver.PlannedBuildExecutionQueue", autoreleaseFrequency: .workItem)
+            #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+            self.isCachedPlan = false
+            #endif
         }
+
+        #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+        internal init(
+            cacheSnapshot: CacheSnapshot,
+            argsResolver: ArgsResolver,
+            explicitModulesResolver: ArgsResolver,
+            globalExplicitDependencyJobGraph: any SwiftGlobalExplicitDependencyGraph
+        ) {
+            self.globalExplicitDependencyJobGraph = globalExplicitDependencyJobGraph
+            self.argsResolver = argsResolver
+            self.explicitModulesResolver = explicitModulesResolver
+            self.eagerCompilationEnabled = true
+            self.workingDirectory = cacheSnapshot.workingDirectory
+            self.plannedTargetJobs = cacheSnapshot.plannedTargetJobs
+            self.driverTargetJobs = []
+            self.incrementalCompilationState = nil
+            self.producerMap = cacheSnapshot.producerMap
+            self.explicitModuleBuildJobKeys = cacheSnapshot.explicitModuleBuildJobKeys
+            self.compilationRequirementsIndices = cacheSnapshot.compilationRequirementsIndices
+            self.compilationIndices = cacheSnapshot.compilationIndices
+            self.afterCompilationIndices = cacheSnapshot.afterCompilationIndices
+            self.verificationIndices = cacheSnapshot.verificationIndices
+            self.jobsUnfinished = Set(cacheSnapshot.plannedTargetJobs.map(\.key))
+            self.jobsUnfinished.formUnion(cacheSnapshot.explicitModuleBuildJobKeys)
+            self.jobExecutionDelegate = nil
+            self.dispatchQueue = SWBQueue(label: "org.swift.swift-build.SwiftDriver.CachedPlannedBuildExecutionQueue", autoreleaseFrequency: .workItem)
+            self.isCachedPlan = true
+        }
+
+        public func cacheSnapshot() -> CacheSnapshot {
+            dispatchQueue.blocking_sync {
+                CacheSnapshot(plannedBuild: self)
+            }
+        }
+        #endif
 
         private static func wrapJobs(_ jobs: [SwiftDriver.Job], argsResolver: ArgsResolver, explicitModulesResolver: ArgsResolver) throws -> [SwiftDriverJob] {
             try jobs.map { job in
@@ -530,6 +626,9 @@ extension LibSwiftDriver {
         // MARK: - Job Execution Lifecycle
 
         public func jobStarted(job: PlannedSwiftDriverJob, arguments: [String], pid: pid_t) throws {
+            #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+            if isCachedPlan { return }
+            #endif
             try dispatchQueue.blocking_sync {
                 let driverJob = try self.driverJob(for: job)
                 self.jobExecutionDelegate?.jobStarted(job: driverJob, arguments: arguments, pid: Int(pid))
@@ -537,6 +636,9 @@ extension LibSwiftDriver {
         }
 
         public func jobFinished(job: PlannedSwiftDriverJob, arguments: [String], pid: pid_t, environment: [String: String], exitStatus: Processes.ExitStatus, output: SWBUtil.ByteString) throws {
+            #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+            if isCachedPlan { return }
+            #endif
             try dispatchQueue.blocking_sync {
                 let driverJob = try self.driverJob(for: job)
                 // FIXME: Need to separate stdout and stderr
@@ -546,6 +648,9 @@ extension LibSwiftDriver {
         }
 
         public func reportSkippedJobs(_ iterator: (LibSwiftDriver.PlannedBuild.PlannedSwiftDriverJob) throws -> Void) throws {
+            #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+            if isCachedPlan { return }
+            #endif
             try dispatchQueue.blocking_sync {
                 let skippedJobs = self.incrementalCompilationState?.skippedJobs ?? []
                 let wrappedJobs = try Self.wrapJobs(skippedJobs, argsResolver: argsResolver, explicitModulesResolver: explicitModulesResolver)
@@ -566,7 +671,10 @@ extension LibSwiftDriver {
         }
 
         public func getCrashReproducerCommand(for job: PlannedSwiftDriverJob, output dir: Path) async throws -> [String]? {
-            try await dispatchQueue.sync {
+            #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+            if isCachedPlan { return nil }
+            #endif
+            return try await dispatchQueue.sync { () -> [String]? in
                 let driverJob = try self.driverJob(for: job)
                 guard let reproJob = self.jobExecutionDelegate?.getReproducerJob(job: driverJob, output: try VirtualPath(path: dir.str)) else {
                   return nil
@@ -586,6 +694,9 @@ extension LibSwiftDriver {
                 // Explicit dependency jobs do not participate in the incremental machinery
                 return []
             case .targetJob(let jobIndex):
+                #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+                if isCachedPlan { return [] }
+                #endif
                 // result is not used but needed for API compatibility
                 let result = TSCBasic.ProcessResult(arguments: [], environmentBlock: ProcessEnvironmentBlock(), exitStatus: .terminated(code: 0), output: .success([]), stderrOutput: .success([]))
                 guard let newJobs = try incrementalCompilationState?.collectJobsDiscoveredToBeNeededAfterFinishing(job: driverTargetJobs[jobIndex], result: result) else {
