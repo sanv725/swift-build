@@ -87,6 +87,7 @@ fileprivate struct SwiftDependencyCompatiblePlanPreflightTests {
                 dependencyOutputPath: output
             )
         #expect(command.contains("-typecheck"))
+        #expect(command.contains("-experimental-skip-all-function-bodies"))
         #expect(!command.contains("-c"))
         #expect(!command.contains("/tmp/Provider.o"))
         #expect(!command.contains("/tmp/Provider.d"))

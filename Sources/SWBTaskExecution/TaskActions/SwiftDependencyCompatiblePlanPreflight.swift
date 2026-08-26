@@ -520,6 +520,7 @@ package enum SwiftDependencyCompatiblePlanPreflight {
             )
         }
         commandLine.append("-typecheck")
+        commandLine.append("-experimental-skip-all-function-bodies")
         return commandLine
     }
 
