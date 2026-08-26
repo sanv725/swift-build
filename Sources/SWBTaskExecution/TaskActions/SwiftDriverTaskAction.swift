@@ -458,10 +458,18 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                                     "Compatible Swift Driver preflight candidate is incomplete."
                                 )
                             }
-                            try planCacheConfiguration.restoreCASSnapshot(
-                                to: casOptions.casPath,
-                                actionKey: candidateKey
-                            )
+                            // A trusted local CompilationCAS retained from the
+                            // candidate build is a strict superset of the
+                            // planning-time snapshot: explicit module jobs add
+                            // PCM/Swiftmodule objects after planning completes.
+                            // Replacing it here would discard those objects and
+                            // make the preflight frontend command unusable.
+                            if !executionDelegate.fs.exists(casOptions.casPath) {
+                                try planCacheConfiguration.restoreCASSnapshot(
+                                    to: casOptions.casPath,
+                                    actionKey: candidateKey
+                                )
+                            }
                             let bytes = try executionDelegate.fs.read(
                                 planCacheConfiguration.actionPath(for: candidateKey)
                             )
