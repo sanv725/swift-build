@@ -1362,8 +1362,10 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                             )
                         switch dependencyAdmissionDecision {
                         case .executeChanged(let sourceIdentity)?,
-                             .executeAffected(let sourceIdentity)?
-                            where admissionCoordinator.usesPrecomputedInvalidation:
+                             .executeAffected(let sourceIdentity)?:
+                            guard admissionCoordinator.usesPrecomputedInvalidation else {
+                                break
+                            }
                             guard let overlayPath = admissionCoordinator
                                     .compatiblePlanOverlayPath else {
                                 admissionCoordinator.abort(reason: "missing_preflight_overlay")
