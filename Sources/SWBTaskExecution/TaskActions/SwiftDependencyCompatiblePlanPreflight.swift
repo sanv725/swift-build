@@ -60,6 +60,13 @@ package enum SwiftDependencyCompatiblePlanPreflight {
         package let dependencyOnlyGraphClosureParity: Bool?
     }
 
+    package struct GraphResult: Sendable, Equatable {
+        package let admissionManifest: SwiftDependencyGraphAdmissionManifest
+        package let executions: [Execution]
+        package let closure: SwiftDependencyPriorGraphClosureResult
+        package let compilerDurationNS: UInt64
+    }
+
     package struct ProjectionComparison: Sendable, Equatable {
         package let compilerVersion: Bool
         package let sourceFileInterfaceFingerprint: Bool
@@ -239,6 +246,168 @@ package enum SwiftDependencyCompatiblePlanPreflight {
                 $0 == priorGraphClosure
             }
         )
+    }
+
+    /// Derives the complete conservative admission cone from fresh
+    /// dependency-only projections for the changed primaries. No codegen
+    /// output is produced here; affected frontend jobs remain owned by the
+    /// normal Swift Build scheduler and can therefore run concurrently.
+    package static func runGraph(
+        previousManifest: SwiftDependencyModuleManifest,
+        changedSourceIdentities: Set<String>,
+        jobs: [Job],
+        overlayPath: Path,
+        compileDependencyOnlyProjection: (Job, [String]) throws
+            -> SwiftDependencyFingerprintProjection
+    ) throws -> GraphResult {
+        let expectedSources = previousManifest.sources.map(\.sourceIdentity)
+        let jobsBySource = Dictionary(uniqueKeysWithValues: jobs.map {
+            ($0.sourceIdentity, $0)
+        })
+        guard overlayPath.isAbsolute,
+              !changedSourceIdentities.isEmpty,
+              jobs.count == jobsBySource.count,
+              jobsBySource.keys.sorted() == expectedSources,
+              changedSourceIdentities.isSubset(of: Set(expectedSources)) else {
+            throw StubError.error(
+                "Swift dependency graph preflight requires exact primary coverage."
+            )
+        }
+
+        var projections: [String: SwiftDependencyFingerprintProjection] = [:]
+        var executions: [Execution] = []
+        var compilerDurationNS: UInt64 = 0
+        for sourceIdentity in changedSourceIdentities.sorted() {
+            guard let job = jobsBySource[sourceIdentity] else {
+                throw StubError.error(
+                    "Swift dependency graph preflight is missing a changed primary."
+                )
+            }
+            let patched = try patchedCommandLine(
+                job.commandLine,
+                sourceIdentity: sourceIdentity,
+                overlayPath: overlayPath
+            )
+            let dependencyOutput = dependencyOnlyOutputPath(for: job)
+            let commandLine = try dependencyOnlyCommandLine(
+                patched,
+                dependencyOutputPath: dependencyOutput
+            )
+            let timer = ElapsedTimer()
+            let projection = try compileDependencyOnlyProjection(job, commandLine)
+            let durationNS = timer.elapsedTime().nanoseconds
+            projections[sourceIdentity] = projection
+            executions.append(.init(
+                sourceIdentity: sourceIdentity,
+                commandLine: commandLine,
+                dependencyOutputPath: dependencyOutput,
+                durationNS: durationNS
+            ))
+            compilerDurationNS += durationNS
+        }
+        let closure = try SwiftDependencyPriorGraphClosure.calculate(
+            previousManifest: previousManifest,
+            changedProjections: projections
+        )
+        return .init(
+            admissionManifest: try .init(
+                previousManifest: previousManifest,
+                closure: closure,
+                changedProjections: projections
+            ),
+            executions: executions,
+            closure: closure,
+            compilerDurationNS: compilerDurationNS
+        )
+    }
+
+    package static func runGraphLive(
+        snapshot: SwiftDriverPlanCacheSnapshot,
+        configuration: SwiftDependencyShadowConfiguration,
+        environment: [String: String],
+        fs: any FSProxy
+    ) throws -> GraphResult {
+        guard configuration.compatiblePlanPreflightMode == .dependencyGraph,
+              let rawPreflightManifestPath = configuration.preflightManifestPath,
+              configuration.changedSourceIdentities.count == 1 else {
+            throw StubError.error(
+                "Swift dependency graph preflight configuration is incomplete."
+            )
+        }
+        let preflightManifestPath = Path(rawPreflightManifestPath)
+        let previousManifestPath = Path(configuration.previousManifestPath)
+        guard preflightManifestPath.isAbsolute, previousManifestPath.isAbsolute else {
+            throw StubError.error("Swift dependency graph preflight paths must be absolute.")
+        }
+        let previousBytes = try fs.read(previousManifestPath)
+        let previousManifest = try JSONDecoder().decode(
+            SwiftDependencyModuleManifest.self,
+            from: Data(previousBytes.bytes)
+        )
+        let jobs = try snapshot.plannedBuild.plannedTargetJobs.compactMap { planned -> Job? in
+            let commandLine = planned.driverJob.commandLine.map(\.asString)
+            let primaries = values(after: "-primary-file", in: commandLine)
+            guard primaries.count == 1 else { return nil }
+            let dependencies = values(
+                after: "-emit-reference-dependencies-path",
+                in: commandLine
+            )
+            guard dependencies.count == 1 else {
+                throw StubError.error(
+                    "Swift dependency graph preflight primary lacks one dependency output."
+                )
+            }
+            let dependencyPath = Path(dependencies[0])
+            return .init(
+                sourceIdentity: primaries[0],
+                commandLine: commandLine,
+                dependencyOutputPath: dependencyPath.isAbsolute
+                    ? dependencyPath
+                    : planned.workingDirectory.join(dependencyPath),
+                outputPaths: planned.driverJob.outputs,
+                workingDirectory: planned.workingDirectory
+            )
+        }
+
+        let overlayPath = preflightManifestPath.dirname.join("prefix-map-vfsoverlay.json")
+        try writeOverlay(
+            to: overlayPath,
+            configuration: configuration,
+            environment: environment,
+            jobs: jobs,
+            fs: fs
+        )
+        let childEnvironment = compilerEnvironment(from: environment)
+        let result = try runGraph(
+            previousManifest: previousManifest,
+            changedSourceIdentities: Set(configuration.changedSourceIdentities),
+            jobs: jobs,
+            overlayPath: overlayPath
+        ) { job, commandLine in
+            let dependencyOutputPath = try dependencyOutputPath(in: commandLine)
+            try fs.createDirectory(dependencyOutputPath.dirname, recursive: true)
+            try execute(
+                commandLine: commandLine,
+                workingDirectory: job.workingDirectory,
+                environment: childEnvironment,
+                logPath: preflightManifestPath.dirname.join(
+                    "dependency-only-\(job.sourceIdentity.split(separator: "/").last ?? "unknown").log"
+                )
+            )
+            return try SwiftDependencyFingerprintProjection.read(
+                from: dependencyOutputPath,
+                sourceIdentity: job.sourceIdentity,
+                pathMappings: configuration.pathMappings
+            )
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        try fs.write(
+            preflightManifestPath,
+            contents: ByteString(try encoder.encode(result.admissionManifest)),
+            atomically: true
+        )
+        return result
     }
 
     package static func runLive(
@@ -563,6 +732,75 @@ package enum SwiftDependencyCompatiblePlanPreflight {
                   commandLine.indices.contains(index + 1) else { return nil }
             return commandLine[index + 1]
         }
+    }
+
+    private static func writeOverlay(
+        to overlayPath: Path,
+        configuration: SwiftDependencyShadowConfiguration,
+        environment: [String: String],
+        jobs: [Job],
+        fs: any FSProxy
+    ) throws {
+        var overlayMappings = Dictionary(
+            uniqueKeysWithValues: configuration.pathMappings.map {
+                ($0.virtualPrefix, $0.physicalPrefix)
+            }
+        )
+        for (virtualPrefix, environmentKey) in [
+            ("/^sdk", "SDKROOT"),
+            ("/^xcode", "DEVELOPER_DIR"),
+            ("/^src", "PROJECT_DIR"),
+            ("/^derived", "PROJECT_TEMP_DIR"),
+            ("/^built", "BUILT_PRODUCTS_DIR"),
+            ("/^workspace", "WORKSPACE_DIR"),
+        ] {
+            if let physicalPrefix = environment[environmentKey],
+               Path(physicalPrefix).isAbsolute {
+                overlayMappings[virtualPrefix] = physicalPrefix
+            }
+        }
+        if let executable = jobs.first?.commandLine.first {
+            let toolchainURL = URL(fileURLWithPath: executable)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+            if toolchainURL.path.hasSuffix(".xctoolchain") {
+                overlayMappings["/^toolchain"] = toolchainURL.path
+            }
+        }
+        let overlay: [String: Any] = [
+            "version": 0,
+            "case-sensitive": "false",
+            "redirecting-with": "fallthrough",
+            "roots": overlayMappings.keys.sorted().map { virtualPrefix in
+                [
+                    "type": "directory-remap",
+                    "name": virtualPrefix,
+                    "external-contents": overlayMappings[virtualPrefix]!,
+                ]
+            },
+        ]
+        let bytes = try JSONSerialization.data(
+            withJSONObject: overlay,
+            options: [.sortedKeys]
+        )
+        try fs.createDirectory(overlayPath.dirname, recursive: true)
+        try fs.write(overlayPath, contents: ByteString(bytes), atomically: true)
+    }
+
+    private static func compilerEnvironment(
+        from environment: [String: String]
+    ) -> [String: String] {
+        var result = environment
+        SwiftJobCASConfiguration.removeControlVariables(from: &result)
+        SwiftDependencyShadowConfiguration.removeControlVariable(from: &result)
+        result.removeValue(forKey: "SWIFT_BUILD_DRIVER_PLAN_CACHE_ROOT")
+        result.removeValue(forKey: "SWIFT_BUILD_DRIVER_PLAN_CACHE_MODE")
+        result.removeValue(forKey: "SWIFT_BUILD_DRIVER_PLAN_CACHE_KEY")
+        result.removeValue(forKey: "SWIFT_BUILD_DRIVER_PLAN_COMPATIBILITY_MODE")
+        result.removeValue(forKey: "SWIFT_BUILD_DRIVER_PLAN_DEPENDENCY_MANIFEST")
+        result.removeValue(forKey: "SWIFT_BUILD_DRIVER_PLAN_INPUT_IDENTITY")
+        return result
     }
 
     private static func execute(

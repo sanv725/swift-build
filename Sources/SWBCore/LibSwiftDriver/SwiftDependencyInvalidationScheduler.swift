@@ -15,6 +15,16 @@ public struct SwiftDependencyFixedPointResult: Sendable, Equatable {
     public let manifest: SwiftDependencyModuleManifest
     public let invalidationCone: SwiftDependencyInvalidationCone
     public let compilationCounts: [String: Int]
+
+    public init(
+        manifest: SwiftDependencyModuleManifest,
+        invalidationCone: SwiftDependencyInvalidationCone,
+        compilationCounts: [String: Int]
+    ) {
+        self.manifest = manifest
+        self.invalidationCone = invalidationCone
+        self.compilationCounts = compilationCounts
+    }
 }
 
 /// Incrementally updates a prior complete module manifest as frontend jobs

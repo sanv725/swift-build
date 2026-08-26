@@ -122,6 +122,11 @@ public struct SwiftDependencyInvalidationCone: Codable, Sendable, Equatable {
     public let affectedSources: [String]
     public let reusableSources: [String]
 
+    public init(affectedSources: [String], reusableSources: [String]) {
+        self.affectedSources = affectedSources.sorted()
+        self.reusableSources = reusableSources.sorted()
+    }
+
     public static func compare(
         previous: SwiftDependencyModuleManifest,
         current: SwiftDependencyModuleManifest,

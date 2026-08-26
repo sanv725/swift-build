@@ -311,6 +311,81 @@ fileprivate struct SwiftDependencyAdmissionCoordinatorTests {
     }
 
     @Test
+    func graphAdmissionRunsAffectedFrontendsTogetherAndPublishesOneFinalManifest() async throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let preflightPath = temporaryDirectory.path.join("preflight.json")
+        let configuration = SwiftDependencyShadowConfiguration(
+            admittingManifestAt: temporaryDirectory.path.join("baseline.json").str,
+            resultPath: temporaryDirectory.path.join("result.json").str,
+            changedSourceIdentity: provider,
+            pathMappings: [],
+            preflightManifestPath: preflightPath.str,
+            compatiblePlanCandidateKey: String(repeating: "a", count: 64),
+            compatiblePlanInputIdentity: String(repeating: "b", count: 64),
+            compatiblePlanPreflightMode: .dependencyGraph
+        )
+        let baseline = try baselineManifest()
+        let changed = providerProjection(fingerprint: "provider-v2")
+        let closure = try SwiftDependencyPriorGraphClosure.calculate(
+            previousManifest: baseline,
+            changedProjections: [provider: changed]
+        )
+        let graphManifest = try SwiftDependencyGraphAdmissionManifest(
+            previousManifest: baseline,
+            closure: closure,
+            changedProjections: [provider: changed]
+        )
+        let coordinator = try SwiftDependencyAdmissionCoordinator(
+            configuration: configuration,
+            previousManifest: baseline,
+            graphAdmissionManifest: graphManifest,
+            fs: localFS
+        )
+
+        #expect(coordinator.usesGraphAdmission)
+        #expect(!coordinator.usesPreflightCompilerOutputs)
+        #expect(await coordinator.admissionDecision(
+            moduleName: "AdmissionFixture",
+            primaryPath: Path(provider)
+        ) == .executeChanged(sourceIdentity: provider))
+        #expect(await coordinator.admissionDecision(
+            moduleName: "AdmissionFixture",
+            primaryPath: Path(caller)
+        ) == .executeAffected(sourceIdentity: caller))
+        #expect(await coordinator.admissionDecision(
+            moduleName: "AdmissionFixture",
+            primaryPath: Path(unrelated)
+        ) == .replayReusable(sourceIdentity: unrelated, dependencyFingerprintDigests: []))
+        coordinator.recordReplayHit(sourceIdentity: unrelated)
+
+        async let providerCompletion = coordinator.completeGraphProjection(
+            changed,
+            sourceIdentity: provider
+        )
+        async let callerCompletion = coordinator.completeGraphProjection(
+            callerProjection(),
+            sourceIdentity: caller
+        )
+        let completions = try await [providerCompletion, callerCompletion]
+        #expect(completions.allSatisfy { $0.outcome == "admitted" })
+        #expect(completions.allSatisfy { $0.predictedCount == 2 })
+        #expect(completions.allSatisfy { $0.actualCount == 2 })
+
+        let bytes = try localFS.read(preflightPath)
+        let finalManifest = try JSONDecoder().decode(
+            SwiftDependencyModuleManifest.self,
+            from: Data(bytes.bytes)
+        )
+        #expect(finalManifest.sources.first {
+            $0.sourceIdentity == provider
+        }?.projection == changed)
+        let result = try readResult(temporaryDirectory: temporaryDirectory)
+        #expect(result.outcome == "admitted")
+        #expect(result.predictedAffectedSources == [caller, provider])
+        #expect(result.actualExecutedSources == [caller, provider])
+    }
+
+    @Test
     func abortReleasesEverySuspendedJobToAppleFallback() async throws {
         let temporaryDirectory = try NamedTemporaryDirectory()
         let coordinator = try makeCoordinator(temporaryDirectory: temporaryDirectory)

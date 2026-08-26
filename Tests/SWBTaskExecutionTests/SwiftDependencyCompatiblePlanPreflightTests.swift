@@ -102,6 +102,33 @@ fileprivate struct SwiftDependencyCompatiblePlanPreflightTests {
     }
 
     @Test
+    func graphAdmissionCompilesOnlyTheChangedDependencyProjection() throws {
+        let overlay = Path("/tmp/u02-graph-prefix-map.json")
+        var compiledSources: [String] = []
+        let result = try SwiftDependencyCompatiblePlanPreflight.runGraph(
+            previousManifest: baselineManifest(),
+            changedSourceIdentities: [provider],
+            jobs: sources.map(job),
+            overlayPath: overlay
+        ) { job, commandLine in
+            compiledSources.append(job.sourceIdentity)
+            #expect(commandLine.contains("-typecheck"))
+            #expect(commandLine.contains("-experimental-skip-all-function-bodies"))
+            #expect(!commandLine.contains("-c"))
+            return providerProjection(fingerprint: "provider-v2")
+        }
+
+        #expect(compiledSources == [provider])
+        #expect(result.executions.map(\.sourceIdentity) == [provider])
+        #expect(result.closure.invalidationCone.affectedSources
+            == [provider, bridge, caller].sorted())
+        #expect(result.closure.invalidationCone.reusableSources == [unrelated])
+        #expect(result.admissionManifest.schema
+            == SwiftDependencyGraphAdmissionManifest.schema)
+        #expect(result.admissionManifest.changedSources.map(\.sourceIdentity) == [provider])
+    }
+
+    @Test
     func rejectsIncompleteOrDuplicatePlanCoverageWithoutCompiling() throws {
         let baseline = try baselineManifest()
         var compileCount = 0

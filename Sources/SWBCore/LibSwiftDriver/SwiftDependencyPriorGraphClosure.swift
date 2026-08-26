@@ -24,6 +24,73 @@ public struct SwiftDependencyPriorGraphClosureResult: Sendable, Equatable {
     public let changedProviderKeys: [SwiftDependencyFingerprintProjection.Key]
 }
 
+/// A short-lived, compiler-derived admission envelope written before llbuild
+/// dispatches frontend tasks. Unlike `SwiftDependencyModuleManifest`, this is
+/// deliberately not a completed module state: it contains only the fresh
+/// changed-source projections needed to derive a conservative prior-graph
+/// closure. The coordinator replaces it with a complete module manifest after
+/// every admitted frontend has produced its real projection.
+public struct SwiftDependencyGraphAdmissionManifest: Codable, Sendable, Equatable {
+    public static let schema = "swift-build-dependency-graph-admission-v1"
+
+    public struct ChangedSource: Codable, Sendable, Equatable, Comparable {
+        public let sourceIdentity: String
+        public let projection: SwiftDependencyFingerprintProjection
+
+        public init(
+            sourceIdentity: String,
+            projection: SwiftDependencyFingerprintProjection
+        ) {
+            self.sourceIdentity = sourceIdentity
+            self.projection = projection
+        }
+
+        public static func < (lhs: Self, rhs: Self) -> Bool {
+            lhs.sourceIdentity < rhs.sourceIdentity
+        }
+    }
+
+    public let schema: String
+    public let previousDependencyIdentity: String
+    public let moduleStructureIdentity: String
+    public let affectedSources: [String]
+    public let reusableSources: [String]
+    public let changedSources: [ChangedSource]
+
+    public init(
+        previousManifest: SwiftDependencyModuleManifest,
+        closure: SwiftDependencyPriorGraphClosureResult,
+        changedProjections: [String: SwiftDependencyFingerprintProjection]
+    ) throws {
+        let expectedSources = Set(previousManifest.sources.map(\.sourceIdentity))
+        let affected = Set(closure.invalidationCone.affectedSources)
+        let reusable = Set(closure.invalidationCone.reusableSources)
+        let changed = Set(changedProjections.keys)
+        guard previousManifest.schema == SwiftDependencyModuleManifest.schema,
+              !changed.isEmpty,
+              changed.isSubset(of: affected),
+              affected.isDisjoint(with: reusable),
+              affected.union(reusable) == expectedSources,
+              changedProjections.values.allSatisfy({
+                  $0.schema == SwiftDependencyFingerprintProjection.schema
+                    && $0.compilerVersion == previousManifest.compilerVersion
+                    && $0.sourceFileInterfaceFingerprint != nil
+              }) else {
+            throw StubError.error(
+                "Swift dependency graph admission requires a complete conservative closure."
+            )
+        }
+        self.schema = Self.schema
+        self.previousDependencyIdentity = previousManifest.dependencyIdentity
+        self.moduleStructureIdentity = previousManifest.structureIdentity
+        self.affectedSources = affected.sorted()
+        self.reusableSources = reusable.sorted()
+        self.changedSources = changedProjections.map {
+            .init(sourceIdentity: $0.key, projection: $0.value)
+        }.sorted()
+    }
+}
+
 public enum SwiftDependencyPriorGraphClosure {
     public static func calculate(
         previousManifest: SwiftDependencyModuleManifest,

@@ -1520,6 +1520,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             if dependencyCompatiblePlanExecution,
                let dependencyOutputPath,
                case .admission(let admissionCoordinator) = dependencyRuntimeCoordinator,
+               admissionCoordinator.usesPreflightCompilerOutputs,
                let sourceIdentity = dependencyPreflightSourceIdentity,
                plannedOutputs.allSatisfy({ executionDelegate.fs.exists($0) }) {
                 let completion = try admissionCoordinator.completeFrontend(
@@ -2095,10 +2096,19 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                          .executeAffected(let sourceIdentity)?:
                         if delegate.commandResult == .succeeded {
                             do {
-                                let completion = try admissionCoordinator.completeFrontend(
-                                    sourceIdentity: sourceIdentity,
-                                    dependencyPath: dependencyOutputPath
-                                )
+                                let completion: SwiftDependencyAdmissionCoordinator.Completion
+                                if admissionCoordinator.usesGraphAdmission {
+                                    completion = try await admissionCoordinator
+                                        .completeGraphFrontend(
+                                            sourceIdentity: sourceIdentity,
+                                            dependencyPath: dependencyOutputPath
+                                        )
+                                } else {
+                                    completion = try admissionCoordinator.completeFrontend(
+                                        sourceIdentity: sourceIdentity,
+                                        dependencyPath: dependencyOutputPath
+                                    )
+                                }
                                 jobCASRecordIdentity = makeJobCASIdentity(
                                     dependencyFingerprintDigests: completion
                                         .dependencyFingerprintDigests

@@ -488,12 +488,28 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                                     "Compatible Swift Driver preflight topology failed validation."
                                 )
                             }
-                            let preflight = try SwiftDependencyCompatiblePlanPreflight.runLive(
-                                snapshot: snapshot,
-                                configuration: preflightConfiguration,
-                                environment: environment,
-                                fs: executionDelegate.fs
-                            )
+                            let graphPreflight: SwiftDependencyCompatiblePlanPreflight.GraphResult?
+                            let serialPreflight: SwiftDependencyCompatiblePlanPreflight.Result?
+                            if preflightConfiguration.compatiblePlanPreflightMode
+                                == .dependencyGraph {
+                                graphPreflight = try SwiftDependencyCompatiblePlanPreflight
+                                    .runGraphLive(
+                                        snapshot: snapshot,
+                                        configuration: preflightConfiguration,
+                                        environment: environment,
+                                        fs: executionDelegate.fs
+                                    )
+                                serialPreflight = nil
+                            } else {
+                                graphPreflight = nil
+                                serialPreflight = try SwiftDependencyCompatiblePlanPreflight
+                                    .runLive(
+                                        snapshot: snapshot,
+                                        configuration: preflightConfiguration,
+                                        environment: environment,
+                                        fs: executionDelegate.fs
+                                    )
+                            }
                             try dependencyGraph.installCachedPlan(
                                 key: driverPayload.uniqueID,
                                 compilerLocation: driverPayload.compilerLocation,
@@ -514,30 +530,42 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                             dependencyObservationCandidateKey = candidateKey
                             dependencyObservationCandidateBinding = binding
                             dependencyObservationOutcome = "compatible_preflight"
-                            let preflightCompileDurationNS = preflight.executions.reduce(0) {
-                                $0 + $1.durationNS
-                            }
-                            let fixedPointAffected = Set(
-                                preflight.fixedPoint.invalidationCone.affectedSources
-                            )
-                            let graphAffected = Set(
-                                preflight.priorGraphClosure.invalidationCone.affectedSources
-                            )
-                            let falseNegativeCount = fixedPointAffected
-                                .subtracting(graphAffected).count
-                            let overadmittedCount = graphAffected
-                                .subtracting(fixedPointAffected).count
-                            outputDelegate.note(
-                                "SWIFT_DRIVER_PLAN_GRAPH_CLOSURE outcome=observed affected=\(graphAffected.count) reusable=\(preflight.priorGraphClosure.invalidationCone.reusableSources.count) changed_keys=\(preflight.priorGraphClosure.changedProviderKeys.count) false_negative=\(falseNegativeCount) overadmitted=\(overadmittedCount) projection_compiler_ns=\(preflight.changedProjectionDurationNS)"
-                            )
-                            if let comparison = preflight.dependencyOnlyProjectionComparison {
+                            if let preflight = graphPreflight {
                                 outputDelegate.note(
-                                    "SWIFT_DRIVER_DEPENDENCY_ONLY_PROJECTION outcome=observed parity=\(comparison.exact ? "exact" : "mismatch") closure_input_parity=\(comparison.closureRelevantExact ? "exact" : "mismatch") closure_parity=\(preflight.dependencyOnlyGraphClosureParity == true ? "exact" : "mismatch") executions=\(preflight.dependencyOnlyExecutions.count) compiler_ns=\(preflight.dependencyOnlyExecutions.reduce(0) { $0 + $1.durationNS }) compiler_equal=\(comparison.compilerVersion ? 1 : 0) fingerprint_equal=\(comparison.sourceFileInterfaceFingerprint ? 1 : 0) provided_equal=\(comparison.providedInterfaces ? 1 : 0) depended_equal=\(comparison.dependedInterfaces ? 1 : 0) dependency_only_provided=\(comparison.dependencyOnlyProvidedCount) full_provided=\(comparison.fullProvidedCount) dependency_only_depended=\(comparison.dependencyOnlyDependedCount) full_depended=\(comparison.fullDependedCount)"
+                                    "SWIFT_DRIVER_PLAN_GRAPH_CLOSURE outcome=admitted affected=\(preflight.closure.invalidationCone.affectedSources.count) reusable=\(preflight.closure.invalidationCone.reusableSources.count) changed_keys=\(preflight.closure.changedProviderKeys.count) false_negative=unknown overadmitted=unknown projection_compiler_ns=\(preflight.compilerDurationNS)"
+                                )
+                                outputDelegate.note(
+                                    "SWIFT_DRIVER_DEPENDENCY_ONLY_PROJECTION outcome=admitted executions=\(preflight.executions.count) compiler_ns=\(preflight.compilerDurationNS)"
+                                )
+                                outputDelegate.note(
+                                    "SWIFT_DRIVER_PLAN_PREFLIGHT outcome=graph_admitted candidate_key=\(candidateKey) affected=\(preflight.closure.invalidationCone.affectedSources.count) reusable=\(preflight.closure.invalidationCone.reusableSources.count) compiled=0 dependency_only=\(preflight.executions.count) compiler_ns=\(preflight.compilerDurationNS)"
+                                )
+                            } else if let preflight = serialPreflight {
+                                let preflightCompileDurationNS = preflight.executions.reduce(0) {
+                                    $0 + $1.durationNS
+                                }
+                                let fixedPointAffected = Set(
+                                    preflight.fixedPoint.invalidationCone.affectedSources
+                                )
+                                let graphAffected = Set(
+                                    preflight.priorGraphClosure.invalidationCone.affectedSources
+                                )
+                                let falseNegativeCount = fixedPointAffected
+                                    .subtracting(graphAffected).count
+                                let overadmittedCount = graphAffected
+                                    .subtracting(fixedPointAffected).count
+                                outputDelegate.note(
+                                    "SWIFT_DRIVER_PLAN_GRAPH_CLOSURE outcome=observed affected=\(graphAffected.count) reusable=\(preflight.priorGraphClosure.invalidationCone.reusableSources.count) changed_keys=\(preflight.priorGraphClosure.changedProviderKeys.count) false_negative=\(falseNegativeCount) overadmitted=\(overadmittedCount) projection_compiler_ns=\(preflight.changedProjectionDurationNS)"
+                                )
+                                if let comparison = preflight.dependencyOnlyProjectionComparison {
+                                    outputDelegate.note(
+                                        "SWIFT_DRIVER_DEPENDENCY_ONLY_PROJECTION outcome=observed parity=\(comparison.exact ? "exact" : "mismatch") closure_input_parity=\(comparison.closureRelevantExact ? "exact" : "mismatch") closure_parity=\(preflight.dependencyOnlyGraphClosureParity == true ? "exact" : "mismatch") executions=\(preflight.dependencyOnlyExecutions.count) compiler_ns=\(preflight.dependencyOnlyExecutions.reduce(0) { $0 + $1.durationNS }) compiler_equal=\(comparison.compilerVersion ? 1 : 0) fingerprint_equal=\(comparison.sourceFileInterfaceFingerprint ? 1 : 0) provided_equal=\(comparison.providedInterfaces ? 1 : 0) depended_equal=\(comparison.dependedInterfaces ? 1 : 0) dependency_only_provided=\(comparison.dependencyOnlyProvidedCount) full_provided=\(comparison.fullProvidedCount) dependency_only_depended=\(comparison.dependencyOnlyDependedCount) full_depended=\(comparison.fullDependedCount)"
+                                    )
+                                }
+                                outputDelegate.note(
+                                    "SWIFT_DRIVER_PLAN_PREFLIGHT outcome=admitted candidate_key=\(candidateKey) affected=\(preflight.fixedPoint.invalidationCone.affectedSources.count) reusable=\(preflight.fixedPoint.invalidationCone.reusableSources.count) compiled=\(preflight.executions.count) compiler_ns=\(preflightCompileDurationNS)"
                                 )
                             }
-                            outputDelegate.note(
-                                "SWIFT_DRIVER_PLAN_PREFLIGHT outcome=admitted candidate_key=\(candidateKey) affected=\(preflight.fixedPoint.invalidationCone.affectedSources.count) reusable=\(preflight.fixedPoint.invalidationCone.reusableSources.count) compiled=\(preflight.executions.count) compiler_ns=\(preflightCompileDurationNS)"
-                            )
                         } catch {
                             dependencyObservationOutcome = "preflight_failed"
                             outputDelegate.note(

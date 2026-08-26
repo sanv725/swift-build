@@ -54,6 +54,11 @@ package struct SwiftDependencyShadowConfiguration: Codable, Sendable, Equatable 
         case admit
     }
 
+    package enum CompatiblePlanPreflightMode: String, Codable, Sendable {
+        case serialFixedPoint = "serial-fixed-point"
+        case dependencyGraph = "dependency-graph"
+    }
+
     package let schema: String
     package let mode: Mode
     package let previousManifestPath: String
@@ -74,6 +79,7 @@ package struct SwiftDependencyShadowConfiguration: Codable, Sendable, Equatable 
     /// prior source/product state. Used only when preflightManifestPath is set.
     package let compatiblePlanCandidateKey: String?
     package let compatiblePlanInputIdentity: String?
+    package let compatiblePlanPreflightMode: CompatiblePlanPreflightMode?
 
     package init(
         previousManifestPath: String,
@@ -96,6 +102,7 @@ package struct SwiftDependencyShadowConfiguration: Codable, Sendable, Equatable 
         self.preflightManifestPath = nil
         self.compatiblePlanCandidateKey = nil
         self.compatiblePlanInputIdentity = nil
+        self.compatiblePlanPreflightMode = nil
     }
 
     package init(
@@ -122,6 +129,7 @@ package struct SwiftDependencyShadowConfiguration: Codable, Sendable, Equatable 
         self.preflightManifestPath = nil
         self.compatiblePlanCandidateKey = nil
         self.compatiblePlanInputIdentity = nil
+        self.compatiblePlanPreflightMode = nil
     }
 
     package init(
@@ -133,7 +141,8 @@ package struct SwiftDependencyShadowConfiguration: Codable, Sendable, Equatable 
         preclassifiedBodyEditProof: SwiftDependencyBodyEditProof? = nil,
         preflightManifestPath: String? = nil,
         compatiblePlanCandidateKey: String? = nil,
-        compatiblePlanInputIdentity: String? = nil
+        compatiblePlanInputIdentity: String? = nil,
+        compatiblePlanPreflightMode: CompatiblePlanPreflightMode? = nil
     ) {
         self.schema = Self.schema
         self.mode = .admit
@@ -150,6 +159,7 @@ package struct SwiftDependencyShadowConfiguration: Codable, Sendable, Equatable 
         self.preflightManifestPath = preflightManifestPath
         self.compatiblePlanCandidateKey = compatiblePlanCandidateKey
         self.compatiblePlanInputIdentity = compatiblePlanInputIdentity
+        self.compatiblePlanPreflightMode = compatiblePlanPreflightMode
     }
 
     package static func path(environment: [String: String]) throws -> Path? {

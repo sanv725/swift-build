@@ -60,11 +60,15 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
 
     private typealias Waiter = CheckedContinuation<SwiftDependencyAdmissionDecision, Never>
     private typealias Resumption = (Waiter, SwiftDependencyAdmissionDecision)
+    private typealias GraphCompletionWaiter = CheckedContinuation<Completion, any Error>
 
     private struct State {
         var scheduler: SwiftDependencyInvalidationScheduler
         var preclassifiedChangedSource: String?
         var preflightExpectedEntries: [String: SwiftDependencyModuleManifest.SourceEntry]?
+        var graphAdmissionManifest: SwiftDependencyGraphAdmissionManifest?
+        var graphActualProjections: [String: SwiftDependencyFingerprintProjection] = [:]
+        var graphCompletionWaiters: [String: GraphCompletionWaiter] = [:]
         var dispatchedSources: Set<String> = []
         var waiters: [String: [Waiter]] = [:]
         var actualExecutionCounts: [String: Int] = [:]
@@ -103,23 +107,35 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
             from: Data(manifestBytes.bytes)
         )
         let preflightManifest: SwiftDependencyModuleManifest?
+        let graphAdmissionManifest: SwiftDependencyGraphAdmissionManifest?
         if let rawPreflightPath = configuration.preflightManifestPath {
             let preflightPath = Path(rawPreflightPath)
             guard preflightPath.isAbsolute else {
                 throw StubError.error("Swift dependency preflight manifest path must be absolute.")
             }
             let preflightBytes = try fs.read(preflightPath)
-            preflightManifest = try JSONDecoder().decode(
-                SwiftDependencyModuleManifest.self,
-                from: Data(preflightBytes.bytes)
-            )
+            if configuration.compatiblePlanPreflightMode == .dependencyGraph {
+                preflightManifest = nil
+                graphAdmissionManifest = try JSONDecoder().decode(
+                    SwiftDependencyGraphAdmissionManifest.self,
+                    from: Data(preflightBytes.bytes)
+                )
+            } else {
+                preflightManifest = try JSONDecoder().decode(
+                    SwiftDependencyModuleManifest.self,
+                    from: Data(preflightBytes.bytes)
+                )
+                graphAdmissionManifest = nil
+            }
         } else {
             preflightManifest = nil
+            graphAdmissionManifest = nil
         }
         try self.init(
             configuration: configuration,
             previousManifest: manifest,
             preflightManifest: preflightManifest,
+            graphAdmissionManifest: graphAdmissionManifest,
             fs: fs
         )
     }
@@ -128,6 +144,7 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
         configuration: SwiftDependencyShadowConfiguration,
         previousManifest: SwiftDependencyModuleManifest,
         preflightManifest: SwiftDependencyModuleManifest? = nil,
+        graphAdmissionManifest: SwiftDependencyGraphAdmissionManifest? = nil,
         fs: any FSProxy
     ) throws {
         guard configuration.schema == SwiftDependencyShadowConfiguration.schema,
@@ -150,8 +167,63 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
         )
         let preclassifiedChangedSource: String?
         let preflightExpectedEntries: [String: SwiftDependencyModuleManifest.SourceEntry]?
+        let validatedGraphAdmission: SwiftDependencyGraphAdmissionManifest?
         let fixedPointResult: SwiftDependencyFixedPointResult?
-        if let preflightManifest {
+        if let graphAdmissionManifest {
+            let candidateKey = configuration.compatiblePlanCandidateKey ?? ""
+            let planInputIdentity = configuration.compatiblePlanInputIdentity ?? ""
+            let changedProjections = Dictionary(
+                uniqueKeysWithValues: graphAdmissionManifest.changedSources.map {
+                    ($0.sourceIdentity, $0.projection)
+                }
+            )
+            let recalculated = try SwiftDependencyPriorGraphClosure.calculate(
+                previousManifest: previousManifest,
+                changedProjections: changedProjections
+            )
+            guard configuration.compatiblePlanPreflightMode == .dependencyGraph,
+                  configuration.preclassifiedBodyEdit != true,
+                  configuration.preclassifiedBodyEditProof == nil,
+                  Self.isSHA256(candidateKey),
+                  Self.isSHA256(planInputIdentity),
+                  graphAdmissionManifest.schema
+                    == SwiftDependencyGraphAdmissionManifest.schema,
+                  graphAdmissionManifest.previousDependencyIdentity
+                    == previousManifest.dependencyIdentity,
+                  graphAdmissionManifest.moduleStructureIdentity
+                    == previousManifest.structureIdentity,
+                  Set(graphAdmissionManifest.changedSources.map(\.sourceIdentity))
+                    == Set(configuration.changedSourceIdentities),
+                  graphAdmissionManifest.affectedSources
+                    == recalculated.invalidationCone.affectedSources,
+                  graphAdmissionManifest.reusableSources
+                    == recalculated.invalidationCone.reusableSources else {
+                throw StubError.error(
+                    "Swift dependency graph admission did not match the trusted prior state."
+                )
+            }
+            var projections = Dictionary(
+                uniqueKeysWithValues: previousManifest.sources.map {
+                    ($0.sourceIdentity, $0.projection)
+                }
+            )
+            projections.merge(changedProjections) { _, changed in changed }
+            let replayManifest = try SwiftDependencyModuleManifest(
+                moduleName: previousManifest.moduleName,
+                toolchainIdentity: previousManifest.toolchainIdentity,
+                pathPolicyIdentity: previousManifest.pathPolicyIdentity,
+                expectedSourceIdentities: sourceIdentities,
+                projectionsBySource: projections
+            )
+            preclassifiedChangedSource = nil
+            preflightExpectedEntries = Dictionary(
+                uniqueKeysWithValues: replayManifest.sources.map {
+                    ($0.sourceIdentity, $0)
+                }
+            )
+            validatedGraphAdmission = graphAdmissionManifest
+            fixedPointResult = nil
+        } else if let preflightManifest {
             let candidateKey = configuration.compatiblePlanCandidateKey ?? ""
             let planInputIdentity = configuration.compatiblePlanInputIdentity ?? ""
             guard configuration.preclassifiedBodyEdit != true,
@@ -174,6 +246,7 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
                     ($0.sourceIdentity, $0)
                 }
             )
+            validatedGraphAdmission = nil
             fixedPointResult = result
         } else if let proof = configuration.preclassifiedBodyEditProof {
             let changedSource = configuration.changedSourceIdentities[0]
@@ -186,16 +259,19 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
             try scheduler.preclassifyChangedSourceAsInterfaceStable(changedSource)
             preclassifiedChangedSource = changedSource
             preflightExpectedEntries = nil
+            validatedGraphAdmission = nil
             fixedPointResult = try scheduler.result()
         } else if configuration.preclassifiedBodyEdit == true {
             let changedSource = configuration.changedSourceIdentities[0]
             try scheduler.preclassifyChangedSourceAsInterfaceStable(changedSource)
             preclassifiedChangedSource = changedSource
             preflightExpectedEntries = nil
+            validatedGraphAdmission = nil
             fixedPointResult = try scheduler.result()
         } else {
             preclassifiedChangedSource = nil
             preflightExpectedEntries = nil
+            validatedGraphAdmission = nil
             fixedPointResult = nil
         }
         self.configuration = configuration
@@ -207,12 +283,25 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
             scheduler: scheduler,
             preclassifiedChangedSource: preclassifiedChangedSource,
             preflightExpectedEntries: preflightExpectedEntries,
+            graphAdmissionManifest: validatedGraphAdmission,
             fixedPointResult: fixedPointResult
         ))
     }
 
     package var usesPrecomputedInvalidation: Bool {
-        state.withLock { $0.preflightExpectedEntries != nil }
+        state.withLock {
+            $0.preflightExpectedEntries != nil || $0.graphAdmissionManifest != nil
+        }
+    }
+
+    package var usesGraphAdmission: Bool {
+        state.withLock { $0.graphAdmissionManifest != nil }
+    }
+
+    package var usesPreflightCompilerOutputs: Bool {
+        state.withLock {
+            $0.preflightExpectedEntries != nil && $0.graphAdmissionManifest == nil
+        }
     }
 
     package var compatiblePlanOverlayPath: Path? {
@@ -302,6 +391,165 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
             pathMappings: configuration.pathMappings
         )
         return try completeProjection(projection, sourceIdentity: sourceIdentity)
+    }
+
+    /// Completes one concurrently dispatched graph-admitted frontend. Each
+    /// caller waits at this short publication barrier until all affected
+    /// projections exist, allowing every job action to publish under the
+    /// dependency digests from the same complete final manifest.
+    package func completeGraphFrontend(
+        sourceIdentity: String,
+        dependencyPath: Path
+    ) async throws -> Completion {
+        let projection = try SwiftDependencyFingerprintProjection.read(
+            from: dependencyPath,
+            sourceIdentity: sourceIdentity,
+            pathMappings: configuration.pathMappings
+        )
+        return try await completeGraphProjection(
+            projection,
+            sourceIdentity: sourceIdentity
+        )
+    }
+
+    package func completeGraphProjection(
+        _ projection: SwiftDependencyFingerprintProjection,
+        sourceIdentity: String
+    ) async throws -> Completion {
+        try await withCheckedThrowingContinuation { continuation in
+            var completed: [(GraphCompletionWaiter, Completion)] = []
+            var finalManifest: SwiftDependencyModuleManifest?
+            var finalResult: SwiftDependencyShadowResult?
+            var failure: (waiters: [GraphCompletionWaiter], error: any Error)?
+            do {
+                try state.withLock { state in
+                    guard state.abortedReason == nil,
+                          let graphAdmission = state.graphAdmissionManifest,
+                          graphAdmission.affectedSources.contains(sourceIdentity),
+                          state.dispatchedSources.remove(sourceIdentity) != nil,
+                          state.graphActualProjections[sourceIdentity] == nil,
+                          state.graphCompletionWaiters[sourceIdentity] == nil,
+                          projection.schema == SwiftDependencyFingerprintProjection.schema,
+                          projection.compilerVersion == previousManifest.compilerVersion,
+                          projection.sourceFileInterfaceFingerprint != nil else {
+                        throw StubError.error(
+                            "Swift dependency graph admission completed an invalid frontend."
+                        )
+                    }
+                    state.graphActualProjections[sourceIdentity] = projection
+                    state.actualExecutionCounts[sourceIdentity, default: 0] += 1
+                    state.graphCompletionWaiters[sourceIdentity] = continuation
+                    guard state.graphActualProjections.count
+                            == graphAdmission.affectedSources.count else {
+                        return
+                    }
+
+                    var projections = Dictionary(
+                        uniqueKeysWithValues: previousManifest.sources.map {
+                            ($0.sourceIdentity, $0.projection)
+                        }
+                    )
+                    projections.merge(state.graphActualProjections) { _, actual in actual }
+                    let manifest = try SwiftDependencyModuleManifest(
+                        moduleName: previousManifest.moduleName,
+                        toolchainIdentity: previousManifest.toolchainIdentity,
+                        pathPolicyIdentity: previousManifest.pathPolicyIdentity,
+                        expectedSourceIdentities: previousManifest.sources.map(\.sourceIdentity),
+                        projectionsBySource: projections
+                    )
+                    let affected = graphAdmission.affectedSources
+                    let fixedPoint = SwiftDependencyFixedPointResult(
+                        manifest: manifest,
+                        invalidationCone: .init(
+                            affectedSources: affected,
+                            reusableSources: graphAdmission.reusableSources
+                        ),
+                        compilationCounts: Dictionary(
+                            uniqueKeysWithValues: affected.map { ($0, 1) }
+                        )
+                    )
+                    state.fixedPointResult = fixedPoint
+                    let entries = Dictionary(
+                        uniqueKeysWithValues: manifest.sources.map {
+                            ($0.sourceIdentity, $0)
+                        }
+                    )
+                    for identity in affected {
+                        guard let waiter = state.graphCompletionWaiters[identity],
+                              let entry = entries[identity] else {
+                            throw StubError.error(
+                                "Swift dependency graph admission publication barrier is incomplete."
+                            )
+                        }
+                        completed.append((
+                            waiter,
+                            .init(
+                                outcome: "admitted",
+                                sourceIdentity: identity,
+                                dependencyFingerprintDigests:
+                                    entry.dependencyFingerprintDigests,
+                                predictedCount: affected.count,
+                                actualCount: state.actualExecutionCounts.count,
+                                pendingCount: 0
+                            )
+                        ))
+                    }
+                    state.graphCompletionWaiters.removeAll()
+                    finalManifest = manifest
+                    let replaysComplete = state.replayCompletedSources.count
+                        == graphAdmission.reusableSources.count
+                    let persistedOutcome = replaysComplete
+                        ? (state.replayFallbackSources.isEmpty
+                            ? "admitted"
+                            : "replay_fallback")
+                        : "admitted_pending_replays"
+                    finalResult = makeResult(
+                        outcome: persistedOutcome,
+                        fixedPoint: fixedPoint,
+                        actualExecutionCounts: state.actualExecutionCounts
+                    )
+                }
+            } catch {
+                let waiters = state.withLock { state -> [GraphCompletionWaiter] in
+                    state.abortedReason = "invalid_graph_projection"
+                    let waiters = Array(state.graphCompletionWaiters.values)
+                    state.graphCompletionWaiters.removeAll()
+                    return waiters
+                }
+                failure = (waiters.isEmpty ? [continuation] : waiters, error)
+            }
+
+            if let finalManifest, let finalResult {
+                do {
+                    guard let rawPath = configuration.preflightManifestPath else {
+                        throw StubError.error(
+                            "Swift dependency graph admission final manifest path is missing."
+                        )
+                    }
+                    let encoder = JSONEncoder()
+                    encoder.outputFormatting = [.sortedKeys]
+                    try fs.write(
+                        Path(rawPath),
+                        contents: ByteString(try encoder.encode(finalManifest)),
+                        atomically: true
+                    )
+                    try persistResult(finalResult)
+                } catch {
+                    failure = (completed.map(\.0), error)
+                    completed.removeAll()
+                    state.withLock { $0.abortedReason = "graph_publication_failed" }
+                }
+            }
+            if let failure {
+                for waiter in failure.waiters {
+                    waiter.resume(throwing: failure.error)
+                }
+            } else {
+                for (waiter, completion) in completed {
+                    waiter.resume(returning: completion)
+                }
+            }
+        }
     }
 
     package func completeProjection(
@@ -501,8 +749,10 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
         executedApple: Bool
     ) {
         let result = state.withLock { state -> SwiftDependencyShadowResult? in
-            guard let fixedPoint = state.fixedPointResult,
-                  fixedPoint.invalidationCone.reusableSources.contains(sourceIdentity),
+            let reusableSources = state.fixedPointResult?
+                .invalidationCone.reusableSources
+                ?? state.graphAdmissionManifest?.reusableSources
+            guard reusableSources?.contains(sourceIdentity) == true,
                   state.replayCompletedSources.insert(sourceIdentity).inserted else {
                 return nil
             }
@@ -510,6 +760,7 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
                 state.actualExecutionCounts[sourceIdentity, default: 0] += 1
                 state.replayFallbackSources.insert(sourceIdentity)
             }
+            guard let fixedPoint = state.fixedPointResult else { return nil }
             guard state.replayCompletedSources.count
                     == fixedPoint.invalidationCone.reusableSources.count,
                   Set(fixedPoint.invalidationCone.affectedSources)
@@ -530,18 +781,33 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
     }
 
     package func abort(reason: String) {
-        let resumptions = state.withLock { state -> [Resumption] in
-            guard state.abortedReason == nil else { return [] }
+        let transition = state.withLock {
+            state -> (decisions: [Resumption], completions: [GraphCompletionWaiter]) in
+            guard state.abortedReason == nil else { return ([], []) }
             state.abortedReason = reason
             let waiters = state.waiters
             state.waiters.removeAll()
-            return waiters.keys.sorted().flatMap { sourceIdentity in
+            let decisions: [Resumption] = waiters.keys.sorted().flatMap { sourceIdentity in
                 waiters[sourceIdentity, default: []].map {
-                    ($0, .appleFallback(sourceIdentity: sourceIdentity, reason: reason))
+                    (
+                        $0,
+                        SwiftDependencyAdmissionDecision.appleFallback(
+                            sourceIdentity: sourceIdentity,
+                            reason: reason
+                        )
+                    )
                 }
             }
+            let completions = Array(state.graphCompletionWaiters.values)
+            state.graphCompletionWaiters.removeAll()
+            return (decisions, completions)
         }
-        resume(resumptions)
+        resume(transition.decisions)
+        for continuation in transition.completions {
+            continuation.resume(throwing: StubError.error(
+                "Swift dependency graph admission aborted: \(reason)."
+            ))
+        }
     }
 
     package func snapshot() -> Snapshot {
@@ -567,6 +833,48 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
                     continuation,
                     .appleFallback(sourceIdentity: sourceIdentity, reason: reason)
                 ))
+                return
+            }
+            if let graphAdmission = state.graphAdmissionManifest,
+               let expectedEntries = state.preflightExpectedEntries {
+                guard expectedSources.contains(sourceIdentity),
+                      let entry = expectedEntries[sourceIdentity] else {
+                    state.abortedReason = "unknown_source"
+                    resumptions.append((
+                        continuation,
+                        .appleFallback(sourceIdentity: sourceIdentity, reason: "unknown_source")
+                    ))
+                    return
+                }
+                if graphAdmission.affectedSources.contains(sourceIdentity) {
+                    guard !state.dispatchedSources.contains(sourceIdentity),
+                          state.actualExecutionCounts[sourceIdentity] == nil else {
+                        state.abortedReason = "duplicate_source"
+                        resumptions.append((
+                            continuation,
+                            .appleFallback(
+                                sourceIdentity: sourceIdentity,
+                                reason: "duplicate_source"
+                            )
+                        ))
+                        return
+                    }
+                    state.dispatchedSources.insert(sourceIdentity)
+                    resumptions.append((
+                        continuation,
+                        configuration.changedSourceIdentities.contains(sourceIdentity)
+                            ? .executeChanged(sourceIdentity: sourceIdentity)
+                            : .executeAffected(sourceIdentity: sourceIdentity)
+                    ))
+                } else {
+                    resumptions.append((
+                        continuation,
+                        .replayReusable(
+                            sourceIdentity: sourceIdentity,
+                            dependencyFingerprintDigests: entry.dependencyFingerprintDigests
+                        )
+                    ))
+                }
                 return
             }
             if let expectedEntries = state.preflightExpectedEntries,
