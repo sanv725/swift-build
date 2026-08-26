@@ -1310,6 +1310,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             }
 
             var cas: SwiftCASDatabases?
+            var dependencyCompatiblePlanExecution = false
             #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
             let jobCASPrimaryInputDigests = try? SwiftJobCASIdentity.primaryInputDigests(
                 commandLine: options.commandLine,
@@ -1332,7 +1333,6 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             )
             var dependencyRuntimeCoordinator: SwiftDependencyRuntimeCoordinator?
             var dependencyAdmissionDecision: SwiftDependencyAdmissionDecision?
-            var dependencyCompatiblePlanExecution = false
             if case .targetCompile = identifier,
                let dependencyShadowConfigurationPath,
                let dependencyPrimaryPath,
