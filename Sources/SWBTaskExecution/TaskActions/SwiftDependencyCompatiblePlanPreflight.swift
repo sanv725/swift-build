@@ -55,6 +55,23 @@ package enum SwiftDependencyCompatiblePlanPreflight {
         package let changedProjectionDurationNS: UInt64
         package let dependencyOnlyExecutions: [Execution]
         package let dependencyOnlyProjectionParity: Bool?
+        package let dependencyOnlyProjectionComparison: ProjectionComparison?
+    }
+
+    package struct ProjectionComparison: Sendable, Equatable {
+        package let compilerVersion: Bool
+        package let sourceFileInterfaceFingerprint: Bool
+        package let providedInterfaces: Bool
+        package let dependedInterfaces: Bool
+        package let dependencyOnlyProvidedCount: Int
+        package let fullProvidedCount: Int
+        package let dependencyOnlyDependedCount: Int
+        package let fullDependedCount: Int
+
+        package var exact: Bool {
+            compilerVersion && sourceFileInterfaceFingerprint
+                && providedInterfaces && dependedInterfaces
+        }
     }
 
     package static func run(
@@ -154,17 +171,56 @@ package enum SwiftDependencyCompatiblePlanPreflight {
                 "Swift dependency compatible plan did not produce every changed-source projection."
             )
         }
+        let projectionComparisons = changedProjections.compactMap { source, full
+            -> ProjectionComparison? in
+            guard let dependencyOnly = dependencyOnlyProjections[source] else {
+                return nil
+            }
+            return .init(
+                compilerVersion: dependencyOnly.compilerVersion == full.compilerVersion,
+                sourceFileInterfaceFingerprint:
+                    dependencyOnly.sourceFileInterfaceFingerprint
+                        == full.sourceFileInterfaceFingerprint,
+                providedInterfaces:
+                    dependencyOnly.providedInterfaces == full.providedInterfaces,
+                dependedInterfaces:
+                    dependencyOnly.dependedInterfaces == full.dependedInterfaces,
+                dependencyOnlyProvidedCount: dependencyOnly.providedInterfaces.count,
+                fullProvidedCount: full.providedInterfaces.count,
+                dependencyOnlyDependedCount: dependencyOnly.dependedInterfaces.count,
+                fullDependedCount: full.dependedInterfaces.count
+            )
+        }
+        let projectionComparison = projectionComparisons.isEmpty
+            ? nil
+            : ProjectionComparison(
+                compilerVersion: projectionComparisons.allSatisfy(\.compilerVersion),
+                sourceFileInterfaceFingerprint: projectionComparisons.allSatisfy(
+                    \.sourceFileInterfaceFingerprint
+                ),
+                providedInterfaces: projectionComparisons.allSatisfy(\.providedInterfaces),
+                dependedInterfaces: projectionComparisons.allSatisfy(\.dependedInterfaces),
+                dependencyOnlyProvidedCount: projectionComparisons.reduce(0) {
+                    $0 + $1.dependencyOnlyProvidedCount
+                },
+                fullProvidedCount: projectionComparisons.reduce(0) {
+                    $0 + $1.fullProvidedCount
+                },
+                dependencyOnlyDependedCount: projectionComparisons.reduce(0) {
+                    $0 + $1.dependencyOnlyDependedCount
+                },
+                fullDependedCount: projectionComparisons.reduce(0) {
+                    $0 + $1.fullDependedCount
+                }
+            )
         return .init(
             fixedPoint: try scheduler.result(),
             executions: executions,
             priorGraphClosure: priorGraphClosure,
             changedProjectionDurationNS: changedProjectionDurationNS,
             dependencyOnlyExecutions: dependencyOnlyExecutions,
-            dependencyOnlyProjectionParity: dependencyOnlyProjections.isEmpty
-                ? nil
-                : changedProjections.allSatisfy {
-                    dependencyOnlyProjections[$0.key] == $0.value
-                }
+            dependencyOnlyProjectionParity: projectionComparison?.exact,
+            dependencyOnlyProjectionComparison: projectionComparison
         )
     }
 

@@ -530,9 +530,11 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                             outputDelegate.note(
                                 "SWIFT_DRIVER_PLAN_GRAPH_CLOSURE outcome=observed affected=\(graphAffected.count) reusable=\(preflight.priorGraphClosure.invalidationCone.reusableSources.count) changed_keys=\(preflight.priorGraphClosure.changedProviderKeys.count) false_negative=\(falseNegativeCount) overadmitted=\(overadmittedCount) projection_compiler_ns=\(preflight.changedProjectionDurationNS)"
                             )
-                            outputDelegate.note(
-                                "SWIFT_DRIVER_DEPENDENCY_ONLY_PROJECTION outcome=observed parity=\(preflight.dependencyOnlyProjectionParity == true ? "exact" : "mismatch") executions=\(preflight.dependencyOnlyExecutions.count) compiler_ns=\(preflight.dependencyOnlyExecutions.reduce(0) { $0 + $1.durationNS })"
-                            )
+                            if let comparison = preflight.dependencyOnlyProjectionComparison {
+                                outputDelegate.note(
+                                    "SWIFT_DRIVER_DEPENDENCY_ONLY_PROJECTION outcome=observed parity=\(comparison.exact ? "exact" : "mismatch") executions=\(preflight.dependencyOnlyExecutions.count) compiler_ns=\(preflight.dependencyOnlyExecutions.reduce(0) { $0 + $1.durationNS }) compiler_equal=\(comparison.compilerVersion ? 1 : 0) fingerprint_equal=\(comparison.sourceFileInterfaceFingerprint ? 1 : 0) provided_equal=\(comparison.providedInterfaces ? 1 : 0) depended_equal=\(comparison.dependedInterfaces ? 1 : 0) dependency_only_provided=\(comparison.dependencyOnlyProvidedCount) full_provided=\(comparison.fullProvidedCount) dependency_only_depended=\(comparison.dependencyOnlyDependedCount) full_depended=\(comparison.fullDependedCount)"
+                                )
+                            }
                             outputDelegate.note(
                                 "SWIFT_DRIVER_PLAN_PREFLIGHT outcome=admitted candidate_key=\(candidateKey) affected=\(preflight.fixedPoint.invalidationCone.affectedSources.count) reusable=\(preflight.fixedPoint.invalidationCone.reusableSources.count) compiled=\(preflight.executions.count) compiler_ns=\(preflightCompileDurationNS)"
                             )
