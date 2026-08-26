@@ -66,6 +66,14 @@ package struct SwiftDependencyShadowConfiguration: Codable, Sendable, Equatable 
     package let recordSourceIdentities: [String]?
     package let preclassifiedBodyEdit: Bool?
     package let preclassifiedBodyEditProof: SwiftDependencyBodyEditProof?
+    /// Complete compiler-derived dependency state produced before llbuild
+    /// admits frontend tasks. Missing in all v1 configurations that predate
+    /// compatible-plan preflight.
+    package let preflightManifestPath: String?
+    /// Immutable exact-plan action selected by the wrapper from the coherent
+    /// prior source/product state. Used only when preflightManifestPath is set.
+    package let compatiblePlanCandidateKey: String?
+    package let compatiblePlanInputIdentity: String?
 
     package init(
         previousManifestPath: String,
@@ -85,6 +93,9 @@ package struct SwiftDependencyShadowConfiguration: Codable, Sendable, Equatable 
         self.recordSourceIdentities = nil
         self.preclassifiedBodyEdit = nil
         self.preclassifiedBodyEditProof = nil
+        self.preflightManifestPath = nil
+        self.compatiblePlanCandidateKey = nil
+        self.compatiblePlanInputIdentity = nil
     }
 
     package init(
@@ -108,6 +119,9 @@ package struct SwiftDependencyShadowConfiguration: Codable, Sendable, Equatable 
         self.recordSourceIdentities = sourceIdentities.sorted()
         self.preclassifiedBodyEdit = nil
         self.preclassifiedBodyEditProof = nil
+        self.preflightManifestPath = nil
+        self.compatiblePlanCandidateKey = nil
+        self.compatiblePlanInputIdentity = nil
     }
 
     package init(
@@ -116,7 +130,10 @@ package struct SwiftDependencyShadowConfiguration: Codable, Sendable, Equatable 
         changedSourceIdentity: String,
         pathMappings: [SwiftDependencyPathMapping],
         preclassifiedBodyEdit: Bool = false,
-        preclassifiedBodyEditProof: SwiftDependencyBodyEditProof? = nil
+        preclassifiedBodyEditProof: SwiftDependencyBodyEditProof? = nil,
+        preflightManifestPath: String? = nil,
+        compatiblePlanCandidateKey: String? = nil,
+        compatiblePlanInputIdentity: String? = nil
     ) {
         self.schema = Self.schema
         self.mode = .admit
@@ -130,6 +147,9 @@ package struct SwiftDependencyShadowConfiguration: Codable, Sendable, Equatable 
         self.recordSourceIdentities = nil
         self.preclassifiedBodyEdit = preclassifiedBodyEdit ? true : nil
         self.preclassifiedBodyEditProof = preclassifiedBodyEditProof
+        self.preflightManifestPath = preflightManifestPath
+        self.compatiblePlanCandidateKey = compatiblePlanCandidateKey
+        self.compatiblePlanInputIdentity = compatiblePlanInputIdentity
     }
 
     package static func path(environment: [String: String]) throws -> Path? {

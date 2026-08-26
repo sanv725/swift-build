@@ -54,6 +54,45 @@ public struct SwiftDependencyInvalidationScheduler: Sendable {
         self.pendingSources = changedSourceIdentities
     }
 
+    /// Validates the complete dependency state produced by a compatible-plan
+    /// preflight and turns it into the fixed-point result consumed before
+    /// frontend task admission. The current manifest must preserve every
+    /// content-independent identity; only compiler dependency/API state may
+    /// differ.
+    public static func precomputedResult(
+        previousManifest: SwiftDependencyModuleManifest,
+        currentManifest: SwiftDependencyModuleManifest,
+        changedSourceIdentities: Set<String>
+    ) throws -> SwiftDependencyFixedPointResult {
+        guard previousManifest.schema == SwiftDependencyModuleManifest.schema,
+              currentManifest.schema == SwiftDependencyModuleManifest.schema,
+              previousManifest.moduleName == currentManifest.moduleName,
+              previousManifest.toolchainIdentity == currentManifest.toolchainIdentity,
+              previousManifest.pathPolicyIdentity == currentManifest.pathPolicyIdentity,
+              previousManifest.compilerVersion == currentManifest.compilerVersion,
+              previousManifest.structureIdentity == currentManifest.structureIdentity,
+              previousManifest.sources.map(\.sourceIdentity)
+                == currentManifest.sources.map(\.sourceIdentity),
+              !changedSourceIdentities.isEmpty,
+              let invalidationCone = SwiftDependencyInvalidationCone.compare(
+                previous: previousManifest,
+                current: currentManifest,
+                changedSourceIdentities: changedSourceIdentities
+              ) else {
+            throw StubError.error(
+                "Swift dependency preflight requires complete structure-compatible manifests."
+            )
+        }
+        let compilationCounts = Dictionary(
+            uniqueKeysWithValues: invalidationCone.affectedSources.map { ($0, 1) }
+        )
+        return .init(
+            manifest: currentManifest,
+            invalidationCone: invalidationCone,
+            compilationCounts: compilationCounts
+        )
+    }
+
     public var nextSourceIdentity: String? {
         pendingSources.min()
     }

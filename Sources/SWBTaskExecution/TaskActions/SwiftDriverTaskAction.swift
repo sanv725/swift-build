@@ -153,9 +153,10 @@ private struct SwiftDriverPlanCacheConfiguration {
         try fileManager.moveItem(atPath: temporary.str, toPath: casSnapshotPath.str)
     }
 
-    func restoreCASSnapshot(to destination: Path) throws {
+    func restoreCASSnapshot(to destination: Path, actionKey: String? = nil) throws {
         let fileManager = FileManager.default
-        guard fileManager.fileExists(atPath: casSnapshotPath.str) else {
+        let source = casSnapshotPath(for: actionKey ?? key)
+        guard fileManager.fileExists(atPath: source.str) else {
             throw StubError.error("Cached Swift Driver planning CAS snapshot is missing.")
         }
         try fileManager.createDirectory(
@@ -168,7 +169,7 @@ private struct SwiftDriverPlanCacheConfiguration {
             try? fileManager.removeItem(atPath: temporary.str)
             try? fileManager.removeItem(atPath: backup.str)
         }
-        try fileManager.copyItem(atPath: casSnapshotPath.str, toPath: temporary.str)
+        try fileManager.copyItem(atPath: source.str, toPath: temporary.str)
         let hadDestination = fileManager.fileExists(atPath: destination.str)
         if hadDestination {
             try fileManager.moveItem(atPath: destination.str, toPath: backup.str)
@@ -314,6 +315,12 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
             } else {
                 environment = task.environment.bindingsDictionary
             }
+            #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+            let experimentControlEnvironment = ProcessInfo.processInfo.environment.merging(
+                environment,
+                uniquingKeysWith: { _, taskValue in taskValue }
+            )
+            #endif
 
             let commandLine = task.commandLineAsStrings.split(separator: "--", maxSplits: 1, omittingEmptySubsequences: false)[1]
             var plannedFromCache = false
@@ -333,14 +340,49 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
             var dependencyObservationLookupIdentity = "none"
             var dependencyObservationCandidateKey = "none"
             var dependencyObservationCandidateBinding: SwiftDependencyPlanBinding?
+            var dependencyPreflightConfiguration: SwiftDependencyShadowConfiguration?
             #endif
             do {
+                #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+                planCacheConfiguration = try SwiftDriverPlanCacheConfiguration(
+                    environment: experimentControlEnvironment
+                )
+                #else
                 planCacheConfiguration = try SwiftDriverPlanCacheConfiguration(environment: environment)
+                #endif
             } catch {
                 planCacheOutcome = "invalid_configuration"
                 outputDelegate.note("SWIFT_DRIVER_PLAN_CACHE outcome=invalid_configuration fallback=apple error=\(error.localizedDescription)")
             }
             #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+            do {
+                if let configurationPath = try SwiftDependencyShadowConfiguration.path(
+                    environment: experimentControlEnvironment
+                ) {
+                    let bytes = try executionDelegate.fs.read(configurationPath)
+                    let configuration = try JSONDecoder().decode(
+                        SwiftDependencyShadowConfiguration.self,
+                        from: Data(bytes.bytes)
+                    )
+                    if configuration.mode == .admit,
+                       configuration.preflightManifestPath != nil {
+                        dependencyPreflightConfiguration = configuration
+                        let manifestBytes = try executionDelegate.fs.read(
+                            Path(configuration.previousManifestPath)
+                        )
+                        dependencyObservationManifest = try JSONDecoder().decode(
+                            SwiftDependencyModuleManifest.self,
+                            from: Data(manifestBytes.bytes)
+                        )
+                        dependencyObservationOutcome = "preflight_ready"
+                    }
+                }
+            } catch {
+                dependencyObservationOutcome = "preflight_invalid_configuration"
+                outputDelegate.note(
+                    "SWIFT_DRIVER_PLAN_COMPATIBILITY outcome=preflight_invalid_configuration fallback=apple error=\(error.localizedDescription)"
+                )
+            }
             if let observation = planCacheConfiguration?.dependencyObservation {
                 do {
                     let manifestBytes = try executionDelegate.fs.read(observation.manifestPath)
@@ -390,7 +432,92 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                 } else {
                     planCacheOutcome = "miss"
                     #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
-                    if let observation = planCacheConfiguration.dependencyObservation,
+                    if let preflightConfiguration = dependencyPreflightConfiguration,
+                       let manifest = dependencyObservationManifest {
+                        do {
+                            guard let candidateKey = preflightConfiguration
+                                    .compatiblePlanCandidateKey,
+                                  let planInputIdentity = preflightConfiguration
+                                    .compatiblePlanInputIdentity,
+                                  candidateKey.count == 64,
+                                  candidateKey.allSatisfy({
+                                    $0.isHexDigit && !$0.isUppercase
+                                  }),
+                                  planInputIdentity.count == 64,
+                                  planInputIdentity.allSatisfy({
+                                    $0.isHexDigit && !$0.isUppercase
+                                  }),
+                                  executionDelegate.fs.exists(
+                                    planCacheConfiguration.actionPath(for: candidateKey)
+                                  ),
+                                  executionDelegate.fs.exists(
+                                    planCacheConfiguration.casSnapshotPath(for: candidateKey)
+                                  ),
+                                  let casOptions = driverPayload.casOptions else {
+                                throw StubError.error(
+                                    "Compatible Swift Driver preflight candidate is incomplete."
+                                )
+                            }
+                            try planCacheConfiguration.restoreCASSnapshot(
+                                to: casOptions.casPath,
+                                actionKey: candidateKey
+                            )
+                            let bytes = try executionDelegate.fs.read(
+                                planCacheConfiguration.actionPath(for: candidateKey)
+                            )
+                            let snapshot: SwiftDriverPlanCacheSnapshot = try
+                                MsgPackDeserializer.deserialize(bytes)
+                            let binding = try SwiftDependencyPlanBinding(
+                                moduleManifest: manifest,
+                                planInputIdentity: planInputIdentity,
+                                jobs: dependencyPlanJobs(from: snapshot)
+                            )
+                            guard case .compatible = binding.observe(
+                                currentManifest: manifest,
+                                currentPlanInputIdentity: planInputIdentity
+                            ) else {
+                                throw StubError.error(
+                                    "Compatible Swift Driver preflight topology failed validation."
+                                )
+                            }
+                            let preflight = try SwiftDependencyCompatiblePlanPreflight.runLive(
+                                snapshot: snapshot,
+                                configuration: preflightConfiguration,
+                                environment: environment,
+                                fs: executionDelegate.fs
+                            )
+                            try dependencyGraph.installCachedPlan(
+                                key: driverPayload.uniqueID,
+                                compilerLocation: driverPayload.compilerLocation,
+                                target: target,
+                                args: Array(commandLine),
+                                workingDirectory: task.workingDirectory,
+                                tempDirPath: driverPayload.tempDirPath,
+                                explicitModulesTempDirPath: driverPayload.explicitModulesTempDirPath,
+                                environment: environment,
+                                eagerCompilationEnabled: driverPayload.eagerCompilationEnabled,
+                                casOptions: driverPayload.casOptions,
+                                snapshot: snapshot
+                            )
+                            plannedFromCache = true
+                            planCacheBytes = bytes.count
+                            planCacheOutcome = "compatible_hit"
+                            dependencyObservationLookupIdentity = binding.lookupIdentity
+                            dependencyObservationCandidateKey = candidateKey
+                            dependencyObservationCandidateBinding = binding
+                            dependencyObservationOutcome = "compatible_preflight"
+                            outputDelegate.note(
+                                "SWIFT_DRIVER_PLAN_PREFLIGHT outcome=admitted candidate_key=\(candidateKey) affected=\(preflight.fixedPoint.invalidationCone.affectedSources.count) reusable=\(preflight.fixedPoint.invalidationCone.reusableSources.count) compiled=\(preflight.executions.count)"
+                            )
+                        } catch {
+                            dependencyObservationOutcome = "preflight_failed"
+                            outputDelegate.note(
+                                "SWIFT_DRIVER_PLAN_PREFLIGHT outcome=failed fallback=apple error=\(error.localizedDescription)"
+                            )
+                        }
+                    }
+                    if !plannedFromCache,
+                       let observation = planCacheConfiguration.dependencyObservation,
                        let manifest = dependencyObservationManifest {
                         do {
                             let lookupIdentity = try SwiftDependencyPlanBinding.lookupIdentity(
@@ -584,9 +711,10 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                     "SWIFT_DRIVER_PLAN_CACHE outcome=\(planCacheOutcome) key=\(planCacheConfiguration?.key ?? "none") bytes=\(planCacheBytes) direct_plan_bytes=\(directPlanBytes) duration_ns=\(planCacheTimer.elapsedTime().nanoseconds) read_ns=\(planCacheReadDurationNS) apple_plan_ns=\(planCachePlanDurationNS) write_ns=\(planCacheWriteDurationNS)"
                 )
                 #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
-                if planCacheConfiguration?.dependencyObservation != nil {
+                if planCacheConfiguration?.dependencyObservation != nil
+                    || dependencyPreflightConfiguration != nil {
                     outputDelegate.note(
-                        "SWIFT_DRIVER_PLAN_COMPATIBILITY outcome=\(dependencyObservationOutcome) lookup=\(dependencyObservationLookupIdentity) candidate_key=\(dependencyObservationCandidateKey) candidate_replay=disabled planning=\(plannedFromCache ? "exact_cache" : "apple")"
+                        "SWIFT_DRIVER_PLAN_COMPATIBILITY outcome=\(dependencyObservationOutcome) lookup=\(dependencyObservationLookupIdentity) candidate_key=\(dependencyObservationCandidateKey) candidate_replay=\(dependencyObservationOutcome == "compatible_preflight" ? "enabled" : "disabled") planning=\(plannedFromCache ? "cache" : "apple")"
                     )
                 }
                 #endif

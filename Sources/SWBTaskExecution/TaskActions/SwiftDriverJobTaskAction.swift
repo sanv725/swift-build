@@ -1064,6 +1064,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         guard let options = Options(task.commandLineAsStrings, outputDelegate) else {
             return .failed
         }
+        var compilerCommandLine = options.commandLine
 
         func emitCommandLine() {
             let commandString = defaultCommandSequenceEncoder(hostOS: executionDelegate.hostOperatingSystem).encode(options.commandLine)
@@ -1331,6 +1332,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             )
             var dependencyRuntimeCoordinator: SwiftDependencyRuntimeCoordinator?
             var dependencyAdmissionDecision: SwiftDependencyAdmissionDecision?
+            var dependencyCompatiblePlanExecution = false
             if case .targetCompile = identifier,
                let dependencyShadowConfigurationPath,
                let dependencyPrimaryPath,
@@ -1358,6 +1360,28 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                                 moduleName: driverJob.driverJob.moduleName,
                                 primaryPath: dependencyPrimaryPath
                             )
+                        switch dependencyAdmissionDecision {
+                        case .executeChanged(let sourceIdentity)?,
+                             .executeAffected(let sourceIdentity)?
+                            where admissionCoordinator.usesPrecomputedInvalidation:
+                            guard let overlayPath = admissionCoordinator
+                                    .compatiblePlanOverlayPath else {
+                                admissionCoordinator.abort(reason: "missing_preflight_overlay")
+                                outputDelegate.emitError(
+                                    "Swift dependency compatible-plan overlay is missing."
+                                )
+                                return .failed
+                            }
+                            compilerCommandLine = try SwiftDependencyCompatiblePlanPreflight
+                                .patchedCommandLine(
+                                    options.commandLine,
+                                    sourceIdentity: sourceIdentity,
+                                    overlayPath: overlayPath
+                                )
+                            dependencyCompatiblePlanExecution = true
+                        default:
+                            break
+                        }
                         if case .appleFallback(_, let reason) = dependencyAdmissionDecision,
                            reason == "cancelled",
                            isCancellationRequested() {
@@ -1369,6 +1393,39 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                         "SWIFT_DEPENDENCY_ADMISSION outcome=invalid_configuration fallback=apple error=\(error.localizedDescription)"
                     )
                 }
+            }
+            if case .targetCompile = identifier,
+               dependencyRuntimeCoordinator == nil,
+               let dependencyShadowConfigurationPath {
+                do {
+                    dependencyRuntimeCoordinator = try dynamicExecutionDelegate
+                        .operationContext.swiftDependencyRuntimeCoordinator(
+                            configurationPath: dependencyShadowConfigurationPath,
+                            fs: executionDelegate.fs
+                        )
+                } catch {
+                    outputDelegate.note(
+                        "SWIFT_DEPENDENCY_ADMISSION outcome=invalid_configuration fallback=apple error=\(error.localizedDescription)"
+                    )
+                }
+            }
+            if case .admission(let admissionCoordinator) = dependencyRuntimeCoordinator,
+               admissionCoordinator.usesPrecomputedInvalidation,
+               dependencyPrimaryPath == nil,
+               options.commandLine.contains("-cache-compile-job") {
+                guard let overlayPath = admissionCoordinator.compatiblePlanOverlayPath else {
+                    admissionCoordinator.abort(reason: "missing_preflight_overlay")
+                    outputDelegate.emitError(
+                        "Swift dependency compatible-plan overlay is missing."
+                    )
+                    return .failed
+                }
+                compilerCommandLine = try SwiftDependencyCompatiblePlanPreflight
+                    .patchedAuxiliaryCommandLine(
+                        options.commandLine,
+                        overlayPath: overlayPath
+                    )
+                dependencyCompatiblePlanExecution = true
             }
             func makeJobCASIdentity(
                 dependencyFingerprintDigests: [String]?
@@ -1497,7 +1554,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 }
             }
             #endif
-            if Self.usesStockCacheReplayPath(mode: acceleratorPolicy.mode) {
+            if Self.usesStockCacheReplayPath(mode: acceleratorPolicy.mode)
+                && !dependencyCompatiblePlanExecution {
                 // Keep the upstream cache creation, pruning, replay, counters, and
                 // diagnostics path unchanged when the accelerator is disabled.
                 if let casOpts = payload.casOptions {
@@ -1522,7 +1580,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                    let casOpts = payload.casOptions,
                    try await Self.replayCachedCommand(cas: db,
                                                       plannedJob: driverJob,
-                                                      commandLine: options.commandLine,
+                                                      commandLine: compilerCommandLine,
                                                       dynamicExecutionDelegate: dynamicExecutionDelegate,
                                                       outputDelegate: outputDelegate,
                                                       casOptions: casOpts,
@@ -1851,7 +1909,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
 
             let compilerTimer = ElapsedTimer()
             do {
-                try await spawn(commandLine: options.commandLine, environment: environment, workingDirectory: task.workingDirectory, dynamicExecutionDelegate: dynamicExecutionDelegate, clientDelegate: clientDelegate, processDelegate: delegate)
+                try await spawn(commandLine: compilerCommandLine, environment: environment, workingDirectory: task.workingDirectory, dynamicExecutionDelegate: dynamicExecutionDelegate, clientDelegate: clientDelegate, processDelegate: delegate)
                 compilerDurationNS = compilerTimer.elapsedTime().nanoseconds
             } catch {
                 compilerDurationNS = compilerTimer.elapsedTime().nanoseconds

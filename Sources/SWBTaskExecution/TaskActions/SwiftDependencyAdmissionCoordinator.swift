@@ -64,6 +64,7 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
     private struct State {
         var scheduler: SwiftDependencyInvalidationScheduler
         var preclassifiedChangedSource: String?
+        var preflightExpectedEntries: [String: SwiftDependencyModuleManifest.SourceEntry]?
         var dispatchedSources: Set<String> = []
         var waiters: [String: [Waiter]] = [:]
         var actualExecutionCounts: [String: Int] = [:]
@@ -101,9 +102,24 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
             SwiftDependencyModuleManifest.self,
             from: Data(manifestBytes.bytes)
         )
+        let preflightManifest: SwiftDependencyModuleManifest?
+        if let rawPreflightPath = configuration.preflightManifestPath {
+            let preflightPath = Path(rawPreflightPath)
+            guard preflightPath.isAbsolute else {
+                throw StubError.error("Swift dependency preflight manifest path must be absolute.")
+            }
+            let preflightBytes = try fs.read(preflightPath)
+            preflightManifest = try JSONDecoder().decode(
+                SwiftDependencyModuleManifest.self,
+                from: Data(preflightBytes.bytes)
+            )
+        } else {
+            preflightManifest = nil
+        }
         try self.init(
             configuration: configuration,
             previousManifest: manifest,
+            preflightManifest: preflightManifest,
             fs: fs
         )
     }
@@ -111,6 +127,7 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
     package init(
         configuration: SwiftDependencyShadowConfiguration,
         previousManifest: SwiftDependencyModuleManifest,
+        preflightManifest: SwiftDependencyModuleManifest? = nil,
         fs: any FSProxy
     ) throws {
         guard configuration.schema == SwiftDependencyShadowConfiguration.schema,
@@ -132,8 +149,33 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
             changedSourceIdentities: Set(configuration.changedSourceIdentities)
         )
         let preclassifiedChangedSource: String?
+        let preflightExpectedEntries: [String: SwiftDependencyModuleManifest.SourceEntry]?
         let fixedPointResult: SwiftDependencyFixedPointResult?
-        if let proof = configuration.preclassifiedBodyEditProof {
+        if let preflightManifest {
+            let candidateKey = configuration.compatiblePlanCandidateKey ?? ""
+            let planInputIdentity = configuration.compatiblePlanInputIdentity ?? ""
+            guard configuration.preclassifiedBodyEdit != true,
+                  configuration.preclassifiedBodyEditProof == nil,
+                  configuration.preflightManifestPath != nil,
+                  Self.isSHA256(candidateKey),
+                  Self.isSHA256(planInputIdentity) else {
+                throw StubError.error(
+                    "Swift dependency preflight cannot be combined with body-edit preclassification."
+                )
+            }
+            let result = try SwiftDependencyInvalidationScheduler.precomputedResult(
+                previousManifest: previousManifest,
+                currentManifest: preflightManifest,
+                changedSourceIdentities: Set(configuration.changedSourceIdentities)
+            )
+            preclassifiedChangedSource = nil
+            preflightExpectedEntries = Dictionary(
+                uniqueKeysWithValues: preflightManifest.sources.map {
+                    ($0.sourceIdentity, $0)
+                }
+            )
+            fixedPointResult = result
+        } else if let proof = configuration.preclassifiedBodyEditProof {
             let changedSource = configuration.changedSourceIdentities[0]
             try Self.validate(
                 proof: proof,
@@ -143,14 +185,17 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
             )
             try scheduler.preclassifyChangedSourceAsInterfaceStable(changedSource)
             preclassifiedChangedSource = changedSource
+            preflightExpectedEntries = nil
             fixedPointResult = try scheduler.result()
         } else if configuration.preclassifiedBodyEdit == true {
             let changedSource = configuration.changedSourceIdentities[0]
             try scheduler.preclassifyChangedSourceAsInterfaceStable(changedSource)
             preclassifiedChangedSource = changedSource
+            preflightExpectedEntries = nil
             fixedPointResult = try scheduler.result()
         } else {
             preclassifiedChangedSource = nil
+            preflightExpectedEntries = nil
             fixedPointResult = nil
         }
         self.configuration = configuration
@@ -161,8 +206,19 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
         self.state = SWBMutex(.init(
             scheduler: scheduler,
             preclassifiedChangedSource: preclassifiedChangedSource,
+            preflightExpectedEntries: preflightExpectedEntries,
             fixedPointResult: fixedPointResult
         ))
+    }
+
+    package var usesPrecomputedInvalidation: Bool {
+        state.withLock { $0.preflightExpectedEntries != nil }
+    }
+
+    package var compatiblePlanOverlayPath: Path? {
+        guard usesPrecomputedInvalidation,
+              let rawPath = configuration.preflightManifestPath else { return nil }
+        return Path(rawPath).dirname.join("prefix-map-vfsoverlay.json")
     }
 
     private static func validate(
@@ -171,13 +227,6 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
         pathMappings: [SwiftDependencyPathMapping],
         fs: any FSProxy
     ) throws {
-        func isSHA256(_ value: String) -> Bool {
-            value.utf8.count == 64 && value.utf8.allSatisfy {
-                ($0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9"))
-                    || ($0 >= UInt8(ascii: "a") && $0 <= UInt8(ascii: "f"))
-            }
-        }
-
         guard proof.schema == SwiftDependencyBodyEditProof.schema,
               proof.classifierVersion == SwiftDependencyBodyEditProof.classifierVersion,
               proof.sourceIdentity == changedSource,
@@ -205,6 +254,13 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
         hash.add(bytes: bytes)
         guard hash.signature.asString == proof.candidateSHA256 else {
             throw StubError.error("Swift dependency body-edit proof does not match the active source.")
+        }
+    }
+
+    private static func isSHA256(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy {
+            ($0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9"))
+                || ($0 >= UInt8(ascii: "a") && $0 <= UInt8(ascii: "f"))
         }
     }
 
@@ -255,6 +311,40 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
         let transition: CompletionTransition
         do {
             transition = try state.withLock { state in
+                if let expectedEntries = state.preflightExpectedEntries,
+                   let fixedPoint = state.fixedPointResult {
+                    guard state.dispatchedSources.remove(sourceIdentity) != nil,
+                          fixedPoint.invalidationCone.affectedSources.contains(sourceIdentity),
+                          let expectedEntry = expectedEntries[sourceIdentity],
+                          expectedEntry.projection == projection else {
+                        throw StubError.error(
+                            "Swift dependency preflight projection did not match the admitted frontend."
+                        )
+                    }
+                    state.actualExecutionCounts[sourceIdentity, default: 0] += 1
+                    let affected = Set(fixedPoint.invalidationCone.affectedSources)
+                    let completed = affected.intersection(state.actualExecutionCounts.keys).count
+                    let pending = affected.count - completed
+                    return .init(
+                        completion: .init(
+                            outcome: pending == 0 ? "admitted" : "progress",
+                            sourceIdentity: sourceIdentity,
+                            dependencyFingerprintDigests: expectedEntry
+                                .dependencyFingerprintDigests,
+                            predictedCount: affected.count,
+                            actualCount: completed,
+                            pendingCount: pending
+                        ),
+                        resumptions: [],
+                        result: pending == 0
+                            ? makeResult(
+                                outcome: "admitted",
+                                fixedPoint: fixedPoint,
+                                actualExecutionCounts: state.actualExecutionCounts
+                            )
+                            : nil
+                    )
+                }
                 if state.preclassifiedChangedSource == sourceIdentity {
                     guard state.dispatchedSources.remove(sourceIdentity) != nil else {
                         throw StubError.error(
@@ -421,7 +511,9 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
                 state.replayFallbackSources.insert(sourceIdentity)
             }
             guard state.replayCompletedSources.count
-                    == fixedPoint.invalidationCone.reusableSources.count else {
+                    == fixedPoint.invalidationCone.reusableSources.count,
+                  Set(fixedPoint.invalidationCone.affectedSources)
+                    .isSubset(of: state.actualExecutionCounts.keys) else {
                 return nil
             }
             return makeResult(
@@ -475,6 +567,48 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
                     continuation,
                     .appleFallback(sourceIdentity: sourceIdentity, reason: reason)
                 ))
+                return
+            }
+            if let expectedEntries = state.preflightExpectedEntries,
+               let fixedPoint = state.fixedPointResult {
+                guard expectedSources.contains(sourceIdentity),
+                      let entry = expectedEntries[sourceIdentity] else {
+                    state.abortedReason = "unknown_source"
+                    resumptions.append((
+                        continuation,
+                        .appleFallback(sourceIdentity: sourceIdentity, reason: "unknown_source")
+                    ))
+                    return
+                }
+                if fixedPoint.invalidationCone.affectedSources.contains(sourceIdentity) {
+                    guard !state.dispatchedSources.contains(sourceIdentity),
+                          state.actualExecutionCounts[sourceIdentity] == nil else {
+                        state.abortedReason = "duplicate_source"
+                        resumptions.append((
+                            continuation,
+                            .appleFallback(
+                                sourceIdentity: sourceIdentity,
+                                reason: "duplicate_source"
+                            )
+                        ))
+                        return
+                    }
+                    state.dispatchedSources.insert(sourceIdentity)
+                    resumptions.append((
+                        continuation,
+                        configuration.changedSourceIdentities.contains(sourceIdentity)
+                            ? .executeChanged(sourceIdentity: sourceIdentity)
+                            : .executeAffected(sourceIdentity: sourceIdentity)
+                    ))
+                } else {
+                    resumptions.append((
+                        continuation,
+                        .replayReusable(
+                            sourceIdentity: sourceIdentity,
+                            dependencyFingerprintDigests: entry.dependencyFingerprintDigests
+                        )
+                    ))
+                }
                 return
             }
             if state.preclassifiedChangedSource == sourceIdentity {

@@ -236,6 +236,81 @@ fileprivate struct SwiftDependencyAdmissionCoordinatorTests {
     }
 
     @Test
+    func precomputedAPIEditClassifiesTheTransitiveConeBeforeAnyTaskWaits() async throws {
+        let temporaryDirectory = try NamedTemporaryDirectory()
+        let configuration = SwiftDependencyShadowConfiguration(
+            admittingManifestAt: temporaryDirectory.path.join("baseline.json").str,
+            resultPath: temporaryDirectory.path.join("result.json").str,
+            changedSourceIdentity: provider,
+            pathMappings: [],
+            preflightManifestPath: temporaryDirectory.path.join("preflight.json").str,
+            compatiblePlanCandidateKey: String(repeating: "a", count: 64),
+            compatiblePlanInputIdentity: String(repeating: "b", count: 64)
+        )
+        let currentManifest = try SwiftDependencyModuleManifest(
+            moduleName: "AdmissionFixture",
+            toolchainIdentity: "toolchain-v1",
+            pathPolicyIdentity: "portable-v1",
+            expectedSourceIdentities: [provider, caller, unrelated],
+            projectionsBySource: [
+                provider: providerProjection(fingerprint: "provider-v2"),
+                caller: callerProjection(),
+                unrelated: unrelatedProjection(),
+            ]
+        )
+        let coordinator = try SwiftDependencyAdmissionCoordinator(
+            configuration: configuration,
+            previousManifest: baselineManifest(),
+            preflightManifest: currentManifest,
+            fs: localFS
+        )
+
+        #expect(coordinator.usesPrecomputedInvalidation)
+        let unrelatedDecision = await coordinator.admissionDecision(
+            moduleName: "AdmissionFixture",
+            primaryPath: Path(unrelated)
+        )
+        #expect(unrelatedDecision == .replayReusable(
+            sourceIdentity: unrelated,
+            dependencyFingerprintDigests: []
+        ))
+        let callerDecision = await coordinator.admissionDecision(
+            moduleName: "AdmissionFixture",
+            primaryPath: Path(caller)
+        )
+        #expect(callerDecision == .executeAffected(sourceIdentity: caller))
+        let providerDecision = await coordinator.admissionDecision(
+            moduleName: "AdmissionFixture",
+            primaryPath: Path(provider)
+        )
+        #expect(providerDecision == .executeChanged(sourceIdentity: provider))
+        #expect(coordinator.snapshot().waitingSources.isEmpty)
+
+        let callerCompletion = try coordinator.completeProjection(
+            callerProjection(),
+            sourceIdentity: caller
+        )
+        #expect(callerCompletion.outcome == "progress")
+        #expect(callerCompletion.pendingCount == 1)
+        let providerCompletion = try coordinator.completeProjection(
+            providerProjection(fingerprint: "provider-v2"),
+            sourceIdentity: provider
+        )
+        #expect(providerCompletion.outcome == "admitted")
+        #expect(providerCompletion.predictedCount == 2)
+        #expect(providerCompletion.actualCount == 2)
+        coordinator.recordReplayHit(sourceIdentity: unrelated)
+
+        let result = try readResult(temporaryDirectory: temporaryDirectory)
+        #expect(result.outcome == "admitted")
+        #expect(result.predictedAffectedSources == [caller, provider])
+        #expect(result.predictedReusableSources == [unrelated])
+        #expect(result.actualExecutedSources == [caller, provider])
+        #expect(result.missingActualExecutions.isEmpty)
+        #expect(result.extraActualExecutions.isEmpty)
+    }
+
+    @Test
     func abortReleasesEverySuspendedJobToAppleFallback() async throws {
         let temporaryDirectory = try NamedTemporaryDirectory()
         let coordinator = try makeCoordinator(temporaryDirectory: temporaryDirectory)
@@ -315,7 +390,7 @@ fileprivate struct SwiftDependencyAdmissionCoordinatorTests {
         _ coordinator: SwiftDependencyAdmissionCoordinator,
         expected: [String]
     ) async -> Bool {
-        for _ in 0..<1_000 {
+        for _ in 0..<10_000 {
             if coordinator.snapshot().waitingSources == expected.sorted() {
                 return true
             }

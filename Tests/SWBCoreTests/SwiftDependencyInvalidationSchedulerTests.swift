@@ -131,6 +131,47 @@ fileprivate struct SwiftDependencyInvalidationSchedulerTests {
         }
     }
 
+    @Test
+    func acceptsACompletePrecomputedTransitiveConeAndRejectsStructureDrift() throws {
+        let baseline = try manifest(
+            providerFingerprint: "provider-v1",
+            bridgeFingerprint: "bridge-v1",
+            callerFingerprint: "caller-v1"
+        )
+        let current = try manifest(
+            providerFingerprint: "provider-v2",
+            bridgeFingerprint: "bridge-v2",
+            callerFingerprint: "caller-v1"
+        )
+        let result = try SwiftDependencyInvalidationScheduler.precomputedResult(
+            previousManifest: baseline,
+            currentManifest: current,
+            changedSourceIdentities: [provider]
+        )
+        #expect(result.invalidationCone.affectedSources == [bridge, caller, provider].sorted())
+        #expect(result.invalidationCone.reusableSources == [unrelated])
+        #expect(result.compilationCounts == [provider: 1, bridge: 1, caller: 1])
+
+        let drifted = try SwiftDependencyModuleManifest(
+            moduleName: "TransitiveFixture",
+            toolchainIdentity: "toolchain-v1",
+            pathPolicyIdentity: "portable-v1",
+            expectedSourceIdentities: Array(sources.dropLast()),
+            projectionsBySource: [
+                provider: providerProjection(fingerprint: "provider-v2"),
+                bridge: bridgeProjection(fingerprint: "bridge-v2", providerName: "provider"),
+                caller: callerProjection(fingerprint: "caller-v1", bridgeName: "bridge"),
+            ]
+        )
+        #expect(throws: (any Error).self) {
+            try SwiftDependencyInvalidationScheduler.precomputedResult(
+                previousManifest: baseline,
+                currentManifest: drifted,
+                changedSourceIdentities: [provider]
+            )
+        }
+    }
+
     private var sources: [String] {
         [provider, bridge, caller, unrelated]
     }
