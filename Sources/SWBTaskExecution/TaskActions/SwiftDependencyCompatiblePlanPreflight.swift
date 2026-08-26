@@ -130,30 +130,6 @@ package enum SwiftDependencyCompatiblePlanPreflight {
             from: Data(previousBytes.bytes)
         )
 
-        let overlayPath = preflightManifestPath.dirname.join("prefix-map-vfsoverlay.json")
-        let overlay: [String: Any] = [
-            "version": 0,
-            "case-sensitive": "false",
-            "redirecting-with": "fallthrough",
-            "roots": configuration.pathMappings.map { mapping in
-                [
-                    "type": "directory-remap",
-                    "name": mapping.virtualPrefix,
-                    "external-contents": mapping.physicalPrefix,
-                ]
-            },
-        ]
-        let overlayBytes = try JSONSerialization.data(
-            withJSONObject: overlay,
-            options: [.sortedKeys]
-        )
-        try fs.createDirectory(overlayPath.dirname, recursive: true)
-        try fs.write(
-            overlayPath,
-            contents: ByteString(overlayBytes),
-            atomically: true
-        )
-
         let jobs = try snapshot.plannedBuild.plannedTargetJobs.compactMap { planned -> Job? in
             let commandLine = planned.driverJob.commandLine.map(\.asString)
             let primaries = values(after: "-primary-file", in: commandLine)
@@ -178,6 +154,57 @@ package enum SwiftDependencyCompatiblePlanPreflight {
                 workingDirectory: planned.workingDirectory
             )
         }
+
+        let overlayPath = preflightManifestPath.dirname.join("prefix-map-vfsoverlay.json")
+        var overlayMappings = Dictionary(
+            uniqueKeysWithValues: configuration.pathMappings.map {
+                ($0.virtualPrefix, $0.physicalPrefix)
+            }
+        )
+        for (virtualPrefix, environmentKey) in [
+            ("/^sdk", "SDKROOT"),
+            ("/^xcode", "DEVELOPER_DIR"),
+            ("/^src", "PROJECT_DIR"),
+            ("/^derived", "PROJECT_TEMP_DIR"),
+            ("/^built", "BUILT_PRODUCTS_DIR"),
+            ("/^workspace", "WORKSPACE_DIR"),
+        ] {
+            if let physicalPrefix = environment[environmentKey],
+               Path(physicalPrefix).isAbsolute {
+                overlayMappings[virtualPrefix] = physicalPrefix
+            }
+        }
+        if let executable = jobs.first?.commandLine.first {
+            let toolchainURL = URL(fileURLWithPath: executable)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+            if toolchainURL.path.hasSuffix(".xctoolchain") {
+                overlayMappings["/^toolchain"] = toolchainURL.path
+            }
+        }
+        let overlay: [String: Any] = [
+            "version": 0,
+            "case-sensitive": "false",
+            "redirecting-with": "fallthrough",
+            "roots": overlayMappings.keys.sorted().map { virtualPrefix in
+                [
+                    "type": "directory-remap",
+                    "name": virtualPrefix,
+                    "external-contents": overlayMappings[virtualPrefix]!,
+                ]
+            },
+        ]
+        let overlayBytes = try JSONSerialization.data(
+            withJSONObject: overlay,
+            options: [.sortedKeys]
+        )
+        try fs.createDirectory(overlayPath.dirname, recursive: true)
+        try fs.write(
+            overlayPath,
+            contents: ByteString(overlayBytes),
+            atomically: true
+        )
 
         var childEnvironment = environment
         SwiftJobCASConfiguration.removeControlVariables(from: &childEnvironment)
@@ -254,13 +281,30 @@ package enum SwiftDependencyCompatiblePlanPreflight {
         guard !plannedCommandLine.isEmpty, overlayPath.isAbsolute else {
             throw StubError.error("Swift dependency compatible-plan command is incomplete.")
         }
-        var commandLine = plannedCommandLine.filter { $0 != "-cache-compile-job" }
+        var commandLine: [String] = []
+        var index = 0
+        while index < plannedCommandLine.count {
+            let argument = plannedCommandLine[index]
+            if argument == "-cache-compile-job" {
+                index += 1
+                continue
+            }
+            if argument == "-vfsoverlay" {
+                guard plannedCommandLine.indices.contains(index + 1) else {
+                    throw StubError.error(
+                        "Swift dependency compatible-plan command has an incomplete VFS overlay."
+                    )
+                }
+                index += 2
+                continue
+            }
+            commandLine.append(argument)
+            index += 1
+        }
         if !commandLine.contains("-module-import-from-cas") {
             commandLine.append("-module-import-from-cas")
         }
-        if !commandLine.contains("-vfsoverlay") {
-            commandLine.append(contentsOf: ["-vfsoverlay", overlayPath.str])
-        }
+        commandLine.append(contentsOf: ["-vfsoverlay", overlayPath.str])
         return commandLine
     }
 

@@ -34,6 +34,7 @@ fileprivate struct SwiftDependencyCompatiblePlanPreflightTests {
             #expect(!commandLine.contains("-cache-compile-job"))
             #expect(commandLine.contains("-module-import-from-cas"))
             #expect(commandLine.suffix(2) == ["-vfsoverlay", overlay.str])
+            #expect(!commandLine.contains("/old/overlay.json"))
             switch job.sourceIdentity {
             case provider:
                 return providerProjection(fingerprint: "provider-v2")
@@ -97,6 +98,7 @@ fileprivate struct SwiftDependencyCompatiblePlanPreflightTests {
                 "-primary-file", source,
                 "-emit-reference-dependencies-path", source + ".swiftdeps",
                 "-cache-compile-job",
+                "-vfsoverlay", "/old/overlay.json",
             ],
             dependencyOutputPath: Path(source + ".swiftdeps")
         )
