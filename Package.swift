@@ -81,6 +81,7 @@ let package = Package(
     ],
     products: [
         .executable(name: "swbuild", targets: ["swbuild"]),
+        .executable(name: "swiftbuild-session", targets: ["swiftbuild-session"]),
         .executable(name: "SWBBuildServiceBundle", targets: ["SWBBuildServiceBundle"]),
         .library(name: "SwiftBuild", targets: ["SwiftBuild"]),
         .library(name: "SWBProtocol", targets: ["SWBProtocol"]),
@@ -97,6 +98,10 @@ let package = Package(
                 "SWBBuildServiceBundle", // the CLI needs to launch the service bundle
             ],
             exclude: ["CMakeLists.txt"],
+            swiftSettings: swiftSettings(languageMode: .v6)),
+        .executableTarget(
+            name: "swiftbuild-session",
+            dependencies: ["SwiftBuild"],
             swiftSettings: swiftSettings(languageMode: .v6)),
         .executableTarget(
             name: "SWBBuildServiceBundle",
