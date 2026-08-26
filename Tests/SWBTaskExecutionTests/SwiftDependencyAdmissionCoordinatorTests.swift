@@ -367,9 +367,10 @@ fileprivate struct SwiftDependencyAdmissionCoordinatorTests {
             sourceIdentity: caller
         )
         let completions = try await [providerCompletion, callerCompletion]
-        #expect(completions.allSatisfy { $0.outcome == "admitted" })
+        #expect(completions.map(\.outcome).sorted() == ["admitted", "progress"])
         #expect(completions.allSatisfy { $0.predictedCount == 2 })
-        #expect(completions.allSatisfy { $0.actualCount == 2 })
+        #expect(completions.map(\.actualCount).sorted() == [1, 2])
+        #expect(completions.map(\.pendingCount).sorted() == [0, 1])
 
         let bytes = try localFS.read(preflightPath)
         let finalManifest = try JSONDecoder().decode(

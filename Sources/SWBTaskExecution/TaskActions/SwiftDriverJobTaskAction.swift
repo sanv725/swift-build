@@ -2147,27 +2147,76 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                             do {
                                 let completion: SwiftDependencyAdmissionCoordinator.Completion
                                 if admissionCoordinator.usesGraphAdmission {
+                                    let publication: SwiftDependencyAdmissionCoordinator
+                                        .GraphPublication?
+                                    if let jobCASConfiguration,
+                                       jobCASConfiguration.mode.writes,
+                                       !cacheKeys.isEmpty,
+                                       !plannedOutputs.isEmpty,
+                                       let jobCASPrimaryInputDigests,
+                                       !Self.hasSharedObjectiveCHeaderOutput(
+                                           commandLine: options.commandLine,
+                                           plannedOutputs: plannedOutputs
+                                       ) {
+                                        publication = .init(
+                                            sourceIdentity: sourceIdentity,
+                                            toolchainIdentity: payload.compilerLocation
+                                                .compilerOrLibraryPath.str,
+                                            ruleInfoType: driverJob.driverJob.ruleInfoType,
+                                            moduleName: driverJob.driverJob.moduleName,
+                                            primaryInputDigests: jobCASPrimaryInputDigests,
+                                            producerCompilerCacheKeys: cacheKeys,
+                                            commandLine: options.commandLine,
+                                            outputPaths: plannedOutputs,
+                                            configuration: jobCASConfiguration
+                                        )
+                                    } else {
+                                        publication = nil
+                                    }
                                     completion = try await admissionCoordinator
                                         .completeGraphFrontend(
                                             sourceIdentity: sourceIdentity,
-                                            dependencyPath: dependencyOutputPath
+                                            dependencyPath: dependencyOutputPath,
+                                            publication: publication
                                         )
+                                    // The graph coordinator publishes all fresh
+                                    // actions, and restores every proven
+                                    // over-admission, after the last runnable
+                                    // frontend establishes one final manifest.
+                                    jobCASRecordIdentity = nil
+                                    for outcome in completion.graphPublicationOutcomes {
+                                        if outcome.outcome == "hit",
+                                           let timings = outcome.timings,
+                                           let jobCASConfiguration {
+                                            outputDelegate.note(
+                                                "SWIFT_JOB_CAS outcome=hit key=\(outcome.jobKey) outputs=\(outcome.outputCount) bytes=\(outcome.outputBytes) duration_ns=\(outcome.durationNS) verification=\(jobCASConfiguration.verification.rawValue) action_lookup_ns=\(timings.actionLookupDurationNS) action_read_ns=\(timings.actionReadDurationNS) action_validation_ns=\(timings.actionValidationDurationNS) blob_read_ns=\(timings.blobReadDurationNS) blob_verification_ns=\(timings.blobVerificationDurationNS) publication_ns=\(timings.outputPublicationDurationNS) phase=postcompile_overadmission"
+                                            )
+                                            outputDelegate.incrementCounter(.swiftCacheHits)
+                                            outputDelegate.incrementTaskCounter(.cacheHits)
+                                        } else {
+                                            outputDelegate.note(
+                                                "SWIFT_JOB_CAS outcome=recorded key=\(outcome.jobKey) outputs=\(outcome.outputCount) bytes=\(outcome.outputBytes) new_blobs=\(outcome.newBlobCount ?? 0) duration_ns=\(outcome.durationNS) phase=graph_publication"
+                                            )
+                                        }
+                                    }
                                 } else {
                                     completion = try admissionCoordinator.completeFrontend(
                                         sourceIdentity: sourceIdentity,
                                         dependencyPath: dependencyOutputPath
                                     )
                                 }
-                                let completedIdentity = makeJobCASIdentity(
-                                    dependencyFingerprintDigests: completion
-                                        .dependencyFingerprintDigests
-                                )
-                                if completion.replayPriorAction,
-                                   let completedIdentity,
-                                   restorePriorJobCAS(completedIdentity) {
-                                    jobCASRecordIdentity = nil
-                                } else {
-                                    jobCASRecordIdentity = completedIdentity
+                                if !admissionCoordinator.usesGraphAdmission {
+                                    let completedIdentity = makeJobCASIdentity(
+                                        dependencyFingerprintDigests: completion
+                                            .dependencyFingerprintDigests
+                                    )
+                                    if completion.replayPriorAction,
+                                       let completedIdentity,
+                                       restorePriorJobCAS(completedIdentity) {
+                                        jobCASRecordIdentity = nil
+                                    } else {
+                                        jobCASRecordIdentity = completedIdentity
+                                    }
                                 }
                                 outputDelegate.note(
                                     "SWIFT_DEPENDENCY_ADMISSION outcome=\(completion.outcome) source=\(sourceIdentity) predicted=\(completion.predictedCount) actual=\(completion.actualCount) pending=\(completion.pendingCount) planning=apple"
