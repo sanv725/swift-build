@@ -115,17 +115,49 @@ fileprivate struct SwiftDependencyCompatiblePlanPreflightTests {
             #expect(commandLine.contains("-typecheck"))
             #expect(commandLine.contains("-experimental-skip-all-function-bodies"))
             #expect(!commandLine.contains("-c"))
-            return providerProjection(fingerprint: "provider-v2")
+            return .compiled(providerProjection(fingerprint: "provider-v2"))
         }
 
         #expect(compiledSources == [provider])
         #expect(result.executions.map(\.sourceIdentity) == [provider])
+        #expect(result.projectionCacheEvents.isEmpty)
         #expect(result.closure.invalidationCone.affectedSources
             == [provider, bridge, caller].sorted())
         #expect(result.closure.invalidationCone.reusableSources == [unrelated])
         #expect(result.admissionManifest.schema
             == SwiftDependencyGraphAdmissionManifest.schema)
         #expect(result.admissionManifest.changedSources.map(\.sourceIdentity) == [provider])
+    }
+
+    @Test
+    func graphAdmissionAcceptsCachedProjectionWithoutCompilerExecution() throws {
+        let event = SwiftDependencyCompatiblePlanPreflight.ProjectionCacheEvent(
+            key: String(repeating: "a", count: 64),
+            outcome: "hit",
+            durationNS: 321,
+            bytes: 456
+        )
+        var resolutionCount = 0
+        let result = try SwiftDependencyCompatiblePlanPreflight.runGraph(
+            previousManifest: baselineManifest(),
+            changedSourceIdentities: [provider],
+            jobs: sources.map(job),
+            overlayPath: Path("/tmp/u02-graph-cache-prefix-map.json")
+        ) { _, _ in
+            resolutionCount += 1
+            return .cacheHit(
+                providerProjection(fingerprint: "provider-v2"),
+                event: event
+            )
+        }
+
+        #expect(resolutionCount == 1)
+        #expect(result.executions.isEmpty)
+        #expect(result.compilerDurationNS == 0)
+        #expect(result.projectionCacheEvents == [event])
+        #expect(result.closure.invalidationCone.affectedSources
+            == [provider, bridge, caller].sorted())
+        #expect(result.closure.invalidationCone.reusableSources == [unrelated])
     }
 
     @Test

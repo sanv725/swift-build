@@ -65,6 +65,58 @@ package enum SwiftDependencyCompatiblePlanPreflight {
         package let executions: [Execution]
         package let closure: SwiftDependencyPriorGraphClosureResult
         package let compilerDurationNS: UInt64
+        package let projectionCacheEvents: [ProjectionCacheEvent]
+    }
+
+    package struct ProjectionCacheEvent: Sendable, Equatable {
+        package let key: String
+        package let outcome: String
+        package let durationNS: UInt64
+        package let bytes: UInt64?
+
+        package init(
+            key: String,
+            outcome: String,
+            durationNS: UInt64,
+            bytes: UInt64?
+        ) {
+            self.key = key
+            self.outcome = outcome
+            self.durationNS = durationNS
+            self.bytes = bytes
+        }
+    }
+
+    package struct ProjectionResolution: Sendable, Equatable {
+        package let projection: SwiftDependencyFingerprintProjection
+        package let compilerExecuted: Bool
+        package let compilerDurationNS: UInt64
+        package let cacheEvent: ProjectionCacheEvent?
+
+        package static func compiled(
+            _ projection: SwiftDependencyFingerprintProjection,
+            durationNS: UInt64 = 0,
+            cacheEvent: ProjectionCacheEvent? = nil
+        ) -> Self {
+            .init(
+                projection: projection,
+                compilerExecuted: true,
+                compilerDurationNS: durationNS,
+                cacheEvent: cacheEvent
+            )
+        }
+
+        package static func cacheHit(
+            _ projection: SwiftDependencyFingerprintProjection,
+            event: ProjectionCacheEvent
+        ) -> Self {
+            .init(
+                projection: projection,
+                compilerExecuted: false,
+                compilerDurationNS: 0,
+                cacheEvent: event
+            )
+        }
     }
 
     package struct ProjectionComparison: Sendable, Equatable {
@@ -257,8 +309,8 @@ package enum SwiftDependencyCompatiblePlanPreflight {
         changedSourceIdentities: Set<String>,
         jobs: [Job],
         overlayPath: Path,
-        compileDependencyOnlyProjection: (Job, [String]) throws
-            -> SwiftDependencyFingerprintProjection
+        resolveDependencyOnlyProjection: (Job, [String]) throws
+            -> ProjectionResolution
     ) throws -> GraphResult {
         let expectedSources = previousManifest.sources.map(\.sourceIdentity)
         let jobsBySource = Dictionary(uniqueKeysWithValues: jobs.map {
@@ -277,6 +329,7 @@ package enum SwiftDependencyCompatiblePlanPreflight {
         var projections: [String: SwiftDependencyFingerprintProjection] = [:]
         var executions: [Execution] = []
         var compilerDurationNS: UInt64 = 0
+        var projectionCacheEvents: [ProjectionCacheEvent] = []
         for sourceIdentity in changedSourceIdentities.sorted() {
             guard let job = jobsBySource[sourceIdentity] else {
                 throw StubError.error(
@@ -293,17 +346,20 @@ package enum SwiftDependencyCompatiblePlanPreflight {
                 patched,
                 dependencyOutputPath: dependencyOutput
             )
-            let timer = ElapsedTimer()
-            let projection = try compileDependencyOnlyProjection(job, commandLine)
-            let durationNS = timer.elapsedTime().nanoseconds
-            projections[sourceIdentity] = projection
-            executions.append(.init(
-                sourceIdentity: sourceIdentity,
-                commandLine: commandLine,
-                dependencyOutputPath: dependencyOutput,
-                durationNS: durationNS
-            ))
-            compilerDurationNS += durationNS
+            let resolution = try resolveDependencyOnlyProjection(job, commandLine)
+            projections[sourceIdentity] = resolution.projection
+            if resolution.compilerExecuted {
+                executions.append(.init(
+                    sourceIdentity: sourceIdentity,
+                    commandLine: commandLine,
+                    dependencyOutputPath: dependencyOutput,
+                    durationNS: resolution.compilerDurationNS
+                ))
+            }
+            compilerDurationNS += resolution.compilerDurationNS
+            if let cacheEvent = resolution.cacheEvent {
+                projectionCacheEvents.append(cacheEvent)
+            }
         }
         let closure = try SwiftDependencyPriorGraphClosure.calculate(
             previousManifest: previousManifest,
@@ -317,7 +373,8 @@ package enum SwiftDependencyCompatiblePlanPreflight {
             ),
             executions: executions,
             closure: closure,
-            compilerDurationNS: compilerDurationNS
+            compilerDurationNS: compilerDurationNS,
+            projectionCacheEvents: projectionCacheEvents
         )
     }
 
@@ -378,6 +435,9 @@ package enum SwiftDependencyCompatiblePlanPreflight {
             fs: fs
         )
         let childEnvironment = compilerEnvironment(from: environment)
+        let projectionCacheConfiguration = SwiftDependencyProjectionCASConfiguration.parse(
+            environment: environment
+        )
         let result = try runGraph(
             previousManifest: previousManifest,
             changedSourceIdentities: Set(configuration.changedSourceIdentities),
@@ -385,7 +445,79 @@ package enum SwiftDependencyCompatiblePlanPreflight {
             overlayPath: overlayPath
         ) { job, commandLine in
             let dependencyOutputPath = try dependencyOutputPath(in: commandLine)
+            let identity: SwiftDependencyProjectionCASIdentity?
+            if projectionCacheConfiguration != nil {
+                guard let mapping = configuration.pathMappings.first(where: {
+                    job.sourceIdentity == $0.virtualPrefix
+                        || job.sourceIdentity.hasPrefix($0.virtualPrefix + "/")
+                }) else {
+                    throw StubError.error(
+                        "Swift dependency projection CAS cannot resolve the changed source."
+                    )
+                }
+                let sourcePath = Path(
+                    mapping.physicalPrefix
+                        + job.sourceIdentity.dropFirst(mapping.virtualPrefix.count)
+                )
+                let sourceDigest = SwiftDependencyProjectionCASIdentity.digest(
+                    bytes: try fs.read(sourcePath)
+                )
+                var replacements = configuration.pathMappings.map {
+                    (physical: $0.physicalPrefix, virtual: $0.virtualPrefix)
+                }
+                for (virtualPrefix, environmentKey) in [
+                    ("/^sdk", "SDKROOT"),
+                    ("/^xcode", "DEVELOPER_DIR"),
+                    ("/^src", "PROJECT_DIR"),
+                    ("/^derived", "PROJECT_TEMP_DIR"),
+                    ("/^built", "BUILT_PRODUCTS_DIR"),
+                    ("/^workspace", "WORKSPACE_DIR"),
+                ] {
+                    if let physical = environment[environmentKey], !physical.isEmpty {
+                        replacements.append((physical: physical, virtual: virtualPrefix))
+                        if physical.hasPrefix("/private/") {
+                            replacements.append((
+                                physical: String(physical.dropFirst("/private".count)),
+                                virtual: virtualPrefix
+                            ))
+                        }
+                    }
+                }
+                identity = .init(
+                    sourceIdentity: job.sourceIdentity,
+                    sourceDigest: sourceDigest,
+                    previousManifest: previousManifest,
+                    commandLine: commandLine,
+                    pathReplacements: replacements
+                )
+            } else {
+                identity = nil
+            }
+            if let projectionCacheConfiguration, let identity,
+               projectionCacheConfiguration.mode.reads {
+                let timer = ElapsedTimer()
+                let replay = SwiftDependencyProjectionCASStore(
+                    root: projectionCacheConfiguration.root
+                ).replay(identity: identity, fs: fs)
+                let durationNS = timer.elapsedTime().nanoseconds
+                switch replay {
+                case .hit(let projection, let bytes):
+                    return .cacheHit(
+                        projection,
+                        event: .init(
+                            key: identity.key,
+                            outcome: "hit",
+                            durationNS: durationNS,
+                            bytes: bytes
+                        )
+                    )
+                case .miss, .invalid:
+                    break
+                }
+            }
+
             try fs.createDirectory(dependencyOutputPath.dirname, recursive: true)
+            let compilerTimer = ElapsedTimer()
             try execute(
                 commandLine: commandLine,
                 workingDirectory: job.workingDirectory,
@@ -394,10 +526,46 @@ package enum SwiftDependencyCompatiblePlanPreflight {
                     "dependency-only-\(job.sourceIdentity.split(separator: "/").last ?? "unknown").log"
                 )
             )
-            return try SwiftDependencyFingerprintProjection.read(
+            let compilerDurationNS = compilerTimer.elapsedTime().nanoseconds
+            let projection = try SwiftDependencyFingerprintProjection.read(
                 from: dependencyOutputPath,
                 sourceIdentity: job.sourceIdentity,
                 pathMappings: configuration.pathMappings
+            )
+            var cacheEvent: ProjectionCacheEvent?
+            if let projectionCacheConfiguration, let identity,
+               projectionCacheConfiguration.mode.writes {
+                let timer = ElapsedTimer()
+                do {
+                    let recorded = try SwiftDependencyProjectionCASStore(
+                        root: projectionCacheConfiguration.root
+                    ).record(identity: identity, projection: projection, fs: fs)
+                    cacheEvent = .init(
+                        key: identity.key,
+                        outcome: recorded.actionCreated ? "recorded" : "present",
+                        durationNS: timer.elapsedTime().nanoseconds,
+                        bytes: recorded.bytes
+                    )
+                } catch {
+                    cacheEvent = .init(
+                        key: identity.key,
+                        outcome: "record_error",
+                        durationNS: timer.elapsedTime().nanoseconds,
+                        bytes: nil
+                    )
+                }
+            } else if let identity {
+                cacheEvent = .init(
+                    key: identity.key,
+                    outcome: "miss",
+                    durationNS: 0,
+                    bytes: nil
+                )
+            }
+            return .compiled(
+                projection,
+                durationNS: compilerDurationNS,
+                cacheEvent: cacheEvent
             )
         }
         let encoder = JSONEncoder()
@@ -647,6 +815,7 @@ package enum SwiftDependencyCompatiblePlanPreflight {
             "-emit-module-source-info-path",
             "-emit-objc-header-path",
             "-emit-tbd-path",
+            "-index-store-path",
             "-index-unit-output-path",
             "-save-optimization-record-path",
         ]
@@ -793,6 +962,7 @@ package enum SwiftDependencyCompatiblePlanPreflight {
     ) -> [String: String] {
         var result = environment
         SwiftJobCASConfiguration.removeControlVariables(from: &result)
+        SwiftDependencyProjectionCASConfiguration.removeControlVariables(from: &result)
         SwiftDependencyShadowConfiguration.removeControlVariable(from: &result)
         result.removeValue(forKey: "SWIFT_BUILD_DRIVER_PLAN_CACHE_ROOT")
         result.removeValue(forKey: "SWIFT_BUILD_DRIVER_PLAN_CACHE_MODE")

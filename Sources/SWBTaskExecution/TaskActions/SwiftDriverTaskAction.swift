@@ -531,6 +531,11 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                             dependencyObservationCandidateBinding = binding
                             dependencyObservationOutcome = "compatible_preflight"
                             if let preflight = graphPreflight {
+                                for event in preflight.projectionCacheEvents {
+                                    outputDelegate.note(
+                                        "SWIFT_DEPENDENCY_PROJECTION_CAS outcome=\(event.outcome) key=\(event.key) duration_ns=\(event.durationNS) bytes=\(event.bytes ?? 0)"
+                                    )
+                                }
                                 outputDelegate.note(
                                     "SWIFT_DRIVER_PLAN_GRAPH_CLOSURE outcome=admitted affected=\(preflight.closure.invalidationCone.affectedSources.count) reusable=\(preflight.closure.invalidationCone.reusableSources.count) changed_keys=\(preflight.closure.changedProviderKeys.count) false_negative=unknown overadmitted=unknown projection_compiler_ns=\(preflight.compilerDurationNS)"
                                 )
