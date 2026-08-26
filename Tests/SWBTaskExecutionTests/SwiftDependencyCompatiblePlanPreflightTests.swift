@@ -29,8 +29,13 @@ fileprivate struct SwiftDependencyCompatiblePlanPreflightTests {
             previousManifest: baselineManifest(),
             changedSourceIdentities: [provider],
             jobs: sources.map(job),
-            overlayPath: overlay
-        ) { job, commandLine in
+            overlayPath: overlay,
+            compileDependencyOnlyProjection: { job, commandLine in
+                #expect(job.sourceIdentity == provider)
+                #expect(commandLine.contains("-typecheck"))
+                return providerProjection(fingerprint: "provider-v2")
+            },
+            compileProjection: { job, commandLine in
             #expect(!commandLine.contains("-cache-compile-job"))
             #expect(commandLine.contains("-module-import-from-cas"))
             #expect(commandLine.suffix(2) == ["-vfsoverlay", overlay.str])
@@ -46,17 +51,47 @@ fileprivate struct SwiftDependencyCompatiblePlanPreflightTests {
                 Issue.record("preflight compiled an unrelated primary")
                 return unrelatedProjection()
             }
-        }
+        })
 
         #expect(result.executions.map(\.sourceIdentity) == [provider, bridge, caller])
         #expect(result.priorGraphClosure.invalidationCone.affectedSources
             == [provider, bridge, caller].sorted())
         #expect(result.priorGraphClosure.invalidationCone.reusableSources == [unrelated])
         #expect(result.changedProjectionDurationNS > 0)
+        #expect(result.dependencyOnlyExecutions.map(\.sourceIdentity) == [provider])
+        #expect(result.dependencyOnlyProjectionParity == true)
         #expect(result.fixedPoint.invalidationCone.affectedSources
             == [provider, bridge, caller].sorted())
         #expect(result.fixedPoint.invalidationCone.reusableSources == [unrelated])
         #expect(result.fixedPoint.compilationCounts == [provider: 1, bridge: 1, caller: 1])
+    }
+
+    @Test
+    func buildsDependencyOnlyTypecheckCommandWithoutCodegenOutputs() throws {
+        let output = Path("/tmp/Provider.dependency-only.swiftdeps")
+        let command = try SwiftDependencyCompatiblePlanPreflight
+            .dependencyOnlyCommandLine(
+                [
+                    "/usr/bin/swift-frontend", "-frontend", "-c",
+                    "-primary-file", provider,
+                    "-emit-reference-dependencies-path", "/tmp/Provider.swiftdeps",
+                    "-emit-dependencies-path", "/tmp/Provider.d",
+                    "-serialize-diagnostics-path", "/tmp/Provider.dia",
+                    "-emit-const-values-path", "/tmp/Provider.swiftconstvalues",
+                    "-o", "/tmp/Provider.o",
+                    "-Xcc", "-o", "-Xfrontend", "-serialize-debugging-options",
+                ],
+                dependencyOutputPath: output
+            )
+        #expect(command.contains("-typecheck"))
+        #expect(!command.contains("-c"))
+        #expect(!command.contains("/tmp/Provider.o"))
+        #expect(!command.contains("/tmp/Provider.d"))
+        #expect(!command.contains("/tmp/Provider.dia"))
+        #expect(!command.contains("/tmp/Provider.swiftconstvalues"))
+        #expect(command.contains(["-Xcc", "-o"]))
+        #expect(command.contains(["-Xfrontend", "-serialize-debugging-options"]))
+        #expect(command.contains(["-emit-reference-dependencies-path", output.str]))
     }
 
     @Test
@@ -99,6 +134,7 @@ fileprivate struct SwiftDependencyCompatiblePlanPreflightTests {
             sourceIdentity: source,
             commandLine: [
                 "/usr/bin/swift-frontend",
+                "-c",
                 "-primary-file", source,
                 "-emit-reference-dependencies-path", source + ".swiftdeps",
                 "-cache-compile-job",

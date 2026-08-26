@@ -53,6 +53,8 @@ package enum SwiftDependencyCompatiblePlanPreflight {
         package let executions: [Execution]
         package let priorGraphClosure: SwiftDependencyPriorGraphClosureResult
         package let changedProjectionDurationNS: UInt64
+        package let dependencyOnlyExecutions: [Execution]
+        package let dependencyOnlyProjectionParity: Bool?
     }
 
     package static func run(
@@ -60,6 +62,7 @@ package enum SwiftDependencyCompatiblePlanPreflight {
         changedSourceIdentities: Set<String>,
         jobs: [Job],
         overlayPath: Path,
+        compileDependencyOnlyProjection: ((Job, [String]) throws -> SwiftDependencyFingerprintProjection)? = nil,
         compileProjection: (Job, [String]) throws -> SwiftDependencyFingerprintProjection
     ) throws -> Result {
         let expectedSources = previousManifest.sources.map(\.sourceIdentity)
@@ -87,6 +90,8 @@ package enum SwiftDependencyCompatiblePlanPreflight {
         var executions: [Execution] = []
         var changedProjections: [String: SwiftDependencyFingerprintProjection] = [:]
         var changedProjectionDurationNS: UInt64 = 0
+        var dependencyOnlyProjections: [String: SwiftDependencyFingerprintProjection] = [:]
+        var dependencyOnlyExecutions: [Execution] = []
         var priorGraphClosure: SwiftDependencyPriorGraphClosureResult?
         while let sourceIdentity = scheduler.nextSourceIdentity {
             guard let job = jobsBySource[sourceIdentity] else {
@@ -99,6 +104,26 @@ package enum SwiftDependencyCompatiblePlanPreflight {
                 sourceIdentity: sourceIdentity,
                 overlayPath: overlayPath
             )
+            if changedSourceIdentities.contains(sourceIdentity),
+               let compileDependencyOnlyProjection,
+               dependencyOnlyProjections[sourceIdentity] == nil {
+                let dependencyOnlyOutputPath = dependencyOnlyOutputPath(for: job)
+                let dependencyOnlyCommandLine = try dependencyOnlyCommandLine(
+                    commandLine,
+                    dependencyOutputPath: dependencyOnlyOutputPath
+                )
+                let dependencyOnlyTimer = ElapsedTimer()
+                dependencyOnlyProjections[sourceIdentity] = try compileDependencyOnlyProjection(
+                    job,
+                    dependencyOnlyCommandLine
+                )
+                dependencyOnlyExecutions.append(.init(
+                    sourceIdentity: sourceIdentity,
+                    commandLine: dependencyOnlyCommandLine,
+                    dependencyOutputPath: dependencyOnlyOutputPath,
+                    durationNS: dependencyOnlyTimer.elapsedTime().nanoseconds
+                ))
+            }
             let compileTimer = ElapsedTimer()
             let projection = try compileProjection(job, commandLine)
             let compileDurationNS = compileTimer.elapsedTime().nanoseconds
@@ -133,7 +158,13 @@ package enum SwiftDependencyCompatiblePlanPreflight {
             fixedPoint: try scheduler.result(),
             executions: executions,
             priorGraphClosure: priorGraphClosure,
-            changedProjectionDurationNS: changedProjectionDurationNS
+            changedProjectionDurationNS: changedProjectionDurationNS,
+            dependencyOnlyExecutions: dependencyOnlyExecutions,
+            dependencyOnlyProjectionParity: dependencyOnlyProjections.isEmpty
+                ? nil
+                : changedProjections.allSatisfy {
+                    dependencyOnlyProjections[$0.key] == $0.value
+                }
         )
     }
 
@@ -250,8 +281,25 @@ package enum SwiftDependencyCompatiblePlanPreflight {
             previousManifest: previousManifest,
             changedSourceIdentities: Set(configuration.changedSourceIdentities),
             jobs: jobs,
-            overlayPath: overlayPath
-        ) { job, commandLine in
+            overlayPath: overlayPath,
+            compileDependencyOnlyProjection: { job, commandLine in
+                let dependencyOutputPath = try dependencyOutputPath(in: commandLine)
+                try fs.createDirectory(dependencyOutputPath.dirname, recursive: true)
+                try execute(
+                    commandLine: commandLine,
+                    workingDirectory: job.workingDirectory,
+                    environment: childEnvironment,
+                    logPath: preflightManifestPath.dirname.join(
+                        "dependency-only-\(job.sourceIdentity.split(separator: "/").last ?? "unknown").log"
+                    )
+                )
+                return try SwiftDependencyFingerprintProjection.read(
+                    from: dependencyOutputPath,
+                    sourceIdentity: job.sourceIdentity,
+                    pathMappings: configuration.pathMappings
+                )
+            },
+            compileProjection: { job, commandLine in
             for outputPath in job.outputPaths {
                 try fs.createDirectory(outputPath.dirname, recursive: true)
             }
@@ -268,7 +316,7 @@ package enum SwiftDependencyCompatiblePlanPreflight {
                 sourceIdentity: job.sourceIdentity,
                 pathMappings: configuration.pathMappings
             )
-        }
+        })
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         try fs.write(
@@ -336,6 +384,103 @@ package enum SwiftDependencyCompatiblePlanPreflight {
         }
         commandLine.append(contentsOf: ["-vfsoverlay", overlayPath.str])
         return commandLine
+    }
+
+    package static func dependencyOnlyCommandLine(
+        _ plannedCommandLine: [String],
+        dependencyOutputPath: Path
+    ) throws -> [String] {
+        guard !plannedCommandLine.isEmpty, dependencyOutputPath.isAbsolute else {
+            throw StubError.error(
+                "Swift dependency-only projection command is incomplete."
+            )
+        }
+        let pairedOutputs: Set<String> = [
+            "-o",
+            "-emit-dependencies-path",
+            "-serialize-diagnostics-path",
+            "-emit-const-values-path",
+            "-emit-module-path",
+            "-emit-module-doc-path",
+            "-emit-module-source-info-path",
+            "-emit-objc-header-path",
+            "-emit-tbd-path",
+            "-index-unit-output-path",
+            "-save-optimization-record-path",
+        ]
+        let outputModes: Set<String> = [
+            "-c", "-emit-object", "-emit-module", "-emit-objc-header",
+            "-emit-tbd", "-serialize-diagnostics", "-emit-const-values",
+        ]
+        var commandLine: [String] = []
+        var index = 0
+        var replacedCompileMode = false
+        while index < plannedCommandLine.count {
+            let argument = plannedCommandLine[index]
+            if argument == "-Xcc" || argument == "-Xfrontend" {
+                guard plannedCommandLine.indices.contains(index + 1) else {
+                    throw StubError.error(
+                        "Swift dependency-only projection command has an incomplete forwarded argument."
+                    )
+                }
+                commandLine.append(contentsOf: [argument, plannedCommandLine[index + 1]])
+                index += 2
+                continue
+            }
+            if argument == "-emit-reference-dependencies-path" {
+                guard plannedCommandLine.indices.contains(index + 1) else {
+                    throw StubError.error(
+                        "Swift dependency-only projection command has an incomplete dependency output."
+                    )
+                }
+                commandLine.append(contentsOf: [argument, dependencyOutputPath.str])
+                index += 2
+                continue
+            }
+            if pairedOutputs.contains(argument) {
+                guard plannedCommandLine.indices.contains(index + 1) else {
+                    throw StubError.error(
+                        "Swift dependency-only projection command has an incomplete output option."
+                    )
+                }
+                index += 2
+                continue
+            }
+            if outputModes.contains(argument) {
+                if argument == "-c" || argument == "-emit-object" {
+                    replacedCompileMode = true
+                }
+                index += 1
+                continue
+            }
+            commandLine.append(argument)
+            index += 1
+        }
+        guard replacedCompileMode,
+              values(after: "-emit-reference-dependencies-path", in: commandLine)
+                == [dependencyOutputPath.str] else {
+            throw StubError.error(
+                "Swift dependency-only projection command lacks a unique compile mode or dependency output."
+            )
+        }
+        commandLine.append("-typecheck")
+        return commandLine
+    }
+
+    private static func dependencyOnlyOutputPath(for job: Job) -> Path {
+        job.dependencyOutputPath.dirname.join(
+            ".\(job.dependencyOutputPath.basename).dependency-only"
+        )
+    }
+
+    private static func dependencyOutputPath(in commandLine: [String]) throws -> Path {
+        let values = values(after: "-emit-reference-dependencies-path", in: commandLine)
+        guard values.count == 1, Path(values[0]).isAbsolute else {
+            throw StubError.error(
+                "Swift dependency-only projection output must be one absolute path."
+            )
+        }
+        return Path(values[0])
     }
 
     private static func values(after option: String, in commandLine: [String]) -> [String] {

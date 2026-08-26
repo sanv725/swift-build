@@ -531,6 +531,9 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                                 "SWIFT_DRIVER_PLAN_GRAPH_CLOSURE outcome=observed affected=\(graphAffected.count) reusable=\(preflight.priorGraphClosure.invalidationCone.reusableSources.count) changed_keys=\(preflight.priorGraphClosure.changedProviderKeys.count) false_negative=\(falseNegativeCount) overadmitted=\(overadmittedCount) projection_compiler_ns=\(preflight.changedProjectionDurationNS)"
                             )
                             outputDelegate.note(
+                                "SWIFT_DRIVER_DEPENDENCY_ONLY_PROJECTION outcome=observed parity=\(preflight.dependencyOnlyProjectionParity == true ? "exact" : "mismatch") executions=\(preflight.dependencyOnlyExecutions.count) compiler_ns=\(preflight.dependencyOnlyExecutions.reduce(0) { $0 + $1.durationNS })"
+                            )
+                            outputDelegate.note(
                                 "SWIFT_DRIVER_PLAN_PREFLIGHT outcome=admitted candidate_key=\(candidateKey) affected=\(preflight.fixedPoint.invalidationCone.affectedSources.count) reusable=\(preflight.fixedPoint.invalidationCone.reusableSources.count) compiled=\(preflight.executions.count) compiler_ns=\(preflightCompileDurationNS)"
                             )
                         } catch {
