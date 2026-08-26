@@ -45,6 +45,7 @@ package enum SwiftDependencyCompatiblePlanPreflight {
         package let sourceIdentity: String
         package let commandLine: [String]
         package let dependencyOutputPath: Path
+        package let durationNS: UInt64
     }
 
     package struct Result: Sendable, Equatable {
@@ -93,7 +94,9 @@ package enum SwiftDependencyCompatiblePlanPreflight {
                 sourceIdentity: sourceIdentity,
                 overlayPath: overlayPath
             )
+            let compileTimer = ElapsedTimer()
             let projection = try compileProjection(job, commandLine)
+            let compileDurationNS = compileTimer.elapsedTime().nanoseconds
             try scheduler.recordCompiledProjection(
                 projection,
                 for: sourceIdentity
@@ -101,7 +104,8 @@ package enum SwiftDependencyCompatiblePlanPreflight {
             executions.append(.init(
                 sourceIdentity: sourceIdentity,
                 commandLine: commandLine,
-                dependencyOutputPath: job.dependencyOutputPath
+                dependencyOutputPath: job.dependencyOutputPath,
+                durationNS: compileDurationNS
             ))
         }
         return .init(fixedPoint: try scheduler.result(), executions: executions)

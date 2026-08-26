@@ -514,8 +514,11 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                             dependencyObservationCandidateKey = candidateKey
                             dependencyObservationCandidateBinding = binding
                             dependencyObservationOutcome = "compatible_preflight"
+                            let preflightCompileDurationNS = preflight.executions.reduce(0) {
+                                $0 + $1.durationNS
+                            }
                             outputDelegate.note(
-                                "SWIFT_DRIVER_PLAN_PREFLIGHT outcome=admitted candidate_key=\(candidateKey) affected=\(preflight.fixedPoint.invalidationCone.affectedSources.count) reusable=\(preflight.fixedPoint.invalidationCone.reusableSources.count) compiled=\(preflight.executions.count)"
+                                "SWIFT_DRIVER_PLAN_PREFLIGHT outcome=admitted candidate_key=\(candidateKey) affected=\(preflight.fixedPoint.invalidationCone.affectedSources.count) reusable=\(preflight.fixedPoint.invalidationCone.reusableSources.count) compiled=\(preflight.executions.count) compiler_ns=\(preflightCompileDurationNS)"
                             )
                         } catch {
                             dependencyObservationOutcome = "preflight_failed"
