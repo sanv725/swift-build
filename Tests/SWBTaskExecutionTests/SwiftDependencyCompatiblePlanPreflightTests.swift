@@ -49,6 +49,10 @@ fileprivate struct SwiftDependencyCompatiblePlanPreflightTests {
         }
 
         #expect(result.executions.map(\.sourceIdentity) == [provider, bridge, caller])
+        #expect(result.priorGraphClosure.invalidationCone.affectedSources
+            == [provider, bridge, caller].sorted())
+        #expect(result.priorGraphClosure.invalidationCone.reusableSources == [unrelated])
+        #expect(result.changedProjectionDurationNS > 0)
         #expect(result.fixedPoint.invalidationCone.affectedSources
             == [provider, bridge, caller].sorted())
         #expect(result.fixedPoint.invalidationCone.reusableSources == [unrelated])

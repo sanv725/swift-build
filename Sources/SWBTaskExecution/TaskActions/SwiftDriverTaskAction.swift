@@ -517,6 +517,19 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                             let preflightCompileDurationNS = preflight.executions.reduce(0) {
                                 $0 + $1.durationNS
                             }
+                            let fixedPointAffected = Set(
+                                preflight.fixedPoint.invalidationCone.affectedSources
+                            )
+                            let graphAffected = Set(
+                                preflight.priorGraphClosure.invalidationCone.affectedSources
+                            )
+                            let falseNegativeCount = fixedPointAffected
+                                .subtracting(graphAffected).count
+                            let overadmittedCount = graphAffected
+                                .subtracting(fixedPointAffected).count
+                            outputDelegate.note(
+                                "SWIFT_DRIVER_PLAN_GRAPH_CLOSURE outcome=observed affected=\(graphAffected.count) reusable=\(preflight.priorGraphClosure.invalidationCone.reusableSources.count) changed_keys=\(preflight.priorGraphClosure.changedProviderKeys.count) false_negative=\(falseNegativeCount) overadmitted=\(overadmittedCount) projection_compiler_ns=\(preflight.changedProjectionDurationNS)"
+                            )
                             outputDelegate.note(
                                 "SWIFT_DRIVER_PLAN_PREFLIGHT outcome=admitted candidate_key=\(candidateKey) affected=\(preflight.fixedPoint.invalidationCone.affectedSources.count) reusable=\(preflight.fixedPoint.invalidationCone.reusableSources.count) compiled=\(preflight.executions.count) compiler_ns=\(preflightCompileDurationNS)"
                             )

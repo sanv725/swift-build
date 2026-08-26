@@ -51,6 +51,8 @@ package enum SwiftDependencyCompatiblePlanPreflight {
     package struct Result: Sendable, Equatable {
         package let fixedPoint: SwiftDependencyFixedPointResult
         package let executions: [Execution]
+        package let priorGraphClosure: SwiftDependencyPriorGraphClosureResult
+        package let changedProjectionDurationNS: UInt64
     }
 
     package static func run(
@@ -83,6 +85,9 @@ package enum SwiftDependencyCompatiblePlanPreflight {
             changedSourceIdentities: changedSourceIdentities
         )
         var executions: [Execution] = []
+        var changedProjections: [String: SwiftDependencyFingerprintProjection] = [:]
+        var changedProjectionDurationNS: UInt64 = 0
+        var priorGraphClosure: SwiftDependencyPriorGraphClosureResult?
         while let sourceIdentity = scheduler.nextSourceIdentity {
             guard let job = jobsBySource[sourceIdentity] else {
                 throw StubError.error(
@@ -97,6 +102,17 @@ package enum SwiftDependencyCompatiblePlanPreflight {
             let compileTimer = ElapsedTimer()
             let projection = try compileProjection(job, commandLine)
             let compileDurationNS = compileTimer.elapsedTime().nanoseconds
+            if changedSourceIdentities.contains(sourceIdentity),
+               changedProjections[sourceIdentity] == nil {
+                changedProjections[sourceIdentity] = projection
+                changedProjectionDurationNS += compileDurationNS
+                if changedProjections.count == changedSourceIdentities.count {
+                    priorGraphClosure = try SwiftDependencyPriorGraphClosure.calculate(
+                        previousManifest: previousManifest,
+                        changedProjections: changedProjections
+                    )
+                }
+            }
             try scheduler.recordCompiledProjection(
                 projection,
                 for: sourceIdentity
@@ -108,7 +124,17 @@ package enum SwiftDependencyCompatiblePlanPreflight {
                 durationNS: compileDurationNS
             ))
         }
-        return .init(fixedPoint: try scheduler.result(), executions: executions)
+        guard let priorGraphClosure else {
+            throw StubError.error(
+                "Swift dependency compatible plan did not produce every changed-source projection."
+            )
+        }
+        return .init(
+            fixedPoint: try scheduler.result(),
+            executions: executions,
+            priorGraphClosure: priorGraphClosure,
+            changedProjectionDurationNS: changedProjectionDurationNS
+        )
     }
 
     package static func runLive(
