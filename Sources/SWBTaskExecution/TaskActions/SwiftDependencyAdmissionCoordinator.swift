@@ -48,6 +48,29 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
         package let predictedCount: Int
         package let actualCount: Int
         package let pendingCount: Int
+        /// The conservative graph admitted this unchanged caller, but its
+        /// complete compiler projection is identical to the prior state. The
+        /// job action should restore the prior exact action after validation
+        /// instead of attempting a create-only publication under the same key.
+        package let replayPriorAction: Bool
+
+        package init(
+            outcome: String,
+            sourceIdentity: String,
+            dependencyFingerprintDigests: [String],
+            predictedCount: Int,
+            actualCount: Int,
+            pendingCount: Int,
+            replayPriorAction: Bool = false
+        ) {
+            self.outcome = outcome
+            self.sourceIdentity = sourceIdentity
+            self.dependencyFingerprintDigests = dependencyFingerprintDigests
+            self.predictedCount = predictedCount
+            self.actualCount = actualCount
+            self.pendingCount = pendingCount
+            self.replayPriorAction = replayPriorAction
+        }
     }
 
     package struct Snapshot: Sendable, Equatable {
@@ -474,9 +497,15 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
                             ($0.sourceIdentity, $0)
                         }
                     )
+                    let previousEntries = Dictionary(
+                        uniqueKeysWithValues: previousManifest.sources.map {
+                            ($0.sourceIdentity, $0)
+                        }
+                    )
                     for identity in affected {
                         guard let waiter = state.graphCompletionWaiters[identity],
-                              let entry = entries[identity] else {
+                              let entry = entries[identity],
+                              let previousEntry = previousEntries[identity] else {
                             throw StubError.error(
                                 "Swift dependency graph admission publication barrier is incomplete."
                             )
@@ -490,7 +519,12 @@ package final class SwiftDependencyAdmissionCoordinator: @unchecked Sendable {
                                     entry.dependencyFingerprintDigests,
                                 predictedCount: affected.count,
                                 actualCount: state.actualExecutionCounts.count,
-                                pendingCount: 0
+                                pendingCount: 0,
+                                replayPriorAction:
+                                    !configuration.changedSourceIdentities.contains(identity)
+                                    && entry.projection == previousEntry.projection
+                                    && entry.dependencyFingerprintDigests
+                                        == previousEntry.dependencyFingerprintDigests
                             )
                         ))
                     }

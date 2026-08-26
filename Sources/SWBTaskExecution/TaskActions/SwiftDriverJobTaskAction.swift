@@ -1509,6 +1509,55 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                     )
                 }
             }
+            func restorePriorJobCAS(_ identity: SwiftJobCASIdentity) -> Bool {
+                guard let jobCASConfiguration,
+                      jobCASConfiguration.mode.reads else { return false }
+                let store = SwiftJobCASStore(root: jobCASConfiguration.root)
+                let timer = ElapsedTimer()
+                var timings = SwiftJobCASReplayTimings()
+                let replay = store.replay(
+                    identity: identity,
+                    destinations: plannedOutputs,
+                    verification: jobCASConfiguration.verification,
+                    timings: &timings,
+                    fs: executionDelegate.fs
+                )
+                let durationNS = timer.elapsedTime().nanoseconds
+                let phaseFields = "verification=\(jobCASConfiguration.verification.rawValue) action_lookup_ns=\(timings.actionLookupDurationNS) action_read_ns=\(timings.actionReadDurationNS) action_validation_ns=\(timings.actionValidationDurationNS) blob_read_ns=\(timings.blobReadDurationNS) blob_verification_ns=\(timings.blobVerificationDurationNS) publication_ns=\(timings.outputPublicationDurationNS)"
+                switch replay {
+                case .hit(let outputCount, let outputBytes):
+                    let event = SwiftJobCASEvent(
+                        jobKey: identity.key,
+                        operation: "postcompile_replay",
+                        outcome: "hit",
+                        durationNS: durationNS,
+                        outputCount: outputCount,
+                        outputBytes: outputBytes,
+                        detail: "conservative_graph_overadmission",
+                        verification: jobCASConfiguration.verification,
+                        replayTimings: timings
+                    )
+                    let eventTimer = ElapsedTimer()
+                    try? store.recordEvent(event, fs: executionDelegate.fs)
+                    let eventDurationNS = eventTimer.elapsedTime().nanoseconds
+                    outputDelegate.note(
+                        "SWIFT_JOB_CAS outcome=hit key=\(identity.key) outputs=\(outputCount) bytes=\(outputBytes) duration_ns=\(durationNS) event_ns=\(eventDurationNS) \(phaseFields) phase=postcompile_overadmission"
+                    )
+                    outputDelegate.incrementCounter(.swiftCacheHits)
+                    outputDelegate.incrementTaskCounter(.cacheHits)
+                    return true
+                case .miss:
+                    outputDelegate.note(
+                        "SWIFT_JOB_CAS outcome=postcompile_miss key=\(identity.key) duration_ns=\(durationNS) \(phaseFields) fallback=record"
+                    )
+                    return false
+                case .invalid:
+                    outputDelegate.note(
+                        "SWIFT_JOB_CAS outcome=postcompile_invalid key=\(identity.key) duration_ns=\(durationNS) \(phaseFields) fallback=record"
+                    )
+                    return false
+                }
+            }
             let dependencyPreflightSourceIdentity: String?
             switch dependencyAdmissionDecision {
             case .executeChanged(let sourceIdentity)?,
@@ -2109,10 +2158,17 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                                         dependencyPath: dependencyOutputPath
                                     )
                                 }
-                                jobCASRecordIdentity = makeJobCASIdentity(
+                                let completedIdentity = makeJobCASIdentity(
                                     dependencyFingerprintDigests: completion
                                         .dependencyFingerprintDigests
                                 )
+                                if completion.replayPriorAction,
+                                   let completedIdentity,
+                                   restorePriorJobCAS(completedIdentity) {
+                                    jobCASRecordIdentity = nil
+                                } else {
+                                    jobCASRecordIdentity = completedIdentity
+                                }
                                 outputDelegate.note(
                                     "SWIFT_DEPENDENCY_ADMISSION outcome=\(completion.outcome) source=\(sourceIdentity) predicted=\(completion.predictedCount) actual=\(completion.actualCount) pending=\(completion.pendingCount) planning=apple"
                                 )
