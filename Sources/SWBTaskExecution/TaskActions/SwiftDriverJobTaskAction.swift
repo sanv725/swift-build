@@ -1471,6 +1471,74 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             }
             var jobCASRecordIdentity = jobCASIdentity
             var dependencyAdmissionReplayMiss = false
+            func recordJobCAS(_ identity: SwiftJobCASIdentity) {
+                guard let jobCASConfiguration,
+                      jobCASConfiguration.mode.writes else { return }
+                let store = SwiftJobCASStore(root: jobCASConfiguration.root)
+                let timer = ElapsedTimer()
+                do {
+                    let recorded = try store.record(
+                        identity: identity,
+                        outputs: plannedOutputs,
+                        fs: executionDelegate.fs
+                    )
+                    let durationNS = timer.elapsedTime().nanoseconds
+                    try? store.recordEvent(.init(
+                        jobKey: identity.key,
+                        operation: "record",
+                        outcome: recorded.actionCreated ? "created" : "present",
+                        durationNS: durationNS,
+                        outputCount: recorded.outputCount,
+                        outputBytes: recorded.outputBytes,
+                        detail: "new_blob_count=\(recorded.newBlobCount)"
+                    ), fs: executionDelegate.fs)
+                    outputDelegate.note(
+                        "SWIFT_JOB_CAS outcome=recorded key=\(identity.key) outputs=\(recorded.outputCount) bytes=\(recorded.outputBytes) new_blobs=\(recorded.newBlobCount) duration_ns=\(durationNS)"
+                    )
+                } catch {
+                    let durationNS = timer.elapsedTime().nanoseconds
+                    try? store.recordEvent(.init(
+                        jobKey: identity.key,
+                        operation: "record",
+                        outcome: "error",
+                        durationNS: durationNS,
+                        detail: String(describing: error)
+                    ), fs: executionDelegate.fs)
+                    outputDelegate.note(
+                        "SWIFT_JOB_CAS outcome=record_error key=\(identity.key) duration_ns=\(durationNS) fallback=completed_frontend"
+                    )
+                }
+            }
+            let dependencyPreflightSourceIdentity: String?
+            switch dependencyAdmissionDecision {
+            case .executeChanged(let sourceIdentity)?,
+                 .executeAffected(let sourceIdentity)?:
+                dependencyPreflightSourceIdentity = sourceIdentity
+            case .appleFallback?, .replayReusable?, nil:
+                dependencyPreflightSourceIdentity = nil
+            }
+            if dependencyCompatiblePlanExecution,
+               let dependencyOutputPath,
+               case .admission(let admissionCoordinator) = dependencyRuntimeCoordinator,
+               let sourceIdentity = dependencyPreflightSourceIdentity,
+               plannedOutputs.allSatisfy({ executionDelegate.fs.exists($0) }) {
+                let completion = try admissionCoordinator.completeFrontend(
+                    sourceIdentity: sourceIdentity,
+                    dependencyPath: dependencyOutputPath
+                )
+                if let identity = makeJobCASIdentity(
+                    dependencyFingerprintDigests: completion.dependencyFingerprintDigests
+                ) {
+                    recordJobCAS(identity)
+                }
+                outputDelegate.note(
+                    "SWIFT_DEPENDENCY_ADMISSION outcome=\(completion.outcome) source=\(sourceIdentity) predicted=\(completion.predictedCount) actual=\(completion.actualCount) pending=\(completion.pendingCount) planning=compatible_preflight"
+                )
+                outputDelegate.note(
+                    "SWIFT_DRIVER_PLAN_PREFLIGHT_OUTPUT outcome=reused source=\(sourceIdentity) outputs=\(plannedOutputs.count)"
+                )
+                return .succeeded
+            }
             if let jobCASConfiguration,
                jobCASConfiguration.mode.reads,
                let jobCASIdentity {
@@ -2063,43 +2131,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 }
             }
             if delegate.commandResult == .succeeded,
-               let jobCASConfiguration,
-               jobCASConfiguration.mode.writes,
                let jobCASIdentity = jobCASRecordIdentity {
-                let store = SwiftJobCASStore(root: jobCASConfiguration.root)
-                let timer = ElapsedTimer()
-                do {
-                    let recorded = try store.record(
-                        identity: jobCASIdentity,
-                        outputs: plannedOutputs,
-                        fs: executionDelegate.fs
-                    )
-                    let durationNS = timer.elapsedTime().nanoseconds
-                    try? store.recordEvent(.init(
-                        jobKey: jobCASIdentity.key,
-                        operation: "record",
-                        outcome: recorded.actionCreated ? "created" : "present",
-                        durationNS: durationNS,
-                        outputCount: recorded.outputCount,
-                        outputBytes: recorded.outputBytes,
-                        detail: "new_blob_count=\(recorded.newBlobCount)"
-                    ), fs: executionDelegate.fs)
-                    outputDelegate.note(
-                        "SWIFT_JOB_CAS outcome=recorded key=\(jobCASIdentity.key) outputs=\(recorded.outputCount) bytes=\(recorded.outputBytes) new_blobs=\(recorded.newBlobCount) duration_ns=\(durationNS)"
-                    )
-                } catch {
-                    let durationNS = timer.elapsedTime().nanoseconds
-                    try? store.recordEvent(.init(
-                        jobKey: jobCASIdentity.key,
-                        operation: "record",
-                        outcome: "error",
-                        durationNS: durationNS,
-                        detail: String(describing: error)
-                    ), fs: executionDelegate.fs)
-                    outputDelegate.note(
-                        "SWIFT_JOB_CAS outcome=record_error key=\(jobCASIdentity.key) duration_ns=\(durationNS) fallback=completed_frontend"
-                    )
-                }
+                recordJobCAS(jobCASIdentity)
             }
             #endif
             // If has remote cache, start uploading task.
