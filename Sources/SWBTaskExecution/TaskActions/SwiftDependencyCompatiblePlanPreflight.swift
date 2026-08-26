@@ -56,6 +56,8 @@ package enum SwiftDependencyCompatiblePlanPreflight {
         package let dependencyOnlyExecutions: [Execution]
         package let dependencyOnlyProjectionParity: Bool?
         package let dependencyOnlyProjectionComparison: ProjectionComparison?
+        package let dependencyOnlyPriorGraphClosure: SwiftDependencyPriorGraphClosureResult?
+        package let dependencyOnlyGraphClosureParity: Bool?
     }
 
     package struct ProjectionComparison: Sendable, Equatable {
@@ -71,6 +73,10 @@ package enum SwiftDependencyCompatiblePlanPreflight {
         package var exact: Bool {
             compilerVersion && sourceFileInterfaceFingerprint
                 && providedInterfaces && dependedInterfaces
+        }
+
+        package var closureRelevantExact: Bool {
+            compilerVersion && sourceFileInterfaceFingerprint && providedInterfaces
         }
     }
 
@@ -213,6 +219,13 @@ package enum SwiftDependencyCompatiblePlanPreflight {
                     $0 + $1.fullDependedCount
                 }
             )
+        let dependencyOnlyPriorGraphClosure =
+            dependencyOnlyProjections.count == changedSourceIdentities.count
+                ? try? SwiftDependencyPriorGraphClosure.calculate(
+                    previousManifest: previousManifest,
+                    changedProjections: dependencyOnlyProjections
+                )
+                : nil
         return .init(
             fixedPoint: try scheduler.result(),
             executions: executions,
@@ -220,7 +233,11 @@ package enum SwiftDependencyCompatiblePlanPreflight {
             changedProjectionDurationNS: changedProjectionDurationNS,
             dependencyOnlyExecutions: dependencyOnlyExecutions,
             dependencyOnlyProjectionParity: projectionComparison?.exact,
-            dependencyOnlyProjectionComparison: projectionComparison
+            dependencyOnlyProjectionComparison: projectionComparison,
+            dependencyOnlyPriorGraphClosure: dependencyOnlyPriorGraphClosure,
+            dependencyOnlyGraphClosureParity: dependencyOnlyPriorGraphClosure.map {
+                $0 == priorGraphClosure
+            }
         )
     }
 

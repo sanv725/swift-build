@@ -63,6 +63,9 @@ fileprivate struct SwiftDependencyCompatiblePlanPreflightTests {
         #expect(result.dependencyOnlyProjectionComparison?.exact == true)
         #expect(result.dependencyOnlyProjectionComparison?.dependencyOnlyProvidedCount == 1)
         #expect(result.dependencyOnlyProjectionComparison?.dependencyOnlyDependedCount == 0)
+        #expect(result.dependencyOnlyProjectionComparison?.closureRelevantExact == true)
+        #expect(result.dependencyOnlyPriorGraphClosure == result.priorGraphClosure)
+        #expect(result.dependencyOnlyGraphClosureParity == true)
         #expect(result.fixedPoint.invalidationCone.affectedSources
             == [provider, bridge, caller].sorted())
         #expect(result.fixedPoint.invalidationCone.reusableSources == [unrelated])
