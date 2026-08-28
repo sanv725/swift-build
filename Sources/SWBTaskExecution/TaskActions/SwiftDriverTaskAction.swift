@@ -187,6 +187,7 @@ private struct SwiftDriverPlanCacheConfiguration {
 
 private struct SwiftDriverDirectPlanManifest: Codable {
     static let schema = "swift-build-direct-swift-plan-v1"
+    static let writeLock = NSLock()
 
     struct Job: Codable {
         let key: String
@@ -220,6 +221,30 @@ private struct SwiftDriverDirectPlanManifest: Codable {
         schema = Self.schema
         self.actionKey = actionKey
         jobs = snapshot.plannedBuild.plannedTargetJobs.map(Job.init)
+    }
+
+    init(actionKey: String, jobs: [Job]) {
+        schema = Self.schema
+        self.actionKey = actionKey
+        self.jobs = jobs
+    }
+
+    func merging(_ other: Self) throws -> Self {
+        guard actionKey == other.actionKey else {
+            throw StubError.error("Swift Driver direct plan action identity differs.")
+        }
+        var seen = Set<String>()
+        let merged = (jobs + other.jobs).filter { job in
+            let identity = [
+                job.moduleName, job.key, job.workingDirectory,
+                job.commandLine.joined(separator: "\u{0}"),
+            ].joined(separator: "\u{1f}")
+            return seen.insert(identity).inserted
+        }.sorted {
+            ($0.moduleName, $0.key, $0.workingDirectory)
+                < ($1.moduleName, $1.key, $1.workingDirectory)
+        }
+        return Self(actionKey: actionKey, jobs: merged)
     }
 }
 
@@ -692,7 +717,32 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                         actionKey: planCacheConfiguration.key,
                         snapshot: snapshot
                     )
-                    let directBytes = try JSONEncoder().encode(directPlan)
+                    let directBytes = try SwiftDriverDirectPlanManifest.writeLock.withLock {
+                        try executionDelegate.fs.createDirectory(
+                            planCacheConfiguration.directPlanPath.dirname,
+                            recursive: true
+                        )
+                        let mergedDirectPlan: SwiftDriverDirectPlanManifest
+                        if executionDelegate.fs.exists(planCacheConfiguration.directPlanPath) {
+                            let existingBytes = try executionDelegate.fs.read(
+                                planCacheConfiguration.directPlanPath
+                            )
+                            let existing = try JSONDecoder().decode(
+                                SwiftDriverDirectPlanManifest.self,
+                                from: Data(existingBytes.bytes)
+                            )
+                            mergedDirectPlan = try existing.merging(directPlan)
+                        } else {
+                            mergedDirectPlan = directPlan
+                        }
+                        let encoded = try JSONEncoder().encode(mergedDirectPlan)
+                        try executionDelegate.fs.write(
+                            planCacheConfiguration.directPlanPath,
+                            contents: ByteString(encoded),
+                            atomically: true
+                        )
+                        return encoded
+                    }
                     directPlanBytes = directBytes.count
                     guard let casOptions = driverPayload.casOptions else {
                         throw StubError.error("Swift Driver plan recording requires a compilation CAS.")
@@ -705,18 +755,6 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                         }
                     } else {
                         try executionDelegate.fs.write(planCacheConfiguration.actionPath, contents: bytes, atomically: true)
-                    }
-                    try executionDelegate.fs.createDirectory(planCacheConfiguration.directPlanPath.dirname, recursive: true)
-                    if executionDelegate.fs.exists(planCacheConfiguration.directPlanPath) {
-                        guard try executionDelegate.fs.read(planCacheConfiguration.directPlanPath) == ByteString(directBytes) else {
-                            throw StubError.error("Swift Driver direct plan conflict for exact key.")
-                        }
-                    } else {
-                        try executionDelegate.fs.write(
-                            planCacheConfiguration.directPlanPath,
-                            contents: ByteString(directBytes),
-                            atomically: true
-                        )
                     }
                     #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
                     if let observation = planCacheConfiguration.dependencyObservation,
