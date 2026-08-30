@@ -1107,6 +1107,25 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             environment: experimentControlEnvironment
         )
         SwiftJobCASConfiguration.removeControlVariables(from: &environment)
+        do {
+            if let residentFrontend = try SwiftResidentFrontendProxyConfiguration.load(
+                environment: experimentControlEnvironment
+            ), let proxyCommand = residentFrontend.proxyCommand(
+                for: compilerCommandLine
+            ) {
+                compilerCommandLine = proxyCommand
+                outputDelegate.note(
+                    "SWIFT_RESIDENT_FRONTEND outcome=selected module=\(residentFrontend.moduleName)"
+                )
+            }
+        } catch {
+            outputDelegate.note(
+                "SWIFT_RESIDENT_FRONTEND outcome=invalid_configuration fallback=apple error=\(error.localizedDescription)"
+            )
+        }
+        SwiftResidentFrontendProxyConfiguration.removeControlVariable(
+            from: &environment
+        )
         let dependencyShadowConfigurationPath: Path?
         do {
             dependencyShadowConfigurationPath = try SwiftDependencyShadowConfiguration.path(
