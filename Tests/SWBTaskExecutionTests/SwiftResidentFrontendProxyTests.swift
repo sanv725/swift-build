@@ -22,6 +22,8 @@ fileprivate struct SwiftResidentFrontendProxyTests {
         let temporary = try NamedTemporaryDirectory()
         let source = temporary.path.join("Allowed.swift").str
         let evidence = temporary.path.join("evidence").str
+        let moduleCache = temporary.path.join("resident-modules").str
+        let resourceDirectory = temporary.path.join("resources").str
         let socket = temporary.path.join("daemon.sock").str
         let configurationPath = temporary.path.join("configuration.json").str
         let configuration: [String: Any] = [
@@ -30,6 +32,8 @@ fileprivate struct SwiftResidentFrontendProxyTests {
             "socket_path": socket,
             "proxy_path": "/usr/bin/true",
             "frontend_path": "/usr/bin/true",
+            "module_cache_path": moduleCache,
+            "resource_directory": resourceDirectory,
             "evidence_root": evidence,
             "module_name": "Fixture",
             "allowed_primary_sources": [source],
@@ -55,15 +59,17 @@ fileprivate struct SwiftResidentFrontendProxyTests {
             "-o", temporary.path.join("Allowed.o").str,
         ]
         let proxied = try #require(loaded.proxyCommand(for: original))
-        #expect(proxied.prefix(9) == [
+        #expect(proxied.prefix(13) == [
             "/usr/bin/true",
             "--socket", socket,
             "--frontend", "/usr/bin/true",
+            "--module-cache", moduleCache,
+            "--resource-dir", resourceDirectory,
             "--evidence-root", evidence,
             "--timeout-ms", "60000",
         ])
-        #expect(proxied[9] == "--")
-        #expect(Array(proxied.dropFirst(10)) == original)
+        #expect(proxied[13] == "--")
+        #expect(Array(proxied.dropFirst(14)) == original)
         #expect(loaded.proxyCommand(for: [
             "/toolchain/swift-frontend", "-frontend", "-c",
             "-primary-file", temporary.path.join("Unexpected.swift").str,

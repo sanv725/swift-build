@@ -14,7 +14,7 @@ import Foundation
 import SWBUtil
 
 package struct SwiftResidentFrontendProxyConfiguration: Codable, Sendable, Equatable {
-    package static let schema = "swift-build-resident-frontend-proxy-v1"
+    package static let schema = "swift-build-resident-frontend-proxy-v2"
     package static let controlEnvironmentKey =
         "SWIFT_BUILD_U02_RESIDENT_FRONTEND_CONFIG"
 
@@ -23,6 +23,8 @@ package struct SwiftResidentFrontendProxyConfiguration: Codable, Sendable, Equat
     package let socketPath: String
     package let proxyPath: String
     package let frontendPath: String
+    package let moduleCachePath: String
+    package let resourceDirectory: String
     package let evidenceRoot: String
     package let moduleName: String
     package let allowedPrimarySources: [String]
@@ -34,6 +36,8 @@ package struct SwiftResidentFrontendProxyConfiguration: Codable, Sendable, Equat
         case socketPath = "socket_path"
         case proxyPath = "proxy_path"
         case frontendPath = "frontend_path"
+        case moduleCachePath = "module_cache_path"
+        case resourceDirectory = "resource_directory"
         case evidenceRoot = "evidence_root"
         case moduleName = "module_name"
         case allowedPrimarySources = "allowed_primary_sources"
@@ -72,6 +76,8 @@ package struct SwiftResidentFrontendProxyConfiguration: Codable, Sendable, Equat
             proxyPath,
             "--socket", socketPath,
             "--frontend", frontendPath,
+            "--module-cache", moduleCachePath,
+            "--resource-dir", resourceDirectory,
             "--evidence-root", evidenceRoot,
             "--timeout-ms", String(timeoutMilliseconds),
             "--",
@@ -83,6 +89,8 @@ package struct SwiftResidentFrontendProxyConfiguration: Codable, Sendable, Equat
               Self.isAbsoluteCleanPath(socketPath),
               Self.isAbsoluteCleanPath(proxyPath),
               Self.isAbsoluteCleanPath(frontendPath),
+              Self.isAbsoluteCleanPath(moduleCachePath),
+              Self.isAbsoluteCleanPath(resourceDirectory),
               Self.isAbsoluteCleanPath(evidenceRoot),
               FileManager.default.isExecutableFile(atPath: proxyPath),
               FileManager.default.isExecutableFile(atPath: frontendPath),
