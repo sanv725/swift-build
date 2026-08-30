@@ -45,9 +45,14 @@ open class SwiftDriverJobSchedulingTaskAction: TaskAction {
      }
 
     private var state = State.initial
+    private var timelineSetupStartedNS: UInt64?
+    private var timelinePlanningFinishedNS: UInt64?
 
     public override func taskSetup(_ task: any ExecutableTask, executionDelegate: any TaskExecutionDelegate, dynamicExecutionDelegate: any DynamicTaskExecutionDelegate) {
         state.reset()
+        timelineSetupStartedNS = SwiftBuildOptPhaseTimeline.isProcessEnabled
+            ? SwiftBuildOptPhaseTimeline.now() : nil
+        timelinePlanningFinishedNS = nil
 
         // Request execution inputs and move to the `waitingForExecutionInputs` state
         if let executionInputs = task.executionInputs {
@@ -115,6 +120,9 @@ open class SwiftDriverJobSchedulingTaskAction: TaskAction {
             guard dependencyID == jobTaskIDBase - 1 else { return }
             do {
                 let plannedBuild = try graph.queryPlannedBuild(for: driverPayload.uniqueID)
+                if timelineSetupStartedNS != nil {
+                    timelinePlanningFinishedNS = SwiftBuildOptPhaseTimeline.now()
+                }
                 let primaryJobs = primaryJobs(for: plannedBuild, driverPayload: driverPayload)
                 let untrackedPrimaryJobs = untrackedPrimaryJobs(for: plannedBuild, driverPayload: driverPayload)
                 if !primaryJobs.isEmpty {
@@ -185,8 +193,28 @@ open class SwiftDriverJobSchedulingTaskAction: TaskAction {
     }
 
     public override func performTaskAction(_ task: any ExecutableTask, dynamicExecutionDelegate: any DynamicTaskExecutionDelegate, executionDelegate: any TaskExecutionDelegate, clientDelegate: any TaskExecutionClientDelegate, outputDelegate: any TaskOutputDelegate) async -> CommandResult {
+        let jobsFinishedNS = timelineSetupStartedNS == nil
+            ? nil : SwiftBuildOptPhaseTimeline.now()
+        let timelineModuleName = (task.payload as? SwiftTaskPayload)?
+            .driverPayload?.moduleName ?? "missing"
         defer {
+            if let setupStartedNS = timelineSetupStartedNS,
+               let jobsFinishedNS {
+                outputDelegate.note(SwiftBuildOptPhaseTimeline.render(
+                    event: "driver",
+                    fields: [
+                        "action_finished_ns": String(SwiftBuildOptPhaseTimeline.now()),
+                        "jobs_finished_ns": String(jobsFinishedNS),
+                        "module": timelineModuleName,
+                        "planning_finished_ns": timelinePlanningFinishedNS.map(String.init) ?? "missing",
+                        "setup_started_ns": String(setupStartedNS),
+                        "tool": type(of: self).toolIdentifier,
+                    ]
+                ))
+            }
             state.reset()
+            timelineSetupStartedNS = nil
+            timelinePlanningFinishedNS = nil
         }
 
         if case .executionError(let error) = state {

@@ -695,6 +695,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         "swift-driver-job-execution"
     }
 
+    private var timelineSetupStartedNS: UInt64?
+
     #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
     #if SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_WIDTH_2
     package static let unsafeParallelReplayMaximumParallelism = 2
@@ -926,6 +928,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
 
     public override func taskSetup(_ task: any ExecutableTask, executionDelegate: any TaskExecutionDelegate, dynamicExecutionDelegate: any DynamicTaskExecutionDelegate) {
         state.reset()
+        timelineSetupStartedNS = SwiftBuildOptPhaseTimeline.isProcessEnabled
+            ? SwiftBuildOptPhaseTimeline.now() : nil
 
         guard let payload = task.payload as? SwiftDriverJobDynamicTaskPayload else {
             fatalError("Unexpected payload type: \(type(of: task.payload)).")
@@ -1032,6 +1036,9 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
     }
 
     public override func performTaskAction(_ task: any ExecutableTask, dynamicExecutionDelegate: any DynamicTaskExecutionDelegate, executionDelegate: any TaskExecutionDelegate, clientDelegate: any TaskExecutionClientDelegate, outputDelegate: any TaskOutputDelegate) async -> CommandResult {
+
+        let taskReadyNS = timelineSetupStartedNS == nil
+            ? nil : SwiftBuildOptPhaseTimeline.now()
 
         var plannedBuild: LibSwiftDriver.PlannedBuild?
         // Explicit dependency build jobs do not update the delegate's (driver's)
@@ -1179,6 +1186,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 var executionError: String?
                 var wasSignaled: Bool = false
                 private var processStarted = false
+                private(set) var processStartedNS: UInt64?
+                private(set) var processFinishedNS: UInt64?
                 private var _commandResult: CommandResult?
                 var commandResult: CommandResult? {
                     guard processStarted else {
@@ -1197,6 +1206,9 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
 
                 func processStarted(pid: llbuild_pid_t?) {
                     processStarted = true
+                    if SwiftBuildOptPhaseTimeline.isProcessEnabled {
+                        processStartedNS = SwiftBuildOptPhaseTimeline.now()
+                    }
                     do {
                         guard let pid else {
                             // `pid` is only optional because the Windows implementation of llbuild's pid_t type is optional. This should never be nil on other platforms
@@ -1227,6 +1239,9 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 }
 
                 func processFinished(result: CommandExtendedResult) {
+                    if SwiftBuildOptPhaseTimeline.isProcessEnabled {
+                        processFinishedNS = SwiftBuildOptPhaseTimeline.now()
+                    }
                     if wasSignaled {
                         // If the process was already signaled, this might be in a reproducer creation. No need to update finish status.
                         return
@@ -1256,6 +1271,46 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             }
 
             let delegate = OutputCapturingDelegate(plannedBuild: plannedBuild, driverJob: driverJob, arguments: options.commandLine, environment: environment, outputDelegate: outputDelegate)
+            defer {
+                if let setupStartedNS = timelineSetupStartedNS,
+                   let taskReadyNS {
+                    #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+                    let interfaceFingerprint: String
+                    if delegate.commandResult == .succeeded,
+                       let rawDependencyPath = Self.uniqueArgumentValue(
+                           after: "-emit-reference-dependencies-path",
+                           in: options.commandLine
+                       ) {
+                        let dependencyPath = Path(rawDependencyPath)
+                        let absoluteDependencyPath = dependencyPath.isAbsolute
+                            ? dependencyPath : task.workingDirectory.join(dependencyPath)
+                        interfaceFingerprint = (
+                            try? SwiftDependencyFingerprintProjection.read(
+                                from: absoluteDependencyPath
+                            ).sourceFileInterfaceFingerprint
+                        ) ?? "unavailable"
+                    } else {
+                        interfaceFingerprint = "unavailable"
+                    }
+                    #else
+                    let interfaceFingerprint = "unavailable"
+                    #endif
+                    outputDelegate.note(SwiftBuildOptPhaseTimeline.render(
+                        event: "frontend-job",
+                        fields: [
+                            "action_finished_ns": String(SwiftBuildOptPhaseTimeline.now()),
+                            "interface_fingerprint": interfaceFingerprint,
+                            "module": driverJob.driverJob.moduleName,
+                            "process_finished_ns": delegate.processFinishedNS.map(String.init) ?? "missing",
+                            "process_started_ns": delegate.processStartedNS.map(String.init) ?? "missing",
+                            "rule": driverJob.driverJob.ruleInfoType,
+                            "setup_started_ns": String(setupStartedNS),
+                            "task_ready_ns": String(taskReadyNS),
+                        ]
+                    ))
+                }
+                timelineSetupStartedNS = nil
+            }
 
             let acceleratorPolicy = payload.acceleratorCachePolicy
             let cacheKeys = driverJob.driverJob.cacheKeys
