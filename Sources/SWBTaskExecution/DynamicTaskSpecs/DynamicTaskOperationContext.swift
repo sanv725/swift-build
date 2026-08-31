@@ -146,6 +146,9 @@ public final class DynamicTaskOperationContext {
     private let swiftDependencyRuntimeCoordinators = SWBMutex(
         [String: SwiftDependencyRuntimeCoordinator]()
     )
+    private let swiftModuleArtifactReuseCoordinators = SWBMutex(
+        [String: SwiftModuleArtifactReuseCoordinator]()
+    )
     #endif
     #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
     private let unsafeReplayExecutors = SWBMutex([Int: UnsafePersistentSwiftCacheReplayExecutor]())
@@ -208,6 +211,23 @@ public final class DynamicTaskOperationContext {
             return coordinator
         }
     }
+
+    package func swiftModuleArtifactReuseCoordinator(
+        configurationPath: Path,
+        fs: any FSProxy
+    ) throws -> SwiftModuleArtifactReuseCoordinator {
+        try swiftModuleArtifactReuseCoordinators.withLock { coordinators in
+            if let coordinator = coordinators[configurationPath.str] {
+                return coordinator
+            }
+            let coordinator = try SwiftModuleArtifactReuseCoordinator(
+                configurationPath: configurationPath,
+                fs: fs
+            )
+            coordinators[configurationPath.str] = coordinator
+            return coordinator
+        }
+    }
     #endif
 
     #if SWIFT_BUILD_ACCELERATOR_UNSAFE_TRUST_EXPERIMENT && SWIFT_BUILD_ACCELERATOR_UNSAFE_PARALLEL_REPLAY_EXPERIMENT
@@ -250,6 +270,7 @@ public final class DynamicTaskOperationContext {
             self.acceleratorCacheQuarantined.withLock { $0 = false }
             #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
             self.swiftDependencyRuntimeCoordinators.withLock { $0.removeAll() }
+            self.swiftModuleArtifactReuseCoordinators.withLock { $0.removeAll() }
             #endif
         }
     }

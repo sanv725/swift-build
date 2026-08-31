@@ -1145,6 +1145,18 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             )
         }
         SwiftDependencyShadowConfiguration.removeControlVariable(from: &environment)
+        let moduleArtifactReuseConfigurationPath: Path?
+        do {
+            moduleArtifactReuseConfigurationPath = try SwiftModuleArtifactReuseConfiguration.path(
+                environment: experimentControlEnvironment
+            )
+        } catch {
+            moduleArtifactReuseConfigurationPath = nil
+            outputDelegate.note(
+                "SWIFT_MODULE_REUSE outcome=invalid_configuration fallback=apple error=\(error.localizedDescription)"
+            )
+        }
+        SwiftModuleArtifactReuseConfiguration.removeControlVariable(from: &environment)
         #endif
 
         #if SWIFT_BUILD_ACCELERATOR_TRUST_CANARY
@@ -1315,6 +1327,22 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             let acceleratorPolicy = payload.acceleratorCachePolicy
             let cacheKeys = driverJob.driverJob.cacheKeys
             let plannedOutputs = driverJob.driverJob.outputs
+            #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+            var moduleArtifactReuseCoordinator: SwiftModuleArtifactReuseCoordinator?
+            if let moduleArtifactReuseConfigurationPath {
+                do {
+                    moduleArtifactReuseCoordinator = try dynamicExecutionDelegate.operationContext
+                        .swiftModuleArtifactReuseCoordinator(
+                            configurationPath: moduleArtifactReuseConfigurationPath,
+                            fs: executionDelegate.fs
+                        )
+                } catch {
+                    outputDelegate.note(
+                        "SWIFT_MODULE_REUSE outcome=invalid_configuration fallback=apple error=\(error.localizedDescription)"
+                    )
+                }
+            }
+            #endif
             let observationMode: TaskCacheObservation.Mode = switch acceleratorPolicy.mode {
             case .stock: .stock
             case .observe: .observe
@@ -1345,7 +1373,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             #if canImport(Darwin)
             var outputLeafExpectation: SwiftCacheOutputAccessPlan.LeafExpectation = .admitted
             #endif
-            let isCancellationRequested = {
+            let isCancellationRequested: @Sendable () -> Bool = {
                 _Concurrency.Task<Never, Never>.isCancelled
                     || (executionDelegate as? any TaskExecutionCancellationDelegate)?.isCancellationRequested == true
             }
@@ -2101,6 +2129,33 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             }
             #endif
 
+            #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+            if driverJob.driverJob.ruleInfoType == "EmitModule",
+               let moduleArtifactReuseCoordinator,
+               moduleArtifactReuseCoordinator.moduleName == driverJob.driverJob.moduleName {
+                switch await moduleArtifactReuseCoordinator.decision(
+                    moduleName: driverJob.driverJob.moduleName,
+                    plannedOutputs: plannedOutputs,
+                    isCancelled: isCancellationRequested
+                ) {
+                case .reuse(let outputCount, let outputBytes, let waitedNS):
+                    outputDelegate.note(
+                        "SWIFT_MODULE_REUSE outcome=hit module=\(driverJob.driverJob.moduleName) output_count=\(outputCount) output_bytes=\(outputBytes) waited_ns=\(waitedNS) process=skipped"
+                    )
+                    return .succeeded
+                case .appleFallback(let reason, let waitedNS):
+                    outputDelegate.note(
+                        "SWIFT_MODULE_REUSE outcome=miss module=\(driverJob.driverJob.moduleName) reason=\(reason) waited_ns=\(waitedNS) fallback=apple"
+                    )
+                case .cancelled(let waitedNS):
+                    outputDelegate.note(
+                        "SWIFT_MODULE_REUSE outcome=cancelled module=\(driverJob.driverJob.moduleName) waited_ns=\(waitedNS)"
+                    )
+                    return .cancelled
+                }
+            }
+            #endif
+
             let compilerTimer = ElapsedTimer()
             do {
                 try await spawn(commandLine: compilerCommandLine, environment: environment, workingDirectory: task.workingDirectory, dynamicExecutionDelegate: dynamicExecutionDelegate, clientDelegate: clientDelegate, processDelegate: delegate)
@@ -2109,6 +2164,51 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 compilerDurationNS = compilerTimer.elapsedTime().nanoseconds
                 throw error
             }
+
+            #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+            if driverJob.driverJob.ruleInfoType == "Compile",
+               let moduleArtifactReuseCoordinator,
+               let dependencyPrimaryPath,
+               moduleArtifactReuseCoordinator.accepts(
+                    primaryPath: dependencyPrimaryPath,
+                    moduleName: driverJob.driverJob.moduleName
+               ) {
+                if delegate.commandResult == .succeeded, let dependencyOutputPath {
+                    do {
+                        let projection = try SwiftDependencyFingerprintProjection.read(
+                            from: dependencyOutputPath,
+                            sourceIdentity: dependencyPrimaryPath.str
+                        )
+                        guard let fingerprint = projection.sourceFileInterfaceFingerprint else {
+                            throw StubError.error("Changed compile emitted no source interface fingerprint.")
+                        }
+                        _ = moduleArtifactReuseCoordinator.publishInterfaceFingerprint(
+                            fingerprint,
+                            primaryPath: dependencyPrimaryPath,
+                            moduleName: driverJob.driverJob.moduleName
+                        )
+                        outputDelegate.note(
+                            "SWIFT_MODULE_REUSE outcome=fingerprint_published module=\(driverJob.driverJob.moduleName) fingerprint=\(fingerprint)"
+                        )
+                    } catch {
+                        moduleArtifactReuseCoordinator.abortChangedCompile(
+                            reason: "fingerprint_unavailable",
+                            primaryPath: dependencyPrimaryPath,
+                            moduleName: driverJob.driverJob.moduleName
+                        )
+                        outputDelegate.note(
+                            "SWIFT_MODULE_REUSE outcome=fingerprint_unavailable module=\(driverJob.driverJob.moduleName) fallback=apple error=\(error.localizedDescription)"
+                        )
+                    }
+                } else {
+                    moduleArtifactReuseCoordinator.abortChangedCompile(
+                        reason: "changed_compile_failed",
+                        primaryPath: dependencyPrimaryPath,
+                        moduleName: driverJob.driverJob.moduleName
+                    )
+                }
+            }
+            #endif
 
             if delegate.commandResult == .succeeded, let shadowManifest {
                 finalDisposition = .verifiedThenExecuted
