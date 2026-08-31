@@ -1437,6 +1437,21 @@ final class OperationDelegate: BuildOperationDelegate {
     }
 
     func taskComplete(_ operation: any BuildSystemOperation, taskIdentifier: TaskIdentifier, task: any ExecutableTask, delegate taskDelegate: any TaskOutputDelegate) {
+        let traceSwiftDriverCompletion = SwiftBuildOptPhaseTimeline.isProcessEnabled
+            && task.action is SwiftDriverJobSchedulingTaskAction
+        func traceCompletionPhase(_ phase: String) {
+            guard traceSwiftDriverCompletion else { return }
+            request.send(BuildOperationConsoleOutputEmitted(data: Array((
+                SwiftBuildOptPhaseTimeline.render(
+                    event: "service-driver-completion",
+                    fields: [
+                        "phase": phase,
+                        "timestamp_ns": String(SwiftBuildOptPhaseTimeline.now()),
+                    ]
+                ) + "\n"
+            ).utf8)))
+        }
+        traceCompletionPhase("entered")
         acceleratorTraceWriter?.cacheObservations(taskIdentifier: taskIdentifier, task: task, observations: taskDelegate.cacheObservations)
         if let delegate = taskDelegate as? TaskOutputHandler {
             let status = BuildOperationTaskEnded.Status(taskResult: delegate.result)
@@ -1482,7 +1497,9 @@ final class OperationDelegate: BuildOperationDelegate {
         let taskID = activeTasks.remove(task)
 
         // Make sure the task output collector has finished processing the output.
+        traceCompletionPhase("output-processing-started")
         delegate.handleTaskCompletion()
+        traceCompletionPhase("output-processing-finished")
 
         // Finally, send the task-did-end message.
         //
@@ -1519,7 +1536,9 @@ final class OperationDelegate: BuildOperationDelegate {
             self.aggregatedTaskCounters[task.ruleInfo[0], default: [:]].merge(delegate.taskCounters) { (a, b) in a+b }
         }
 
+        traceCompletionPhase("task-ended-send-started")
         request.send(BuildOperationTaskEnded(id: taskID, signature: .taskIdentifier(ByteString(encodingAsUTF8: taskIdentifier.rawValue)), status: status, signalled: status == .cancelled, metrics: metrics))
+        traceCompletionPhase("task-ended-send-finished")
     }
 
     func beginActivity(_ operation: any BuildSystemOperation, ruleInfo: String, executionDescription: String, signature: ByteString, target: ConfiguredTarget?, parentActivity: ActivityID?) -> ActivityID {
