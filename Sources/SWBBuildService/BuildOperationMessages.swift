@@ -1106,6 +1106,9 @@ final class OperationDelegate: BuildOperationDelegate {
     var aggregatedCounters: [BuildOperationMetrics.Counter: Int] = [:]
     var aggregatedTaskCounters: [String: [BuildOperationMetrics.TaskCounter: Int]] = [:]
 
+    /// Timeline-only IDs cover hidden as well as user-visible executed tasks.
+    private let timelineActiveTasks = ObjectIDMapping<any ExecutableTask>()
+
     /// The IDs assigned to each distinct CAS configuration seen during this build.
     private let casOptionsIDs = SWBMutex<[CASOptionsPayload: Int]>([:])
 
@@ -1355,6 +1358,23 @@ final class OperationDelegate: BuildOperationDelegate {
     func taskStarted(_ operation: any BuildSystemOperation, taskIdentifier: TaskIdentifier, task: any ExecutableTask, dependencyInfo: CommandLineDependencyInfo?) -> any TaskOutputDelegate {
         acceleratorTraceWriter?.taskStarted(taskIdentifier: taskIdentifier, task: task)
 
+        if SwiftBuildOptPhaseTimeline.isProcessEnabled {
+            assert(timelineActiveTasks.lookup(task) == nil)
+            let timelineTaskID = timelineActiveTasks.insert(task)
+            request.send(BuildOperationConsoleOutputEmitted(data: Array((
+                SwiftBuildOptPhaseTimeline.render(
+                    event: "service-task-all",
+                    fields: [
+                        "phase": "started",
+                        "rule": task.ruleInfo.first ?? "missing",
+                        "task_id": String(timelineTaskID),
+                        "timestamp_ns": String(SwiftBuildOptPhaseTimeline.now()),
+                        "visible": task.showInLog ? "true" : "false",
+                    ]
+                ) + "\n"
+            ).utf8)))
+        }
+
         guard !skipCommandLevelInformation else {
             return DiscardingTaskOutputHandler()
         }
@@ -1391,22 +1411,6 @@ final class OperationDelegate: BuildOperationDelegate {
         let info = BuildOperationTaskInfo(taskName: taskSpec?.name ?? "", signature: .taskIdentifier(ByteString(encodingAsUTF8: task.identifier.rawValue)), ruleInfo: task.ruleInfo.quotedDescription, executionDescription: (task.execDescription ?? task.ruleInfo.quotedDescription), commandLineDisplayString: task.showCommandLineInLog ? commandLineDisplayString(task.commandLine.map(\.asByteString), additionalOutput: task.additionalOutput, workingDirectory: task.workingDirectory, environment: environmentToShow, dependencyInfo: dependencyInfo, hostOS: workspaceContext.core.hostOperatingSystem) : nil, interestingPath: interestingPath, serializedDiagnosticsPaths: serializedDiagnosticsPaths)
 
         request.send(BuildOperationTaskStarted(id: taskID, targetID: targetID, parentID: nil, info: info))
-        if SwiftBuildOptPhaseTimeline.isProcessEnabled {
-            request.send(BuildOperationConsoleOutputEmitted(
-                data: Array((SwiftBuildOptPhaseTimeline.render(
-                    event: "service-task",
-                    fields: [
-                        "phase": "started",
-                        "rule": task.ruleInfo.first ?? "missing",
-                        "task_id": String(taskID),
-                        "timestamp_ns": String(SwiftBuildOptPhaseTimeline.now()),
-                    ]
-                ) + "\n").utf8),
-                taskID: taskID,
-                taskSignature: .taskIdentifier(ByteString(encodingAsUTF8: taskIdentifier.rawValue))
-            ))
-        }
-
         // Create the output parser, if used.
         //
         // FIXME: Does this really belong at this layer, versus one layer below in the build system? It feels integral to the build, not the reporting of it.
@@ -1440,6 +1444,25 @@ final class OperationDelegate: BuildOperationDelegate {
         } else if let delegate = taskDelegate as? DiscardingTaskOutputHandler {
             let status = BuildOperationTaskEnded.Status(taskResult: delegate.result)
             acceleratorTraceWriter?.taskFinished(taskIdentifier: taskIdentifier, task: task, status: status, result: delegate.result, duration: delegate.timer.elapsedTime())
+        }
+
+        if SwiftBuildOptPhaseTimeline.isProcessEnabled {
+            assert(timelineActiveTasks.lookup(task) != nil)
+            let timelineTaskID = timelineActiveTasks.remove(task)
+            let status = BuildOperationTaskEnded.Status(taskResult: taskDelegate.result)
+            request.send(BuildOperationConsoleOutputEmitted(data: Array((
+                SwiftBuildOptPhaseTimeline.render(
+                    event: "service-task-all",
+                    fields: [
+                        "phase": "finished",
+                        "rule": task.ruleInfo.first ?? "missing",
+                        "status": String(describing: status),
+                        "task_id": String(timelineTaskID),
+                        "timestamp_ns": String(SwiftBuildOptPhaseTimeline.now()),
+                        "visible": task.showInLog ? "true" : "false",
+                    ]
+                ) + "\n"
+            ).utf8)))
         }
 
         guard !skipCommandLevelInformation else { return }
@@ -1496,22 +1519,6 @@ final class OperationDelegate: BuildOperationDelegate {
             self.aggregatedTaskCounters[task.ruleInfo[0], default: [:]].merge(delegate.taskCounters) { (a, b) in a+b }
         }
 
-        if SwiftBuildOptPhaseTimeline.isProcessEnabled {
-            request.send(BuildOperationConsoleOutputEmitted(
-                data: Array((SwiftBuildOptPhaseTimeline.render(
-                    event: "service-task",
-                    fields: [
-                        "phase": "finished",
-                        "rule": task.ruleInfo.first ?? "missing",
-                        "status": String(describing: status),
-                        "task_id": String(taskID),
-                        "timestamp_ns": String(SwiftBuildOptPhaseTimeline.now()),
-                    ]
-                ) + "\n").utf8),
-                taskID: taskID,
-                taskSignature: .taskIdentifier(ByteString(encodingAsUTF8: taskIdentifier.rawValue))
-            ))
-        }
         request.send(BuildOperationTaskEnded(id: taskID, signature: .taskIdentifier(ByteString(encodingAsUTF8: taskIdentifier.rawValue)), status: status, signalled: status == .cancelled, metrics: metrics))
     }
 
