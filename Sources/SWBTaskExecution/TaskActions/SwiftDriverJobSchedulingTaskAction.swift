@@ -335,8 +335,12 @@ open class SwiftDriverJobSchedulingTaskAction: TaskAction {
                 }
             }
             #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+            let experimentControlEnvironment = ProcessInfo.processInfo.environment.merging(
+                task.environment.bindingsDictionary,
+                uniquingKeysWith: { _, taskValue in taskValue }
+            )
             if let planRoot = SwiftDriverAggregateDependencyReporting.planRoot(
-                environment: task.environment.bindingsDictionary
+                environment: experimentControlEnvironment
             ) {
                 dynamicExecutionDelegate.discoveredDependencyDirectoryTree(
                     Path(planRoot)
