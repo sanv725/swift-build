@@ -26,6 +26,60 @@ private enum SwiftDriverPlanCacheMode: String {
     var canWrite: Bool { self == .record || self == .readWrite }
 }
 
+package enum SwiftDriverPlanCacheKeyScope: String, Sendable {
+    case legacy
+    case driver
+
+    package func actionKey(baseKey: String, driverIdentity: String) -> String {
+        guard self == .driver else { return baseKey }
+        let context = SHA256Context()
+        for field in ["swift-driver-plan-cache-driver-key-v1", baseKey, driverIdentity] {
+            let bytes = Array(field.utf8)
+            context.add(number: UInt64(bytes.count))
+            context.add(bytes: bytes)
+        }
+        return context.signature.asString
+    }
+}
+
+package func swiftDriverPlanCacheScopeIdentity(
+    moduleName: String, outputPrefix: String, variant: String,
+    architecture: String, ruleInfo: [String], commandLine: [String]
+) -> String {
+    let context = SHA256Context()
+    for field in [
+        "swift-driver-plan-cache-scope-identity-v1",
+        moduleName, outputPrefix, variant, architecture,
+    ] + ruleInfo + commandLine {
+        let bytes = Array(field.utf8)
+        context.add(number: UInt64(bytes.count))
+        context.add(bytes: bytes)
+    }
+    return context.signature.asString
+}
+
+package struct SwiftDriverPlanLiveCASReference: Codable, Sendable, Equatable {
+    package static let currentSchema = "swift-driver-plan-live-cas-reference-v1"
+
+    package let schema: String
+    package let actionKey: String
+    package let casPath: String
+
+    package init(actionKey: String, casPath: String) {
+        self.schema = Self.currentSchema
+        self.actionKey = actionKey
+        self.casPath = casPath
+    }
+
+    package func validate(actionKey: String, casPath: String) throws {
+        guard schema == Self.currentSchema,
+              self.actionKey == actionKey,
+              self.casPath == casPath else {
+            throw StubError.error("Live Swift Driver planning CAS identity changed.")
+        }
+    }
+}
+
 #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
 private struct SwiftDriverDependencyPlanObservationConfiguration {
     static let modeVariable = "SWIFT_BUILD_DRIVER_PLAN_COMPATIBILITY_MODE"
@@ -73,10 +127,15 @@ private struct SwiftDriverPlanCacheConfiguration {
     static let rootVariable = "SWIFT_BUILD_DRIVER_PLAN_CACHE_ROOT"
     static let modeVariable = "SWIFT_BUILD_DRIVER_PLAN_CACHE_MODE"
     static let keyVariable = "SWIFT_BUILD_DRIVER_PLAN_CACHE_KEY"
+    static let keyScopeVariable = "SWIFT_BUILD_DRIVER_PLAN_CACHE_KEY_SCOPE"
+    static let liveCASVariable = "SWIFT_BUILD_DRIVER_PLAN_CACHE_LIVE_CAS"
 
     let root: Path
     let mode: SwiftDriverPlanCacheMode
-    let key: String
+    var key: String
+    let baseKey: String
+    let keyScope: SwiftDriverPlanCacheKeyScope
+    let useLiveCAS: Bool
     #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
     let dependencyObservation: SwiftDriverDependencyPlanObservationConfiguration?
     #endif
@@ -99,14 +158,37 @@ private struct SwiftDriverPlanCacheConfiguration {
               key.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
             throw StubError.error("\(Self.keyVariable) must be a lowercase SHA-256 digest.")
         }
+        guard let keyScope = SwiftDriverPlanCacheKeyScope(
+            rawValue: environment[Self.keyScopeVariable] ?? "legacy"
+        ) else {
+            throw StubError.error("\(Self.keyScopeVariable) must be legacy or driver.")
+        }
+        let useLiveCAS: Bool
+        switch environment[Self.liveCASVariable] ?? "0" {
+        case "0": useLiveCAS = false
+        case "1": useLiveCAS = true
+        default:
+            throw StubError.error("\(Self.liveCASVariable) must be 0 or 1.")
+        }
         self.root = root
         self.mode = mode
         self.key = key
+        self.baseKey = key
+        self.keyScope = keyScope
+        self.useLiveCAS = useLiveCAS
         #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
         self.dependencyObservation = try SwiftDriverDependencyPlanObservationConfiguration(
             environment: environment
         )
         #endif
+    }
+
+    func scoped(to driverIdentity: String) -> Self {
+        var scoped = self
+        scoped.key = keyScope.actionKey(
+            baseKey: baseKey, driverIdentity: driverIdentity
+        )
+        return scoped
     }
 
     var actionPath: Path {
@@ -119,6 +201,10 @@ private struct SwiftDriverPlanCacheConfiguration {
 
     var directPlanPath: Path {
         root.join("direct").join(String(key.prefix(2))).join("\(key).json")
+    }
+
+    var liveCASReferencePath: Path {
+        root.join("live-cas").join(String(key.prefix(2))).join("\(key).json")
     }
 
     func actionPath(for actionKey: String) -> Path {
@@ -151,6 +237,60 @@ private struct SwiftDriverPlanCacheConfiguration {
         defer { try? fileManager.removeItem(atPath: temporary.str) }
         try fileManager.copyItem(atPath: source.str, toPath: temporary.str)
         try fileManager.moveItem(atPath: temporary.str, toPath: casSnapshotPath.str)
+    }
+
+    func publishLiveCASReference(to source: Path) throws {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: source.str) else {
+            throw StubError.error("Live Swift Driver planning CAS is missing.")
+        }
+        let reference = SwiftDriverPlanLiveCASReference(
+            actionKey: key, casPath: source.str
+        )
+        let encoded = try JSONEncoder().encode(reference)
+        try fileManager.createDirectory(
+            atPath: liveCASReferencePath.dirname.str,
+            withIntermediateDirectories: true
+        )
+        if fileManager.fileExists(atPath: liveCASReferencePath.str) {
+            let existing = try Data(contentsOf: URL(fileURLWithPath: liveCASReferencePath.str))
+            guard existing == encoded else {
+                throw StubError.error("Live Swift Driver planning CAS reference conflict.")
+            }
+            return
+        }
+        let temporary = liveCASReferencePath.dirname.join(
+            ".\(key).tmp-\(UUID().uuidString)"
+        )
+        defer { try? fileManager.removeItem(atPath: temporary.str) }
+        try encoded.write(
+            to: URL(fileURLWithPath: temporary.str), options: .atomic
+        )
+        do {
+            try fileManager.moveItem(
+                atPath: temporary.str, toPath: liveCASReferencePath.str
+            )
+        } catch {
+            if fileManager.fileExists(atPath: liveCASReferencePath.str),
+               try Data(contentsOf: URL(fileURLWithPath: liveCASReferencePath.str))
+                    == encoded {
+                return
+            }
+            throw error
+        }
+    }
+
+    func validateLiveCASReference(at source: Path) throws {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: source.str),
+              fileManager.fileExists(atPath: liveCASReferencePath.str) else {
+            throw StubError.error("Live Swift Driver planning CAS is unavailable.")
+        }
+        let data = try Data(contentsOf: URL(fileURLWithPath: liveCASReferencePath.str))
+        let reference = try JSONDecoder().decode(
+            SwiftDriverPlanLiveCASReference.self, from: data
+        )
+        try reference.validate(actionKey: key, casPath: source.str)
     }
 
     func restoreCASSnapshot(to destination: Path, actionKey: String? = nil) throws {
@@ -379,6 +519,18 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                 planCacheOutcome = "invalid_configuration"
                 outputDelegate.note("SWIFT_DRIVER_PLAN_CACHE outcome=invalid_configuration fallback=apple error=\(error.localizedDescription)")
             }
+            if let configuration = planCacheConfiguration {
+                planCacheConfiguration = configuration.scoped(
+                    to: swiftDriverPlanCacheScopeIdentity(
+                        moduleName: driverPayload.moduleName,
+                        outputPrefix: driverPayload.outputPrefix,
+                        variant: driverPayload.variant,
+                        architecture: driverPayload.architecture,
+                        ruleInfo: driverPayload.ruleInfo,
+                        commandLine: driverPayload.commandLine
+                    )
+                )
+            }
             #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
             do {
                 if let configurationPath = try SwiftDependencyShadowConfiguration.path(
@@ -431,7 +583,15 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                         guard let casOptions = driverPayload.casOptions else {
                             throw StubError.error("Swift Driver plan replay requires a compilation CAS.")
                         }
-                        try planCacheConfiguration.restoreCASSnapshot(to: casOptions.casPath)
+                        if planCacheConfiguration.useLiveCAS {
+                            try planCacheConfiguration.validateLiveCASReference(
+                                at: casOptions.casPath
+                            )
+                        } else {
+                            try planCacheConfiguration.restoreCASSnapshot(
+                                to: casOptions.casPath
+                            )
+                        }
                         let bytes = try executionDelegate.fs.read(planCacheConfiguration.actionPath)
                         planCacheBytes = bytes.count
                         let snapshot: SwiftDriverPlanCacheSnapshot = try MsgPackDeserializer.deserialize(bytes)
@@ -747,7 +907,15 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                     guard let casOptions = driverPayload.casOptions else {
                         throw StubError.error("Swift Driver plan recording requires a compilation CAS.")
                     }
-                    try planCacheConfiguration.publishCASSnapshot(from: casOptions.casPath)
+                    if planCacheConfiguration.useLiveCAS {
+                        try planCacheConfiguration.publishLiveCASReference(
+                            to: casOptions.casPath
+                        )
+                    } else {
+                        try planCacheConfiguration.publishCASSnapshot(
+                            from: casOptions.casPath
+                        )
+                    }
                     try executionDelegate.fs.createDirectory(planCacheConfiguration.actionPath.dirname, recursive: true)
                     if executionDelegate.fs.exists(planCacheConfiguration.actionPath) {
                         guard try executionDelegate.fs.read(planCacheConfiguration.actionPath) == bytes else {
@@ -808,7 +976,7 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
             }
             if planCacheConfiguration != nil {
                 outputDelegate.note(
-                    "SWIFT_DRIVER_PLAN_CACHE outcome=\(planCacheOutcome) key=\(planCacheConfiguration?.key ?? "none") bytes=\(planCacheBytes) direct_plan_bytes=\(directPlanBytes) duration_ns=\(planCacheTimer.elapsedTime().nanoseconds) read_ns=\(planCacheReadDurationNS) apple_plan_ns=\(planCachePlanDurationNS) write_ns=\(planCacheWriteDurationNS)"
+                    "SWIFT_DRIVER_PLAN_CACHE outcome=\(planCacheOutcome) key=\(planCacheConfiguration?.key ?? "none") base_key=\(planCacheConfiguration?.baseKey ?? "none") key_scope=\(planCacheConfiguration?.keyScope.rawValue ?? "none") cas_mode=\(planCacheConfiguration?.useLiveCAS == true ? "live" : "snapshot") bytes=\(planCacheBytes) direct_plan_bytes=\(directPlanBytes) duration_ns=\(planCacheTimer.elapsedTime().nanoseconds) read_ns=\(planCacheReadDurationNS) apple_plan_ns=\(planCachePlanDurationNS) write_ns=\(planCacheWriteDurationNS)"
                 )
                 #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
                 if planCacheConfiguration?.dependencyObservation != nil
