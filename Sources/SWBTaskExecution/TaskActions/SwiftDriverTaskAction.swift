@@ -129,6 +129,8 @@ private struct SwiftDriverPlanCacheConfiguration {
     static let keyVariable = "SWIFT_BUILD_DRIVER_PLAN_CACHE_KEY"
     static let keyScopeVariable = "SWIFT_BUILD_DRIVER_PLAN_CACHE_KEY_SCOPE"
     static let liveCASVariable = "SWIFT_BUILD_DRIVER_PLAN_CACHE_LIVE_CAS"
+    static let invalidateSourceVariable =
+        "SWIFT_BUILD_DRIVER_PLAN_CACHE_INVALIDATE_SOURCE"
 
     let root: Path
     let mode: SwiftDriverPlanCacheMode
@@ -136,6 +138,7 @@ private struct SwiftDriverPlanCacheConfiguration {
     let baseKey: String
     let keyScope: SwiftDriverPlanCacheKeyScope
     let useLiveCAS: Bool
+    let invalidateSource: Path?
     #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
     let dependencyObservation: SwiftDriverDependencyPlanObservationConfiguration?
     #endif
@@ -170,12 +173,25 @@ private struct SwiftDriverPlanCacheConfiguration {
         default:
             throw StubError.error("\(Self.liveCASVariable) must be 0 or 1.")
         }
+        let invalidateSource: Path?
+        if let rawSource = environment[Self.invalidateSourceVariable] {
+            let source = Path(rawSource)
+            guard source.isAbsolute else {
+                throw StubError.error(
+                    "\(Self.invalidateSourceVariable) must be absolute."
+                )
+            }
+            invalidateSource = source
+        } else {
+            invalidateSource = nil
+        }
         self.root = root
         self.mode = mode
         self.key = key
         self.baseKey = key
         self.keyScope = keyScope
         self.useLiveCAS = useLiveCAS
+        self.invalidateSource = invalidateSource
         #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
         self.dependencyObservation = try SwiftDriverDependencyPlanObservationConfiguration(
             environment: environment
@@ -499,6 +515,7 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
             var planCacheWriteDurationNS: UInt64 = 0
             var planCacheBytes = 0
             var directPlanBytes = 0
+            var planCacheInvalidatedJobCount = 0
             #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
             var dependencyObservationManifest: SwiftDependencyModuleManifest?
             var dependencyObservationOutcome = "off"
@@ -594,7 +611,19 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                         }
                         let bytes = try executionDelegate.fs.read(planCacheConfiguration.actionPath)
                         planCacheBytes = bytes.count
-                        let snapshot: SwiftDriverPlanCacheSnapshot = try MsgPackDeserializer.deserialize(bytes)
+                        var snapshot: SwiftDriverPlanCacheSnapshot = try MsgPackDeserializer.deserialize(bytes)
+                        if let source = planCacheConfiguration.invalidateSource {
+                            let invalidation = snapshot.invalidatingCompilationCacheKeys(
+                                for: source
+                            )
+                            guard invalidation.invalidatedJobCount == 1 else {
+                                throw StubError.error(
+                                    "Cached plan expected exactly one changed source job, found \(invalidation.invalidatedJobCount)."
+                                )
+                            }
+                            snapshot = invalidation.snapshot
+                            planCacheInvalidatedJobCount = invalidation.invalidatedJobCount
+                        }
                         try dependencyGraph.installCachedPlan(
                             key: driverPayload.uniqueID,
                             compilerLocation: driverPayload.compilerLocation,
@@ -976,7 +1005,7 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
             }
             if planCacheConfiguration != nil {
                 outputDelegate.note(
-                    "SWIFT_DRIVER_PLAN_CACHE outcome=\(planCacheOutcome) key=\(planCacheConfiguration?.key ?? "none") base_key=\(planCacheConfiguration?.baseKey ?? "none") key_scope=\(planCacheConfiguration?.keyScope.rawValue ?? "none") cas_mode=\(planCacheConfiguration?.useLiveCAS == true ? "live" : "snapshot") bytes=\(planCacheBytes) direct_plan_bytes=\(directPlanBytes) duration_ns=\(planCacheTimer.elapsedTime().nanoseconds) read_ns=\(planCacheReadDurationNS) apple_plan_ns=\(planCachePlanDurationNS) write_ns=\(planCacheWriteDurationNS)"
+                    "SWIFT_DRIVER_PLAN_CACHE outcome=\(planCacheOutcome) key=\(planCacheConfiguration?.key ?? "none") base_key=\(planCacheConfiguration?.baseKey ?? "none") key_scope=\(planCacheConfiguration?.keyScope.rawValue ?? "none") cas_mode=\(planCacheConfiguration?.useLiveCAS == true ? "live" : "snapshot") invalidated_jobs=\(planCacheInvalidatedJobCount) bytes=\(planCacheBytes) direct_plan_bytes=\(directPlanBytes) duration_ns=\(planCacheTimer.elapsedTime().nanoseconds) read_ns=\(planCacheReadDurationNS) apple_plan_ns=\(planCachePlanDurationNS) write_ns=\(planCacheWriteDurationNS)"
                 )
                 #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
                 if planCacheConfiguration?.dependencyObservation != nil

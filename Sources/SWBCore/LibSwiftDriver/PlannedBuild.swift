@@ -89,6 +89,37 @@ public struct SwiftDriverJob: Serializable, CustomDebugStringConvertible {
     /// Cache keys for the swift-frontend invocation (one key per output producing input)
     public let cacheKeys: [String]
 
+    #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+    private init(
+        kind: Kind, ruleInfoType: String, moduleName: String, inputs: [Path],
+        displayInputs: [Path], descriptionForLifecycle: String, outputs: [Path],
+        cacheOutputKindGroups: [[String]], commandLine: [SWBUtil.ByteString],
+        commandLineSignature: SWBUtil.ByteString, cacheKeys: [String]
+    ) {
+        self.kind = kind
+        self.ruleInfoType = ruleInfoType
+        self.moduleName = moduleName
+        self.inputs = inputs
+        self.displayInputs = displayInputs
+        self.descriptionForLifecycle = descriptionForLifecycle
+        self.outputs = outputs
+        self.cacheOutputKindGroups = cacheOutputKindGroups
+        self.commandLine = commandLine
+        self.commandLineSignature = commandLineSignature
+        self.cacheKeys = cacheKeys
+    }
+
+    public func invalidatingCompilationCacheKeys() -> Self {
+        Self(
+            kind: kind, ruleInfoType: ruleInfoType, moduleName: moduleName,
+            inputs: inputs, displayInputs: displayInputs,
+            descriptionForLifecycle: descriptionForLifecycle, outputs: outputs,
+            cacheOutputKindGroups: [], commandLine: commandLine,
+            commandLineSignature: commandLineSignature, cacheKeys: []
+        )
+    }
+    #endif
+
     fileprivate init(job: SwiftDriver.Job, resolver: ArgsResolver, explicitModulesResolver: ArgsResolver) throws {
         let categorizer = SwiftDriverJobCategorizer(job)
         self.ruleInfoType = categorizer.ruleInfoType()
@@ -240,6 +271,17 @@ extension LibSwiftDriver {
                 PlannedSwiftDriverJob(key: key, driverJob: driverJob, dependencies: dependencies + newDependencies, workingDirectory: workingDirectory)
             }
 
+            #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+            fileprivate func invalidatingCompilationCacheKeys() -> Self {
+                Self(
+                    key: key,
+                    driverJob: driverJob.invalidatingCompilationCacheKeys(),
+                    dependencies: dependencies,
+                    workingDirectory: workingDirectory
+                )
+            }
+            #endif
+
             public var description: String {
                 driverJob.descriptionForLifecycle
             }
@@ -285,6 +327,52 @@ extension LibSwiftDriver {
                 self.afterCompilationIndices = plannedBuild.afterCompilationIndices
                 self.verificationIndices = plannedBuild.verificationIndices
                 self.workingDirectory = plannedBuild.workingDirectory
+            }
+
+            private init(
+                plannedTargetJobs: [PlannedSwiftDriverJob],
+                producerMap: [Path: JobKey],
+                explicitModuleBuildJobKeys: Set<JobKey>,
+                compilationRequirementsIndices: Range<JobIndex>,
+                compilationIndices: Range<JobIndex>,
+                afterCompilationIndices: Range<JobIndex>,
+                verificationIndices: Range<JobIndex>,
+                workingDirectory: Path
+            ) {
+                self.plannedTargetJobs = plannedTargetJobs
+                self.producerMap = producerMap
+                self.explicitModuleBuildJobKeys = explicitModuleBuildJobKeys
+                self.compilationRequirementsIndices = compilationRequirementsIndices
+                self.compilationIndices = compilationIndices
+                self.afterCompilationIndices = afterCompilationIndices
+                self.verificationIndices = verificationIndices
+                self.workingDirectory = workingDirectory
+            }
+
+            public func invalidatingCompilationCacheKeys(
+                for source: Path
+            ) -> (snapshot: Self, invalidatedJobCount: Int) {
+                var invalidatedJobCount = 0
+                let jobs = plannedTargetJobs.map { job in
+                    guard job.driverJob.ruleInfoType == "Compile",
+                          job.driverJob.inputs.contains(source) else {
+                        return job
+                    }
+                    invalidatedJobCount += 1
+                    return job.invalidatingCompilationCacheKeys()
+                }
+                return (
+                    Self(
+                        plannedTargetJobs: jobs, producerMap: producerMap,
+                        explicitModuleBuildJobKeys: explicitModuleBuildJobKeys,
+                        compilationRequirementsIndices: compilationRequirementsIndices,
+                        compilationIndices: compilationIndices,
+                        afterCompilationIndices: afterCompilationIndices,
+                        verificationIndices: verificationIndices,
+                        workingDirectory: workingDirectory
+                    ),
+                    invalidatedJobCount
+                )
             }
 
             public func serialize<T>(to serializer: T) where T: Serializer {

@@ -74,6 +74,22 @@ public struct SwiftDriverPlanCacheSnapshot: Serializable {
         self.transitiveDependencyModuleNames = transitiveDependencyModuleNames
     }
 
+    public func invalidatingCompilationCacheKeys(
+        for source: Path
+    ) -> (snapshot: Self, invalidatedJobCount: Int) {
+        let result = plannedBuild.invalidatingCompilationCacheKeys(for: source)
+        return (
+            Self(
+                plannedBuild: result.snapshot,
+                explicitModuleJobs: explicitModuleJobs,
+                swiftmodulesNeedingRegistration: swiftmodulesNeedingRegistration,
+                planningDependencies: planningDependencies,
+                transitiveDependencyModuleNames: transitiveDependencyModuleNames
+            ),
+            result.invalidatedJobCount
+        )
+    }
+
     public func serialize<T>(to serializer: T) where T: Serializer {
         serializer.serializeAggregate(6) {
             serializer.serialize(schemaVersion)
