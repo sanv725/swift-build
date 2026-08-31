@@ -197,6 +197,13 @@ open class SwiftDriverJobSchedulingTaskAction: TaskAction {
             ? nil : SwiftBuildOptPhaseTimeline.now()
         let timelineModuleName = (task.payload as? SwiftTaskPayload)?
             .driverPayload?.moduleName ?? "missing"
+        var timelinePlannedBuildQueriedNS: UInt64?
+        var timelineSkippedJobsReportedNS: UInt64?
+        var timelinePlanningDependenciesQueriedNS: UInt64?
+        var timelineDependencyVerificationFinishedNS: UInt64?
+        var timelineDiscoveryFinishedNS: UInt64?
+        var timelinePlanningDependencyCount = 0
+        var timelineDiscoveredDependencyCount = 0
         defer {
             if let setupStartedNS = timelineSetupStartedNS,
                let jobsFinishedNS {
@@ -204,9 +211,16 @@ open class SwiftDriverJobSchedulingTaskAction: TaskAction {
                     event: "driver",
                     fields: [
                         "action_finished_ns": String(SwiftBuildOptPhaseTimeline.now()),
+                        "dependency_count": String(timelinePlanningDependencyCount),
+                        "dependency_discovery_finished_ns": timelineDiscoveryFinishedNS.map(String.init) ?? "missing",
+                        "dependency_verification_finished_ns": timelineDependencyVerificationFinishedNS.map(String.init) ?? "missing",
+                        "discovered_dependency_count": String(timelineDiscoveredDependencyCount),
                         "jobs_finished_ns": String(jobsFinishedNS),
                         "module": timelineModuleName,
+                        "planned_build_queried_ns": timelinePlannedBuildQueriedNS.map(String.init) ?? "missing",
+                        "planning_dependencies_queried_ns": timelinePlanningDependenciesQueriedNS.map(String.init) ?? "missing",
                         "planning_finished_ns": timelinePlanningFinishedNS.map(String.init) ?? "missing",
+                        "skipped_jobs_reported_ns": timelineSkippedJobsReportedNS.map(String.init) ?? "missing",
                         "setup_started_ns": String(setupStartedNS),
                         "tool": type(of: self).toolIdentifier,
                     ]
@@ -235,6 +249,9 @@ open class SwiftDriverJobSchedulingTaskAction: TaskAction {
         let graph = dynamicExecutionDelegate.operationContext.swiftModuleDependencyGraph
         do {
             let plannedBuild = try graph.queryPlannedBuild(for: driverPayload.uniqueID)
+            if timelineSetupStartedNS != nil {
+                timelinePlannedBuildQueriedNS = SwiftBuildOptPhaseTimeline.now()
+            }
             guard case .requestingDriverJobs(primaryJobsTaskIDs: let primaryJobsTaskIDs, secondaryJobTaskIDs: let secondaryJobTaskIDs, discoveredJobTaskIDs: let discoveredJobTaskIDs, jobTaskIDBase: let jobTaskIDBase) = state else {
                 throw StubError.error("Finished job execution in unexpected state: \(state)")
             }
@@ -248,8 +265,15 @@ open class SwiftDriverJobSchedulingTaskAction: TaskAction {
             if shouldReportSkippedJobs(driverPayload: driverPayload) {
                 try reportSkippedJobs(task, outputDelegate: outputDelegate, driverPayload: driverPayload, plannedBuild: plannedBuild, dynamicExecutionDelegate: dynamicExecutionDelegate)
             }
+            if timelineSetupStartedNS != nil {
+                timelineSkippedJobsReportedNS = SwiftBuildOptPhaseTimeline.now()
+            }
 
             let planningDependencies = try graph.queryPlanningDependencies(for: driverPayload.uniqueID)
+            timelinePlanningDependencyCount = planningDependencies.count
+            if timelineSetupStartedNS != nil {
+                timelinePlanningDependenciesQueriedNS = SwiftBuildOptPhaseTimeline.now()
+            }
             if executionDelegate.userPreferences.enableDebugActivityLogs {
                 outputDelegate.emitOutput(ByteString(encodingAsUTF8: "Discovered dependency nodes:\n" + planningDependencies.joined(separator: "\n") + "\n"))
             }
@@ -264,6 +288,9 @@ open class SwiftDriverJobSchedulingTaskAction: TaskAction {
                     }
                 }
             }
+            if timelineSetupStartedNS != nil {
+                timelineDependencyVerificationFinishedNS = SwiftBuildOptPhaseTimeline.now()
+            }
 
             let dependencyFilteringRootPathString = driverPayload.dependencyFilteringRootPath?.str
             for dep in planningDependencies {
@@ -271,10 +298,15 @@ open class SwiftDriverJobSchedulingTaskAction: TaskAction {
                     // We intentionally do a prefix check instead of an ancestor check here, for performance reasons. The filtering path (SDK path) and paths returned by the compiler are guaranteed to be normalized, which makes this safe.
                     if !dep.hasPrefix(dependencyFilteringRootPathString) {
                         dynamicExecutionDelegate.discoveredDependencyNode(ExecutionNode(identifier: dep))
+                        timelineDiscoveredDependencyCount += 1
                     }
                 } else {
                     dynamicExecutionDelegate.discoveredDependencyNode(ExecutionNode(identifier: dep))
+                    timelineDiscoveredDependencyCount += 1
                 }
+            }
+            if timelineSetupStartedNS != nil {
+                timelineDiscoveryFinishedNS = SwiftBuildOptPhaseTimeline.now()
             }
         } catch {
             outputDelegate.error(error)
