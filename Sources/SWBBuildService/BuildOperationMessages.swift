@@ -1438,7 +1438,8 @@ final class OperationDelegate: BuildOperationDelegate {
 
     func taskComplete(_ operation: any BuildSystemOperation, taskIdentifier: TaskIdentifier, task: any ExecutableTask, delegate taskDelegate: any TaskOutputDelegate) {
         let traceSwiftDriverCompletion = SwiftBuildOptPhaseTimeline.isProcessEnabled
-            && task.action is SwiftDriverJobSchedulingTaskAction
+            && ["SwiftDriver Compilation", "SwiftDriver Compilation Requirements"]
+                .contains(task.ruleInfo.first ?? "")
         func traceCompletionPhase(_ phase: String) {
             guard traceSwiftDriverCompletion else { return }
             request.send(BuildOperationConsoleOutputEmitted(data: Array((
