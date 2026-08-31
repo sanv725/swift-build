@@ -17,6 +17,31 @@ public import enum SWBLLBuild.BuildValueKind
 import Foundation
 import SWBProtocol
 
+#if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+package enum SwiftDriverAggregateDependencyReporting {
+    package static let environmentVariable =
+        "SWIFT_BUILD_DRIVER_PLAN_CACHE_AGGREGATE_DEPENDENCIES"
+
+    package static func planRoot(environment: [String: String]) -> String? {
+        guard environment[environmentVariable] == "1",
+              environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_MODE"] == "replay",
+              environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_KEY_SCOPE"] == "driver",
+              environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_LIVE_CAS"] == "1",
+              let source = environment[
+                "SWIFT_BUILD_DRIVER_PLAN_CACHE_INVALIDATE_SOURCE"
+              ], Path(source).isAbsolute,
+              let root = environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_ROOT"],
+              Path(root).isAbsolute,
+              let key = environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_KEY"],
+              key.count == 64,
+              key.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
+            return nil
+        }
+        return root
+    }
+}
+#endif
+
 open class SwiftDriverJobSchedulingTaskAction: TaskAction {
     public override class var toolIdentifier: String {
         assertionFailure("Subclass responsibility")
@@ -204,6 +229,7 @@ open class SwiftDriverJobSchedulingTaskAction: TaskAction {
         var timelineDiscoveryFinishedNS: UInt64?
         var timelinePlanningDependencyCount = 0
         var timelineDiscoveredDependencyCount = 0
+        var timelineDependencyReportingMode = "individual"
         defer {
             if let setupStartedNS = timelineSetupStartedNS,
                let jobsFinishedNS {
@@ -212,6 +238,7 @@ open class SwiftDriverJobSchedulingTaskAction: TaskAction {
                     fields: [
                         "action_finished_ns": String(SwiftBuildOptPhaseTimeline.now()),
                         "dependency_count": String(timelinePlanningDependencyCount),
+                        "dependency_reporting_mode": timelineDependencyReportingMode,
                         "dependency_discovery_finished_ns": timelineDiscoveryFinishedNS.map(String.init) ?? "missing",
                         "dependency_verification_finished_ns": timelineDependencyVerificationFinishedNS.map(String.init) ?? "missing",
                         "discovered_dependency_count": String(timelineDiscoveredDependencyCount),
@@ -292,19 +319,36 @@ open class SwiftDriverJobSchedulingTaskAction: TaskAction {
                 timelineDependencyVerificationFinishedNS = SwiftBuildOptPhaseTimeline.now()
             }
 
-            let dependencyFilteringRootPathString = driverPayload.dependencyFilteringRootPath?.str
-            for dep in planningDependencies {
-                if let dependencyFilteringRootPathString {
-                    // We intentionally do a prefix check instead of an ancestor check here, for performance reasons. The filtering path (SDK path) and paths returned by the compiler are guaranteed to be normalized, which makes this safe.
-                    if !dep.hasPrefix(dependencyFilteringRootPathString) {
+            func reportIndividualDependencies() {
+                let dependencyFilteringRootPathString = driverPayload.dependencyFilteringRootPath?.str
+                for dep in planningDependencies {
+                    if let dependencyFilteringRootPathString {
+                        // We intentionally do a prefix check instead of an ancestor check here, for performance reasons. The filtering path (SDK path) and paths returned by the compiler are guaranteed to be normalized, which makes this safe.
+                        if !dep.hasPrefix(dependencyFilteringRootPathString) {
+                            dynamicExecutionDelegate.discoveredDependencyNode(ExecutionNode(identifier: dep))
+                            timelineDiscoveredDependencyCount += 1
+                        }
+                    } else {
                         dynamicExecutionDelegate.discoveredDependencyNode(ExecutionNode(identifier: dep))
                         timelineDiscoveredDependencyCount += 1
                     }
-                } else {
-                    dynamicExecutionDelegate.discoveredDependencyNode(ExecutionNode(identifier: dep))
-                    timelineDiscoveredDependencyCount += 1
                 }
             }
+            #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+            if let planRoot = SwiftDriverAggregateDependencyReporting.planRoot(
+                environment: task.environment.bindingsDictionary
+            ) {
+                dynamicExecutionDelegate.discoveredDependencyDirectoryTree(
+                    Path(planRoot)
+                )
+                timelineDiscoveredDependencyCount = 1
+                timelineDependencyReportingMode = "aggregate-plan-root"
+            } else {
+                reportIndividualDependencies()
+            }
+            #else
+            reportIndividualDependencies()
+            #endif
             if timelineSetupStartedNS != nil {
                 timelineDiscoveryFinishedNS = SwiftBuildOptPhaseTimeline.now()
             }

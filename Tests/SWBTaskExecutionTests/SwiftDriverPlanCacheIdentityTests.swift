@@ -18,6 +18,38 @@ fileprivate struct SwiftDriverPlanCacheIdentityTests {
     private let baseKey = String(repeating: "a", count: 64)
 
     @Test
+    func aggregateDependenciesRequireTheExactReplayBoundary() {
+        let root = "/tmp/driver-plan"
+        var environment = [
+            SwiftDriverAggregateDependencyReporting.environmentVariable: "1",
+            "SWIFT_BUILD_DRIVER_PLAN_CACHE_MODE": "replay",
+            "SWIFT_BUILD_DRIVER_PLAN_CACHE_KEY_SCOPE": "driver",
+            "SWIFT_BUILD_DRIVER_PLAN_CACHE_LIVE_CAS": "1",
+            "SWIFT_BUILD_DRIVER_PLAN_CACHE_INVALIDATE_SOURCE": "/tmp/File.swift",
+            "SWIFT_BUILD_DRIVER_PLAN_CACHE_ROOT": root,
+            "SWIFT_BUILD_DRIVER_PLAN_CACHE_KEY": baseKey,
+        ]
+        #expect(
+            SwiftDriverAggregateDependencyReporting.planRoot(
+                environment: environment
+            ) == root
+        )
+        environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_MODE"] = "record"
+        #expect(
+            SwiftDriverAggregateDependencyReporting.planRoot(
+                environment: environment
+            ) == nil
+        )
+        environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_MODE"] = "replay"
+        environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_INVALIDATE_SOURCE"] = nil
+        #expect(
+            SwiftDriverAggregateDependencyReporting.planRoot(
+                environment: environment
+            ) == nil
+        )
+    }
+
+    @Test
     func legacyScopePreservesExternalKey() {
         #expect(
             SwiftDriverPlanCacheKeyScope.legacy.actionKey(
