@@ -110,12 +110,19 @@ public struct SwiftDriverJob: Serializable, CustomDebugStringConvertible {
     }
 
     public func invalidatingCompilationCacheKeys() -> Self {
-        Self(
+        let uncachedCommandLine = commandLine.filter {
+            $0.asString != "-cache-compile-job"
+        }
+        let signatureContext = InsecureHashContext()
+        for argument in uncachedCommandLine {
+            signatureContext.add(string: argument.asString)
+        }
+        return Self(
             kind: kind, ruleInfoType: ruleInfoType, moduleName: moduleName,
             inputs: inputs, displayInputs: displayInputs,
             descriptionForLifecycle: descriptionForLifecycle, outputs: outputs,
-            cacheOutputKindGroups: [], commandLine: commandLine,
-            commandLineSignature: commandLineSignature, cacheKeys: []
+            cacheOutputKindGroups: [], commandLine: uncachedCommandLine,
+            commandLineSignature: signatureContext.signature, cacheKeys: []
         )
     }
     #endif
