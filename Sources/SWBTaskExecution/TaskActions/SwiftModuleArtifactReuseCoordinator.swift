@@ -37,6 +37,7 @@ package struct SwiftModuleArtifactReuseConfiguration: Codable, Sendable, Equatab
     package let expectedInterfaceFingerprint: String
     package let emitModuleArtifacts: [Artifact]
     package let waitTimeoutMilliseconds: Int
+    package let compileStartGraceMilliseconds: Int?
 
     package init(
         moduleName: String,
@@ -44,7 +45,8 @@ package struct SwiftModuleArtifactReuseConfiguration: Codable, Sendable, Equatab
         candidateSourceSHA256: String,
         expectedInterfaceFingerprint: String,
         emitModuleArtifacts: [Artifact],
-        waitTimeoutMilliseconds: Int = 30_000
+        waitTimeoutMilliseconds: Int = 30_000,
+        compileStartGraceMilliseconds: Int = 25
     ) {
         self.schema = Self.schema
         self.moduleName = moduleName
@@ -53,6 +55,7 @@ package struct SwiftModuleArtifactReuseConfiguration: Codable, Sendable, Equatab
         self.expectedInterfaceFingerprint = expectedInterfaceFingerprint
         self.emitModuleArtifacts = emitModuleArtifacts
         self.waitTimeoutMilliseconds = waitTimeoutMilliseconds
+        self.compileStartGraceMilliseconds = compileStartGraceMilliseconds
     }
 
     package static func path(environment: [String: String]) throws -> Path? {
@@ -78,6 +81,7 @@ package enum SwiftModuleArtifactReuseDecision: Sendable, Equatable {
 package final class SwiftModuleArtifactReuseCoordinator: @unchecked Sendable {
     private enum Observation: Sendable, Equatable {
         case waiting
+        case compileRunning
         case fingerprint(String)
         case aborted(String)
     }
@@ -100,6 +104,7 @@ package final class SwiftModuleArtifactReuseCoordinator: @unchecked Sendable {
               !configuration.candidateSourceSHA256.isEmpty,
               !configuration.expectedInterfaceFingerprint.isEmpty,
               (1...120_000).contains(configuration.waitTimeoutMilliseconds),
+              (1...1_000).contains(configuration.compileStartGraceMilliseconds ?? 25),
               !configuration.emitModuleArtifacts.isEmpty else {
             throw StubError.error("Invalid Swift module artifact reuse configuration.")
         }
@@ -123,6 +128,16 @@ package final class SwiftModuleArtifactReuseCoordinator: @unchecked Sendable {
     }
 
     @discardableResult
+    package func beginChangedCompile(primaryPath: Path, moduleName: String) -> Bool {
+        guard accepts(primaryPath: primaryPath, moduleName: moduleName) else { return false }
+        return observation.withLock { current in
+            guard current == .waiting else { return false }
+            current = .compileRunning
+            return true
+        }
+    }
+
+    @discardableResult
     package func publishInterfaceFingerprint(
         _ fingerprint: String,
         primaryPath: Path,
@@ -130,7 +145,7 @@ package final class SwiftModuleArtifactReuseCoordinator: @unchecked Sendable {
     ) -> Bool {
         guard accepts(primaryPath: primaryPath, moduleName: moduleName) else { return false }
         return observation.withLock { current in
-            guard current == .waiting else { return false }
+            guard current == .waiting || current == .compileRunning else { return false }
             current = .fingerprint(fingerprint)
             return true
         }
@@ -143,7 +158,7 @@ package final class SwiftModuleArtifactReuseCoordinator: @unchecked Sendable {
     ) {
         guard accepts(primaryPath: primaryPath, moduleName: moduleName) else { return }
         observation.withLock { current in
-            guard current == .waiting else { return }
+            guard current == .waiting || current == .compileRunning else { return }
             current = .aborted(reason)
         }
     }
@@ -164,6 +179,9 @@ package final class SwiftModuleArtifactReuseCoordinator: @unchecked Sendable {
         }
 
         let timeoutNS = UInt64(configuration.waitTimeoutMilliseconds) * 1_000_000
+        let startGraceNS = UInt64(
+            configuration.compileStartGraceMilliseconds ?? 25
+        ) * 1_000_000
         while true {
             if isCancelled() || _Concurrency.Task<Never, Never>.isCancelled {
                 return .cancelled(waitedNS: timer.elapsedTime().nanoseconds)
@@ -171,8 +189,34 @@ package final class SwiftModuleArtifactReuseCoordinator: @unchecked Sendable {
             switch observation.withLock({ $0 }) {
             case .waiting:
                 let elapsedNS = timer.elapsedTime().nanoseconds
-                guard elapsedNS < timeoutNS else {
-                    return .appleFallback(reason: "fingerprint_timeout", waitedNS: elapsedNS)
+                if elapsedNS >= startGraceNS {
+                    let stoppedWaiting = observation.withLock { current in
+                        guard current == .waiting else { return false }
+                        current = .aborted("changed_compile_not_started")
+                        return true
+                    }
+                    if stoppedWaiting {
+                        return .appleFallback(
+                            reason: "changed_compile_not_started", waitedNS: elapsedNS
+                        )
+                    }
+                }
+                do {
+                    try await _Concurrency.Task<Never, Never>.sleep(nanoseconds: 1_000_000)
+                } catch {
+                    return .cancelled(waitedNS: timer.elapsedTime().nanoseconds)
+                }
+            case .compileRunning:
+                let elapsedNS = timer.elapsedTime().nanoseconds
+                if elapsedNS >= timeoutNS {
+                    let stoppedWaiting = observation.withLock { current in
+                        guard current == .compileRunning else { return false }
+                        current = .aborted("fingerprint_timeout")
+                        return true
+                    }
+                    if stoppedWaiting {
+                        return .appleFallback(reason: "fingerprint_timeout", waitedNS: elapsedNS)
+                    }
                 }
                 do {
                     try await _Concurrency.Task<Never, Never>.sleep(nanoseconds: 1_000_000)

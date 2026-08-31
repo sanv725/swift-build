@@ -2156,6 +2156,21 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             }
             #endif
 
+            #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+            if driverJob.driverJob.ruleInfoType == "Compile",
+               let moduleArtifactReuseCoordinator,
+               let dependencyPrimaryPath,
+               moduleArtifactReuseCoordinator.accepts(
+                    primaryPath: dependencyPrimaryPath,
+                    moduleName: driverJob.driverJob.moduleName
+               ) {
+                _ = moduleArtifactReuseCoordinator.beginChangedCompile(
+                    primaryPath: dependencyPrimaryPath,
+                    moduleName: driverJob.driverJob.moduleName
+                )
+            }
+            #endif
+
             let compilerTimer = ElapsedTimer()
             do {
                 try await spawn(commandLine: compilerCommandLine, environment: environment, workingDirectory: task.workingDirectory, dynamicExecutionDelegate: dynamicExecutionDelegate, clientDelegate: clientDelegate, processDelegate: delegate)
@@ -2182,13 +2197,14 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                         guard let fingerprint = projection.sourceFileInterfaceFingerprint else {
                             throw StubError.error("Changed compile emitted no source interface fingerprint.")
                         }
-                        _ = moduleArtifactReuseCoordinator.publishInterfaceFingerprint(
+                        let published = moduleArtifactReuseCoordinator.publishInterfaceFingerprint(
                             fingerprint,
                             primaryPath: dependencyPrimaryPath,
                             moduleName: driverJob.driverJob.moduleName
                         )
-                        outputDelegate.note(
-                            "SWIFT_MODULE_REUSE outcome=fingerprint_published module=\(driverJob.driverJob.moduleName) fingerprint=\(fingerprint)"
+                        outputDelegate.note(published
+                            ? "SWIFT_MODULE_REUSE outcome=fingerprint_published module=\(driverJob.driverJob.moduleName) fingerprint=\(fingerprint)"
+                            : "SWIFT_MODULE_REUSE outcome=fingerprint_late module=\(driverJob.driverJob.moduleName) fingerprint=\(fingerprint)"
                         )
                     } catch {
                         moduleArtifactReuseCoordinator.abortChangedCompile(

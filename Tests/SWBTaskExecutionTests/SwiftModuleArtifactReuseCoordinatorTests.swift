@@ -20,6 +20,10 @@ fileprivate struct SwiftModuleArtifactReuseCoordinatorTests {
     @Test
     func exactGenerationReusesArtifacts() async throws {
         let fixture = try makeFixture()
+        #expect(fixture.coordinator.beginChangedCompile(
+            primaryPath: fixture.source,
+            moduleName: "Fixture"
+        ))
         async let pendingDecision = fixture.coordinator.decision(
             moduleName: "Fixture",
             plannedOutputs: fixture.outputs,
@@ -39,6 +43,26 @@ fileprivate struct SwiftModuleArtifactReuseCoordinatorTests {
         }
         #expect(outputCount == 2)
         #expect(outputBytes == 28)
+    }
+
+    @Test
+    func moduleBeforeCompileFallsBackWithoutFingerprintTimeout() async throws {
+        let fixture = try makeFixture()
+        let decision = await fixture.coordinator.decision(
+            moduleName: "Fixture",
+            plannedOutputs: fixture.outputs,
+            isCancelled: { false }
+        )
+        guard case .appleFallback(let reason, let waitedNS) = decision else {
+            Issue.record("Expected Apple fallback, got \(decision)")
+            return
+        }
+        #expect(reason == "changed_compile_not_started")
+        #expect(waitedNS < 100_000_000)
+        #expect(!fixture.coordinator.beginChangedCompile(
+            primaryPath: fixture.source,
+            moduleName: "Fixture"
+        ))
     }
 
     @Test
