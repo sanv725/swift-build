@@ -2100,10 +2100,32 @@ internal final class OperationSystemAdaptor: SWBLLBuild.BuildSystemDelegate, Act
             return
         }
 
+        let traceSwiftDriverCompletion = SwiftBuildOptPhaseTimeline.isProcessEnabled
+            && task.action is SwiftDriverJobSchedulingTaskAction
+        if traceSwiftDriverCompletion {
+            outputDelegate.note(SwiftBuildOptPhaseTimeline.render(
+                event: "llbuild-driver-completion",
+                fields: [
+                    "phase": "callback",
+                    "result": String(result.rawValue),
+                    "timestamp_ns": String(SwiftBuildOptPhaseTimeline.now()),
+                ]
+            ))
+        }
+
         // We can call this here because we're on an llbuild worker thread. This shouldn't be used while on `self.queue` because we have Swift async work elsewhere which blocks on that queue.
         let sandboxViolations = task.isSandboxed && result == .failed ? task.extractSandboxViolationMessages_ASYNC_UNSAFE(startTime: outputDelegate.startTime) : []
 
         queue.async {
+            if traceSwiftDriverCompletion {
+                outputDelegate.note(SwiftBuildOptPhaseTimeline.render(
+                    event: "llbuild-driver-completion",
+                    fields: [
+                        "phase": "delegate-queue-started",
+                        "timestamp_ns": String(SwiftBuildOptPhaseTimeline.now()),
+                    ]
+                ))
+            }
             for message in sandboxViolations {
                 outputDelegate.emit(Diagnostic(behavior: .error, location: .unknown, data: DiagnosticData(message)))
             }
@@ -2134,6 +2156,15 @@ internal final class OperationSystemAdaptor: SWBLLBuild.BuildSystemDelegate, Act
 
             // Notify the operation client.
             self.operation.delegate.taskComplete(self.operation, taskIdentifier: taskIdentifier, task: task, delegate: outputDelegate)
+            if traceSwiftDriverCompletion {
+                outputDelegate.note(SwiftBuildOptPhaseTimeline.render(
+                    event: "llbuild-driver-completion",
+                    fields: [
+                        "phase": "task-complete-returned",
+                        "timestamp_ns": String(SwiftBuildOptPhaseTimeline.now()),
+                    ]
+                ))
+            }
         }
     }
 
