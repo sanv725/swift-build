@@ -110,8 +110,15 @@ public struct SwiftDriverJob: Serializable, CustomDebugStringConvertible {
     }
 
     public func invalidatingCompilationCacheKeys() -> Self {
-        let uncachedCommandLine = commandLine.filter {
+        var uncachedCommandLine = commandLine.filter {
             $0.asString != "-cache-compile-job"
+        }
+        if !uncachedCommandLine.contains(where: {
+            $0.asString == "-module-import-from-cas"
+        }) {
+            uncachedCommandLine.append(
+                ByteString(encodingAsUTF8: "-module-import-from-cas")
+            )
         }
         let signatureContext = InsecureHashContext()
         for argument in uncachedCommandLine {
