@@ -398,6 +398,18 @@ final class ActiveBuild: ActiveBuildOperation {
 
         // reply() enqueues a message to be sent asynchronously, so it
         // should be called last.
+        if SwiftBuildOptPhaseTimeline.isProcessEnabled {
+            request.send(BuildOperationConsoleOutputEmitted(data: Array((
+                SwiftBuildOptPhaseTimeline.render(
+                    event: "service-build",
+                    fields: [
+                        "build_id": String(id),
+                        "phase": "response-enqueued",
+                        "response_enqueued_ns": String(SwiftBuildOptPhaseTimeline.now()),
+                    ]
+                ) + "\n"
+            ).utf8)))
+        }
         request.reply(message)
     }
 
@@ -1146,6 +1158,18 @@ final class OperationDelegate: BuildOperationDelegate {
         }
 
         request.send(BuildOperationStarted(id: activeBuild.id))
+        if SwiftBuildOptPhaseTimeline.isProcessEnabled {
+            request.send(BuildOperationConsoleOutputEmitted(data: Array((
+                SwiftBuildOptPhaseTimeline.render(
+                    event: "service-build",
+                    fields: [
+                        "build_id": String(activeBuild.id),
+                        "execution_started_ns": String(SwiftBuildOptPhaseTimeline.now()),
+                        "phase": "started",
+                    ]
+                ) + "\n"
+            ).utf8)))
+        }
         let outputCollector = BuildOutputCollector(diagnosticsDelegate: diagnosticsHandler)
         self.outputCollector = outputCollector
         return outputCollector
@@ -1367,6 +1391,21 @@ final class OperationDelegate: BuildOperationDelegate {
         let info = BuildOperationTaskInfo(taskName: taskSpec?.name ?? "", signature: .taskIdentifier(ByteString(encodingAsUTF8: task.identifier.rawValue)), ruleInfo: task.ruleInfo.quotedDescription, executionDescription: (task.execDescription ?? task.ruleInfo.quotedDescription), commandLineDisplayString: task.showCommandLineInLog ? commandLineDisplayString(task.commandLine.map(\.asByteString), additionalOutput: task.additionalOutput, workingDirectory: task.workingDirectory, environment: environmentToShow, dependencyInfo: dependencyInfo, hostOS: workspaceContext.core.hostOperatingSystem) : nil, interestingPath: interestingPath, serializedDiagnosticsPaths: serializedDiagnosticsPaths)
 
         request.send(BuildOperationTaskStarted(id: taskID, targetID: targetID, parentID: nil, info: info))
+        if SwiftBuildOptPhaseTimeline.isProcessEnabled {
+            request.send(BuildOperationConsoleOutputEmitted(
+                data: Array((SwiftBuildOptPhaseTimeline.render(
+                    event: "service-task",
+                    fields: [
+                        "phase": "started",
+                        "rule": task.ruleInfo.first ?? "missing",
+                        "task_id": String(taskID),
+                        "timestamp_ns": String(SwiftBuildOptPhaseTimeline.now()),
+                    ]
+                ) + "\n").utf8),
+                taskID: taskID,
+                taskSignature: .taskIdentifier(ByteString(encodingAsUTF8: taskIdentifier.rawValue))
+            ))
+        }
 
         // Create the output parser, if used.
         //
@@ -1457,6 +1496,22 @@ final class OperationDelegate: BuildOperationDelegate {
             self.aggregatedTaskCounters[task.ruleInfo[0], default: [:]].merge(delegate.taskCounters) { (a, b) in a+b }
         }
 
+        if SwiftBuildOptPhaseTimeline.isProcessEnabled {
+            request.send(BuildOperationConsoleOutputEmitted(
+                data: Array((SwiftBuildOptPhaseTimeline.render(
+                    event: "service-task",
+                    fields: [
+                        "phase": "finished",
+                        "rule": task.ruleInfo.first ?? "missing",
+                        "status": String(describing: status),
+                        "task_id": String(taskID),
+                        "timestamp_ns": String(SwiftBuildOptPhaseTimeline.now()),
+                    ]
+                ) + "\n").utf8),
+                taskID: taskID,
+                taskSignature: .taskIdentifier(ByteString(encodingAsUTF8: taskIdentifier.rawValue))
+            ))
+        }
         request.send(BuildOperationTaskEnded(id: taskID, signature: .taskIdentifier(ByteString(encodingAsUTF8: taskIdentifier.rawValue)), status: status, signalled: status == .cancelled, metrics: metrics))
     }
 
