@@ -1232,6 +1232,10 @@ private class InProcessCommand: SWBLLBuild.ExternalCommand, SWBLLBuild.ExternalD
         self.adaptor = adaptor
     }
 
+    var shouldReceiveInputValues: Bool {
+        action.needsDependencyReadyCallbacks
+    }
+
     var outputs: [String] {
         task.isDynamic ? task.outputPaths.map(\.str) : []
     }
