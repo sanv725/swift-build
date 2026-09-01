@@ -691,6 +691,10 @@ private extension TaskCacheObservation.ExclusionReason {
 }
 
 public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTaskAction {
+    public override var needsDependencyReadyCallbacks: Bool {
+        true
+    }
+
     public override class var toolIdentifier: String {
         "swift-driver-job-execution"
     }

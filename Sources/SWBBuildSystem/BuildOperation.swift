@@ -1294,6 +1294,11 @@ private class InProcessCommand: SWBLLBuild.ExternalCommand, SWBLLBuild.ExternalD
         _ buildValue: BuildValue,
         _ inputID: UInt
     ) {
+        if ProcessInfo.processInfo.environment[
+            "SWIFT_BUILD_OPT_SKIP_NOOP_DEPENDENCY_CALLBACKS"
+        ] == "1", !action.needsDependencyReadyCallbacks {
+            return
+        }
         let adaptorInterfaceDelegate = OperatorSystemAdaptorDynamicContext(
             commandInterface: commandInterface,
             adaptor: adaptor,

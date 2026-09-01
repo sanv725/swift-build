@@ -22,6 +22,10 @@ import Foundation
 /// After this task is finished, the dependent compilation tasks only need to
 /// query the local CAS for accessing the data related to a cache key.
 public final class SwiftCachingMaterializeKeyTaskAction: TaskAction {
+    public override var needsDependencyReadyCallbacks: Bool {
+        true
+    }
+
     public override class var toolIdentifier: String {
         return "swift-caching-materialize-key"
     }
@@ -210,4 +214,3 @@ public final class SwiftCachingMaterializeKeyTaskAction: TaskAction {
         try super.init(from: deserializer)
     }
 }
-

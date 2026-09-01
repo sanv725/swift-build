@@ -18,6 +18,10 @@ import Foundation
 import SWBProtocol
 
 public final class ClangCompileTaskAction: TaskAction, BuildValueValidatingTaskAction {
+    public override var needsDependencyReadyCallbacks: Bool {
+        true
+    }
+
     public override class var toolIdentifier: String {
         return "ccompile"
     }

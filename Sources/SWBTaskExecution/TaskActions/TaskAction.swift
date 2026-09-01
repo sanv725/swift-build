@@ -88,6 +88,16 @@ open class TaskAction: PlannedTaskAction, PolymorphicSerializable
     /// - parameter dynamicExecutionDelegate: The dynamic execution context to request dynamic dependencies from.
     open func taskSetup(_ task: any ExecutableTask, executionDelegate: any TaskExecutionDelegate, dynamicExecutionDelegate: any DynamicTaskExecutionDelegate) {}
 
+    /// Whether this action consumes dependency-ready notifications.
+    ///
+    /// Most task actions only wait for llbuild to make their inputs available;
+    /// their inherited `taskDependencyReady` implementation is intentionally a
+    /// no-op.  Build-system adaptors may use this bit to avoid constructing a
+    /// dynamic execution context for those no-op notifications.
+    open var needsDependencyReadyCallbacks: Bool {
+        false
+    }
+
     /// Hook for task actions that signals that a dynamic dependency has been resolved and is available.
     /// - parameter task: The `Task` the action is acting on behalf of.
     /// - parameter dependencyID: The unique ID for the requested dependency.

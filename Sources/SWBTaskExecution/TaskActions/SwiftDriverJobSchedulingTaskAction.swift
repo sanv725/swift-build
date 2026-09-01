@@ -43,6 +43,10 @@ package enum SwiftDriverAggregateDependencyReporting {
 #endif
 
 open class SwiftDriverJobSchedulingTaskAction: TaskAction {
+    public override var needsDependencyReadyCallbacks: Bool {
+        true
+    }
+
     public override class var toolIdentifier: String {
         assertionFailure("Subclass responsibility")
         return ""
