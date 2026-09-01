@@ -29,6 +29,8 @@ package struct SwiftResidentFrontendProxyConfiguration: Codable, Sendable, Equat
     package let moduleName: String
     package let allowedPrimarySources: [String]
     package let timeoutMilliseconds: Int
+    package let declarationReplacement: Bool?
+    package let sessionRoot: String?
 
     private enum CodingKeys: String, CodingKey {
         case schema
@@ -42,6 +44,8 @@ package struct SwiftResidentFrontendProxyConfiguration: Codable, Sendable, Equat
         case moduleName = "module_name"
         case allowedPrimarySources = "allowed_primary_sources"
         case timeoutMilliseconds = "timeout_milliseconds"
+        case declarationReplacement = "declaration_replacement"
+        case sessionRoot = "session_root"
     }
 
     package static func load(
@@ -72,7 +76,7 @@ package struct SwiftResidentFrontendProxyConfiguration: Codable, Sendable, Equat
               let primary = Self.uniqueValue(after: "-primary-file", in: commandLine),
               allowedPrimarySources.contains(primary)
         else { return nil }
-        return [
+        var proxyArguments = [
             proxyPath,
             "--socket", socketPath,
             "--frontend", frontendPath,
@@ -80,8 +84,15 @@ package struct SwiftResidentFrontendProxyConfiguration: Codable, Sendable, Equat
             "--resource-dir", resourceDirectory,
             "--evidence-root", evidenceRoot,
             "--timeout-ms", String(timeoutMilliseconds),
-            "--",
-        ] + commandLine
+        ]
+        if declarationReplacement == true, let sessionRoot {
+            proxyArguments.append(contentsOf: [
+                "--declaration-replacement", "1",
+                "--session-root", sessionRoot,
+            ])
+        }
+        proxyArguments.append("--")
+        return proxyArguments + commandLine
     }
 
     private func validate() throws {
@@ -98,6 +109,8 @@ package struct SwiftResidentFrontendProxyConfiguration: Codable, Sendable, Equat
               !allowedPrimarySources.isEmpty,
               Set(allowedPrimarySources).count == allowedPrimarySources.count,
               allowedPrimarySources.allSatisfy(Self.isAbsoluteCleanPath),
+              declarationReplacement != true
+                || sessionRoot.map(Self.isAbsoluteCleanPath) == true,
               timeoutMilliseconds > 0, timeoutMilliseconds <= 3_600_000
         else {
             throw StubError.error("Resident frontend configuration is invalid.")

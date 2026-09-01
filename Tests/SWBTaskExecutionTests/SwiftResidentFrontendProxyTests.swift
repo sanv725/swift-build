@@ -38,6 +38,8 @@ fileprivate struct SwiftResidentFrontendProxyTests {
             "module_name": "Fixture",
             "allowed_primary_sources": [source],
             "timeout_milliseconds": 60_000,
+            "declaration_replacement": true,
+            "session_root": temporary.path.join("sessions").str,
         ]
         try JSONSerialization.data(
             withJSONObject: configuration, options: [.sortedKeys]
@@ -68,8 +70,12 @@ fileprivate struct SwiftResidentFrontendProxyTests {
             "--evidence-root", evidence,
             "--timeout-ms", "60000",
         ])
-        #expect(proxied[13] == "--")
-        #expect(Array(proxied.dropFirst(14)) == original)
+        #expect(Array(proxied[13..<17]) == [
+            "--declaration-replacement", "1",
+            "--session-root", temporary.path.join("sessions").str,
+        ])
+        #expect(proxied[17] == "--")
+        #expect(Array(proxied.dropFirst(18)) == original)
         #expect(loaded.proxyCommand(for: [
             "/toolchain/swift-frontend", "-frontend", "-c",
             "-primary-file", temporary.path.join("Unexpected.swift").str,
