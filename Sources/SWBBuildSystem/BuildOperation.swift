@@ -1233,7 +1233,12 @@ private class InProcessCommand: SWBLLBuild.ExternalCommand, SWBLLBuild.ExternalD
     }
 
     var shouldReceiveInputValues: Bool {
-        action.needsDependencyReadyCallbacks
+        guard ProcessInfo.processInfo.environment[
+            "SWIFT_BUILD_OPT_LLBUILD_PASSIVE_INPUT_FAST_PATH"
+        ] == "1" else {
+            return true
+        }
+        return action.needsDependencyReadyCallbacks
     }
 
     var outputs: [String] {
