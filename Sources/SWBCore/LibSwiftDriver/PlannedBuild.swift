@@ -369,7 +369,11 @@ extension LibSwiftDriver {
                 var invalidatedJobCount = 0
                 let jobs = plannedTargetJobs.map { job in
                     guard job.driverJob.ruleInfoType == "Compile",
-                          job.driverJob.inputs.contains(source) else {
+                          SwiftDriverPrimaryInputOwnership.owns(
+                            source: source.str,
+                            arguments: job.driverJob.commandLine.map { $0.asString },
+                            inputs: job.driverJob.inputs.map { $0.str }
+                          ) else {
                         return job
                     }
                     invalidatedJobCount += 1
