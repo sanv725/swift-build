@@ -505,6 +505,7 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
 
             let commandLine = task.commandLineAsStrings.split(separator: "--", maxSplits: 1, omittingEmptySubsequences: false)[1]
             var plannedFromCache = false
+            var planningSucceeded = true
             var planBuildDiagnostics: [Diagnostic] = []
             #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
             let planCacheTimer = ElapsedTimer()
@@ -859,7 +860,7 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                 planCachePlanDurationNS = planTimer.elapsedTime().nanoseconds
                 #endif
                 planBuildDiagnostics = planResult.diagnostics
-                guard planResult.success else { return .failed }
+                planningSucceeded = planResult.success
             }
 
             // Read and emit any serialized diagnostics reported by the scanner. Then report any diagnostics from planBuild
@@ -894,6 +895,10 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                     outputDelegate.emit(diagnostic)
                 }
             }
+
+            // A failed dependency scan can carry the only source diagnostic.
+            // Emit it before returning, but never publish or execute its plan.
+            guard planningSucceeded else { return .failed }
 
             #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
             if !plannedFromCache, let planCacheConfiguration, planCacheConfiguration.mode.canWrite {
