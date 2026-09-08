@@ -14,7 +14,7 @@ import Foundation
 
 import SwiftDriver
 import SwiftOptions
-import TSCBasic
+package import TSCBasic
 
 public import SWBUtil
 
@@ -50,7 +50,8 @@ public protocol SwiftGlobalExplicitDependencyGraph : AnyObject {
 /// Complete execution-facing result of one integrated Swift Driver planning
 /// phase. The wrapper's exact action key owns compatibility and invalidation.
 public struct SwiftDriverPlanCacheSnapshot: Serializable {
-    public static let schemaVersion = 1
+    // Version 2 plans retain debugger search paths in compilation cache keys.
+    public static let schemaVersion = 2
 
     public let schemaVersion: Int
     public let plannedBuild: LibSwiftDriver.PlannedBuild.CacheSnapshot
@@ -760,6 +761,29 @@ public final class LibSwiftDriver {
 
     var intermoduleDependencyGraph: InterModuleDependencyGraph?
 
+    /// Keep the exact search-path spelling in cached frontend jobs: these paths
+    /// are serialized for LLDB even though explicit imports do not search them.
+    /// Adapt before Driver planning so the compiler CAS keys include the paths.
+    package static func preservingDebuggerSearchPaths(
+        _ args: [String], diagnosticsEngine: TSCBasic.DiagnosticsEngine
+    ) throws -> [String] {
+        #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+        let expanded = try Driver.expandResponseFiles(args, fileSystem: localFileSystem, diagnosticsEngine: diagnosticsEngine)
+        var options = try OptionTable().parse(Array(expanded.dropFirst()), for: .batch, delayThrows: true)
+        guard options.contains(.cacheCompileJob), options.contains(.driverExplicitModuleBuild),
+              options.arguments(for: .Xfrontend).contains(where: { $0.argument.asSingle == "-serialize-debugging-options" }) else {
+            return args
+        }
+        let paths = options.arguments(for: .I, .Isystem, .F, .Fsystem)
+        let forwarded = paths.flatMap { ["-Xfrontend", $0.option.spelling, "-Xfrontend", $0.argument.asSingle] }
+        // Prepend after the executable so a trailing '--' cannot turn options
+        // into inputs. Leave original response files and scanner paths intact.
+        return Array(args.prefix(1)) + forwarded + Array(args.dropFirst())
+        #else
+        return args
+        #endif
+    }
+
     private init(graph: SwiftModuleDependencyGraph?, compilerLocation: CompilerLocation, target: ConfiguredTarget?, workingDirectory: Path, tempDirPath: Path, explicitModulesTempDirPath: Path, commandLine: [String], environment: [String: String], eagerCompilationEnabled: Bool, diagnosticsEngine: TSCBasic.DiagnosticsEngine, casOptions: CASOptions?) throws {
         self.target = target
         self.workingDirectory = workingDirectory
@@ -809,7 +833,7 @@ public final class LibSwiftDriver {
         }
         let key = SwiftModuleDependencyGraph.OracleRegistryKey(compilerLocation: compilerLocation, casOpts: casOptions)
         let oracle = graph?.oracleRegistry.getOrInsert(key, { InterModuleDependencyOracle() })
-        let driver = try Driver(args: commandLine, envBlock: env, diagnosticsOutput: .engine(diagnosticsEngine), executor: executor, compilerIntegratedTooling: false, compilerExecutableDir: compilerExecutableDir, interModuleDependencyOracle: oracle)
+        let driver = try Driver(args: Self.preservingDebuggerSearchPaths(commandLine, diagnosticsEngine: diagnosticsEngine), envBlock: env, diagnosticsOutput: .engine(diagnosticsEngine), executor: executor, compilerIntegratedTooling: false, compilerExecutableDir: compilerExecutableDir, interModuleDependencyOracle: oracle)
         self.driver = driver
         if let scanOracle = oracle, let scanLib = try driver.getSwiftScanLibPath() {
             // Errors instantiating the scanner are potentially recoverable, so suppress them here. Truly fatal errors
@@ -889,7 +913,7 @@ public final class LibSwiftDriver {
             { InterModuleDependencyOracle() }
         )
         let driver = try Driver(
-            args: commandLine,
+            args: Self.preservingDebuggerSearchPaths(commandLine, diagnosticsEngine: diagnosticsEngine),
             envBlock: processEnvironment,
             diagnosticsOutput: .engine(diagnosticsEngine),
             executor: executor,
