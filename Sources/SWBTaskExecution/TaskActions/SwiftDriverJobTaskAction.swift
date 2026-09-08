@@ -1811,6 +1811,13 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                                                       outputDelegate: outputDelegate,
                                                       casOptions: casOpts,
                                                       reportCacheKeys: executionDelegate.enableTaskCacheKeyReporting) {
+                        // Replay completed the job without spawning a compiler. The
+                        // driver still needs a successful result to mark its inputs
+                        // up to date in the next incremental build record. Pair the
+                        // callbacks for parsable batch output, using PID 0 because
+                        // there is no child process. Diagnostics were already emitted.
+                        try plannedBuild?.jobStarted(job: driverJob, arguments: options.commandLine, pid: 0)
+                        try plannedBuild?.jobFinished(job: driverJob, arguments: options.commandLine, pid: 0, environment: environment, exitStatus: .exit(0), output: "")
                         return .succeeded
                 }
             } else if !acceleratorPolicy.shouldProbe {
