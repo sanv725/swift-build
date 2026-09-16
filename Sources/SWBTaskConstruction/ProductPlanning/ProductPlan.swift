@@ -1098,6 +1098,20 @@ package final class GlobalProductPlan: GlobalTargetInfoProvider
             }
         )
 
+        let workspaceSettings = getWorkspaceSettings()
+        let preferPackageProductDiamonds = workspaceSettings.globalScope.evaluate(
+            workspaceSettings.globalScope.namespace.parseString("$(SWIFT_BUILD_OPT_PREFER_PACKAGE_PRODUCT_DIAMONDS)")
+        ).boolValue
+        let packageTargetsCoveredByDynamicProducts = Set(
+            dynamicallyBuildingTargetsWithDiamondLinkage.keys
+                .filter { $0.type == .packageProduct }
+                .flatMap { product in
+                    product.dependencies.compactMap { dependency in
+                        planRequest.workspaceContext.workspace.target(for: dependency.guid)
+                    }
+                }
+        )
+
         let packageLinkingTargets = {
             var results = PackageLinkingTargets()
             let resolver = TopLevelLinkingTargetResolver(
@@ -1115,7 +1129,8 @@ package final class GlobalProductPlan: GlobalTargetInfoProvider
                             for: configuredTarget
                         )
 
-                } else if isStaticallyLinkedPackageTarget(configuredTarget) {
+                } else if isStaticallyLinkedPackageTarget(configuredTarget),
+                          !(preferPackageProductDiamonds && packageTargetsCoveredByDynamicProducts.contains(configuredTarget.target)) {
                     results.targets[configuredTarget] = resolver
                         .resolve(
                             for: configuredTarget
@@ -1185,6 +1200,13 @@ package final class GlobalProductPlan: GlobalTargetInfoProvider
             }
 
             for (target, topLevelTargets) in packageLinkingTargets.targets {
+                // Compatibility mode preserves a dynamic package-product boundary when
+                // that product already covers this package target. The exact command-line
+                // build setting is receipt-bound by SwiftBuildOptimizer; default planning
+                // keeps the upstream target-level diamond repair.
+                if preferPackageProductDiamonds && packageTargetsToIgnore.contains(target) {
+                    continue
+                }
                 if let andOther = checkLinkage(topLevelTargets: topLevelTargets) {
                     let workspaceContext = self.planRequest.workspaceContext
                     if let standardTarget = target.target as? SWBCore.StandardTarget, let guid = standardTarget.dynamicTargetVariantGuid, let dynamicTarget = workspaceContext.workspace.target(for: guid) {

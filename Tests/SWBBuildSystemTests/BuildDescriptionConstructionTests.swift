@@ -20,6 +20,7 @@ import SWBTestSupport
 @_spi(Testing) import SWBUtil
 
 import SWBTaskExecution
+import SWBMacro
 
 /// Test constructing build descriptions for projects, and checking for issues in them.
 @Suite
@@ -614,6 +615,76 @@ fileprivate struct BuildDescriptionConstructionTests: CoreBasedTests {
                 #expect(packageTargets.map { $0.target.name } == ["PackageLib-dynamic"])
             }
         }
+    }
+
+    @Test(.requireSDKs(.iOS))
+    func reframePackageProductCompatibilityPlanning() async throws {
+        var nonPackageTargetsByMode: [[String]] = []
+        let linkerFlags = "$(inherited) -fuse-ld=/Library/Developer/CommandLineTools/usr/bin/ld -Wl,-objc_stubs_small"
+
+        for compatibilityEnabled in [false, true] {
+            try await withTesterForPackageDiamondProblemDiagnostic(offerDynamicVariant: true, requiresMultiPass: true) { tester, tmpDir in
+                let moduleCache = tmpDir.join("ReframeModuleCache").str
+                var overrides = [
+                    "ARCHS": "arm64",
+                    "SWIFT_ENABLE_EXPLICIT_MODULES": "YES",
+                    "SWIFT_ENFORCE_EXCLUSIVE_ACCESS": "on",
+                    "USE_HEADERMAP": "YES",
+                    "CLANG_MODULES_PRUNE_INTERVAL": "",
+                    "CLANG_MODULES_PRUNE_AFTER": "",
+                    "MODULE_CACHE_DIR": moduleCache,
+                    "SDK_EXPLICIT_MODULES_OUTPUT_PATH": moduleCache,
+                    "OTHER_LDFLAGS": linkerFlags,
+                ]
+                if compatibilityEnabled {
+                    overrides["SWIFT_BUILD_OPT_PREFER_PACKAGE_PRODUCT_DIAMONDS"] = "YES"
+                }
+
+                try await tester.checkBuildDescription(
+                    BuildParameters(configuration: "Debug", overrides: overrides, arena: arenaInfo(from: tmpDir.join("build"))),
+                    runDestination: .iOS
+                ) { results in
+                    results.checkNoDiagnostics()
+
+                    let configuredTargets = results.buildDescription.allConfiguredTargets
+                    let packageTargets = configuredTargets.filter {
+                        tester.workspaceContext.workspace.project(for: $0.target).isPackage
+                    }.map { $0.target.name }.sorted()
+                    let nonPackageTargets = configuredTargets.filter {
+                        !tester.workspaceContext.workspace.project(for: $0.target).isPackage
+                    }.map { $0.target.name }.sorted()
+                    nonPackageTargetsByMode.append(nonPackageTargets)
+
+                    if compatibilityEnabled {
+                        #expect(packageTargets.contains("PackageLibProduct-dynamic"))
+                        #expect(!packageTargets.contains("PackageLib-dynamic"))
+                    } else {
+                        #expect(packageTargets == ["PackageLib-dynamic"])
+                    }
+
+                    let app = try #require(configuredTargets.first { $0.target.name == "App" })
+                    let settings = results.buildRequestContext.getCachedSettings(app.parameters, target: app.target)
+                    let scope = settings.globalScope
+                    func value(_ name: String) -> String {
+                        scope.evaluate(scope.namespace.parseString("$(\(name))"))
+                    }
+                    #expect(value("ARCHS") == "arm64")
+                    #expect(value("SWIFT_ENABLE_EXPLICIT_MODULES") == "YES")
+                    #expect(value("SWIFT_ENFORCE_EXCLUSIVE_ACCESS") == "on")
+                    #expect(value("USE_HEADERMAP") == "YES")
+                    #expect(value("CLANG_MODULES_PRUNE_INTERVAL").isEmpty)
+                    #expect(value("CLANG_MODULES_PRUNE_AFTER").isEmpty)
+                    #expect(value("MODULE_CACHE_DIR") == moduleCache)
+                    #expect(value("SDK_EXPLICIT_MODULES_OUTPUT_PATH") == moduleCache)
+                    #expect(value("OTHER_LDFLAGS").contains("-fuse-ld=/Library/Developer/CommandLineTools/usr/bin/ld"))
+                    #expect(value("OTHER_LDFLAGS").contains("-Wl,-objc_stubs_small"))
+                    #expect(value("SWIFT_BUILD_OPT_PREFER_PACKAGE_PRODUCT_DIAMONDS") == (compatibilityEnabled ? "YES" : ""))
+                }
+            }
+        }
+
+        #expect(nonPackageTargetsByMode.count == 2)
+        #expect(nonPackageTargetsByMode[0] == nonPackageTargetsByMode[1])
     }
 
     @Test(.requireSDKs(.iOS))
