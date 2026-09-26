@@ -5,7 +5,9 @@
 
 /// Conservative ownership for the opt-in single-source cached-plan experiment.
 /// A frontend reads other same-module files without owning their object outputs.
-/// Do not resolve response files or infer WMO/batch ownership from dependencies.
+/// Explicit batch primaries own their whole job: invalidating one source must
+/// invalidate that job's entire set of compilation cache keys. Never infer
+/// ownership from non-primary inputs, response files, or WMO dependencies.
 public enum SwiftDriverPrimaryInputOwnership {
     public static func owns(source: String, arguments: [String], inputs: [String]) -> Bool {
         guard source.hasPrefix("/"), inputs.contains(source),
@@ -18,6 +20,7 @@ public enum SwiftDriverPrimaryInputOwnership {
                   arguments[index + 1].hasPrefix("/") else { return false }
             primary.append(arguments[index + 1])
         }
-        return primary.count == 1 && primary[0] == source
+        return !primary.isEmpty && Set(primary).count == primary.count
+            && primary.contains(source)
     }
 }
