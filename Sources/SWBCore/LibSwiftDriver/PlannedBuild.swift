@@ -250,7 +250,7 @@ extension LibSwiftDriver {
             /// A signature which uniquely identifies this planned job.
             public let signature: SWBUtil.ByteString
 
-            internal init(key: JobKey, driverJob: SwiftDriverJob, dependencies: [JobKey], workingDirectory: Path) {
+            internal init(key: JobKey, driverJob: SwiftDriverJob, dependencies: [JobKey], workingDirectory: Path, signature: SWBUtil.ByteString? = nil) {
                 self.key = key
                 self.driverJob = driverJob
                 self.dependencies = dependencies
@@ -259,7 +259,7 @@ extension LibSwiftDriver {
                 md5.add(bytes: driverJob.commandLineSignature)
                 md5.add(string: workingDirectory.str)
                 md5.add(number: dependencies.hashValue)
-                self.signature = md5.signature
+                self.signature = signature ?? md5.signature
             }
 
             public func serialize<T>(to serializer: T) where T : Serializer {
@@ -361,6 +361,34 @@ extension LibSwiftDriver {
                 self.afterCompilationIndices = afterCompilationIndices
                 self.verificationIndices = verificationIndices
                 self.workingDirectory = workingDirectory
+            }
+
+            /// Rebase build-wide explicit IDs for a pristine replay graph. Target
+            /// indices and execution phase ranges remain unchanged.
+            func remappingExplicitKeys(_ mapping: [JobKey: JobKey]) throws -> Self {
+                func remap(_ key: JobKey) throws -> JobKey {
+                    guard case .explicitDependencyJob = key else { return key }
+                    guard let value = mapping[key] else {
+                        throw StubError.error("Cached plan contains an unmapped explicit dependency.")
+                    }
+                    return value
+                }
+                return try Self(
+                    plannedTargetJobs: plannedTargetJobs.map { job in
+                        PlannedSwiftDriverJob(
+                            key: try remap(job.key), driverJob: job.driverJob,
+                            dependencies: try job.dependencies.map(remap),
+                            workingDirectory: job.workingDirectory, signature: job.signature
+                        )
+                    },
+                    producerMap: producerMap.mapValues(remap),
+                    explicitModuleBuildJobKeys: Set(explicitModuleBuildJobKeys.map(remap)),
+                    compilationRequirementsIndices: compilationRequirementsIndices,
+                    compilationIndices: compilationIndices,
+                    afterCompilationIndices: afterCompilationIndices,
+                    verificationIndices: verificationIndices,
+                    workingDirectory: workingDirectory
+                )
             }
 
             public func invalidatingCompilationCacheKeys(

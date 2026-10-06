@@ -75,6 +75,48 @@ public struct SwiftDriverPlanCacheSnapshot: Serializable {
         self.transitiveDependencyModuleNames = transitiveDependencyModuleNames
     }
 
+    /// A recorded target selects sparse IDs from the build-wide tracker. Replay
+    /// uses a fresh tracker, so remap the entire execution graph with a bijection.
+    func rebasedForReplay() throws -> Self {
+        typealias Key = LibSwiftDriver.JobKey
+        let keys = explicitModuleJobs.map(\.key)
+        guard keys == keys.sorted(), Set(keys).count == keys.count,
+              Set(keys) == plannedBuild.explicitModuleBuildJobKeys else {
+            throw StubError.error("Cached explicit dependency coverage is inconsistent.")
+        }
+        var mapping: [Key: Key] = [:]
+        var uniqueIDs: Set<Int> = []
+        for (index, job) in explicitModuleJobs.enumerated() {
+            guard case .explicitDependencyJob(let oldIndex) = job.key, oldIndex >= 0,
+                  case .explicitModule(let uniqueID) = job.driverJob.kind,
+                  uniqueIDs.insert(uniqueID).inserted,
+                  job.workingDirectory == plannedBuild.workingDirectory else {
+                throw StubError.error("Cached explicit dependency identity is inconsistent.")
+            }
+            mapping[job.key] = .explicitDependencyJob(index)
+        }
+        func remap(_ key: Key) throws -> Key {
+            guard case .explicitDependencyJob = key else { return key }
+            guard let value = mapping[key] else {
+                throw StubError.error("Cached plan contains an unmapped explicit dependency.")
+            }
+            return value
+        }
+        return try Self(
+            plannedBuild: plannedBuild.remappingExplicitKeys(mapping),
+            explicitModuleJobs: explicitModuleJobs.map { job in
+                LibSwiftDriver.PlannedBuild.PlannedSwiftDriverJob(
+                    key: try remap(job.key), driverJob: job.driverJob,
+                    dependencies: try job.dependencies.map(remap),
+                    workingDirectory: job.workingDirectory, signature: job.signature
+                )
+            },
+            swiftmodulesNeedingRegistration: swiftmodulesNeedingRegistration,
+            planningDependencies: planningDependencies,
+            transitiveDependencyModuleNames: transitiveDependencyModuleNames
+        )
+    }
+
     public func invalidatingCompilationCacheKeys(
         for source: Path
     ) -> (snapshot: Self, invalidatedJobCount: Int) {
@@ -394,15 +436,26 @@ public final class SwiftModuleDependencyGraph: SwiftGlobalExplicitDependencyGrap
             throw StubError.error("Swift Driver plan replay currently requires a pristine single-target graph.")
         }
 
+        let snapshot = try snapshot.rebasedForReplay()
         var producerMap = snapshot.plannedBuild.producerMap
-        let expectedExplicitKeys = snapshot.plannedBuild.explicitModuleBuildJobKeys
-        let installedExplicitKeys = try addExplicitDependencyBuildJobs(
+        // Validate a private tracker before publishing anything to the graph.
+        // A rejected cache must leave Apple fallback planning pristine.
+        var tracker = GlobalExplicitDependencyTracker()
+        let installedExplicitKeys = try tracker.addExplicitDependencyBuildJobs(
             snapshot.explicitModuleJobs.map(\.driverJob),
             workingDirectory: workingDirectory,
             producerMap: &producerMap
         )
-        guard installedExplicitKeys == expectedExplicitKeys else {
+        guard installedExplicitKeys == snapshot.plannedBuild.explicitModuleBuildJobKeys,
+              producerMap == snapshot.plannedBuild.producerMap else {
             throw StubError.error("Cached Swift Driver explicit-module keys did not reproduce.")
+        }
+        for original in snapshot.explicitModuleJobs {
+            guard let rebuilt = tracker.plannedExplicitDependencyBuildJob(for: original.key),
+                  rebuilt.dependencies == original.dependencies,
+                  rebuilt.workingDirectory == original.workingDirectory else {
+                throw StubError.error("Cached Swift Driver explicit-module dependencies did not reproduce.")
+            }
         }
 
         let cachedDriver = try LibSwiftDriver(
@@ -418,7 +471,10 @@ public final class SwiftModuleDependencyGraph: SwiftGlobalExplicitDependencyGrap
             eagerCompilationEnabled: eagerCompilationEnabled,
             casOptions: casOptions
         )
-        register(key: key, driver: cachedDriver)
+        registryQueue.blocking_sync {
+            globalExplicitDependencyTracker = tracker
+            registry[key] = cachedDriver
+        }
     }
     #endif
 

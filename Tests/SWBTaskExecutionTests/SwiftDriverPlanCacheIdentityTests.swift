@@ -9,6 +9,7 @@
 
 #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
 
+import Foundation
 import Testing
 
 import SWBTaskExecution
@@ -95,6 +96,23 @@ fileprivate struct SwiftDriverPlanCacheIdentityTests {
         #expect(first == repeated)
         #expect(first.count == 64)
         #expect(first != changed)
+    }
+
+    @Test
+    func liveCASReferenceIdentityIgnoresJSONMemberOrder() throws {
+        let reference = SwiftDriverPlanLiveCASReference(
+            actionKey: baseKey, casPath: "/tmp/cas-a"
+        )
+        let first = Data("{\"schema\":\"swift-driver-plan-live-cas-reference-v1\",\"actionKey\":\"\(baseKey)\",\"casPath\":\"/tmp/cas-a\"}".utf8)
+        let reordered = Data("{\"casPath\":\"/tmp/cas-a\",\"actionKey\":\"\(baseKey)\",\"schema\":\"swift-driver-plan-live-cas-reference-v1\"}".utf8)
+        #expect(first != reordered)
+        #expect(try JSONDecoder().decode(SwiftDriverPlanLiveCASReference.self, from: first) == reference)
+        #expect(try JSONDecoder().decode(SwiftDriverPlanLiveCASReference.self, from: reordered) == reference)
+        let changed = Data(String(decoding: reordered, as: UTF8.self).replacingOccurrences(of: "/tmp/cas-a", with: "/tmp/cas-b").utf8)
+        #expect(try JSONDecoder().decode(SwiftDriverPlanLiveCASReference.self, from: changed) != reference)
+        #expect(throws: (any Error).self) {
+            try JSONDecoder().decode(SwiftDriverPlanLiveCASReference.self, from: Data("{}".utf8))
+        }
     }
 
     @Test

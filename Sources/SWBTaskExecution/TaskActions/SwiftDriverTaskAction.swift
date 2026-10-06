@@ -270,7 +270,7 @@ private struct SwiftDriverPlanCacheConfiguration {
         )
         if fileManager.fileExists(atPath: liveCASReferencePath.str) {
             let existing = try Data(contentsOf: URL(fileURLWithPath: liveCASReferencePath.str))
-            guard existing == encoded else {
+            guard try JSONDecoder().decode(SwiftDriverPlanLiveCASReference.self, from: existing) == reference else {
                 throw StubError.error("Live Swift Driver planning CAS reference conflict.")
             }
             return
@@ -288,8 +288,10 @@ private struct SwiftDriverPlanCacheConfiguration {
             )
         } catch {
             if fileManager.fileExists(atPath: liveCASReferencePath.str),
-               try Data(contentsOf: URL(fileURLWithPath: liveCASReferencePath.str))
-                    == encoded {
+               try JSONDecoder().decode(
+                    SwiftDriverPlanLiveCASReference.self,
+                    from: Data(contentsOf: URL(fileURLWithPath: liveCASReferencePath.str))
+                ) == reference {
                 return
             }
             throw error
