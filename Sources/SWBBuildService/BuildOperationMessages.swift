@@ -1075,6 +1075,32 @@ final class OperationDelegate: BuildOperationDelegate {
 
     fileprivate unowned let activeBuild: ActiveBuild
     private let activeTargets = SWBMutex<[ConfiguredTarget.GUID: TargetInfo]>([:])
+    // Operation callbacks are serialized; build completion follows their drained queue.
+    private var skippedParentCoverage = SwiftDriverSkippedParentCoverage()
+    private var skippedParentTasks: [String: any ExecutableTask] = [:]
+    private var skippedDiagnosticCount = 0
+    private func skippedDiagnostic(_ reason: String) {
+        guard ProcessInfo.processInfo.environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_ALLOW_UNAFFECTED_NATIVE_PLANNING"] == "1",
+              skippedDiagnosticCount < 64 else { return }
+        skippedDiagnosticCount += 1
+        request.send(BuildOperationConsoleOutputEmitted(data: Array((
+            "SWIFT_DRIVER_SKIPPED_DIAGNOSTIC reason=\(reason)\n").utf8)))
+    }
+    private func observeSkippedParent(_ task: any ExecutableTask, upToDate: Bool) {
+        guard (task.ruleInfo.first ?? "").hasPrefix("SwiftDriver") else { return }
+        do {
+            guard let value = try SwiftDriverTaskAction.skippedPlanningIdentity(task,
+                environment: ProcessInfo.processInfo.environment) else {
+                skippedParentCoverage.rejectUncorrelatableRequester()
+                skippedDiagnostic("identity-policy-rejected"); return
+            }
+            skippedDiagnostic(upToDate ? "parent-up-to-date" : "parent-executed")
+            skippedParentCoverage.observe(key: value.key, identity: value.identity,
+                role: task.ruleInfo.first ?? "", taskID: task.identifier.rawValue, upToDate: upToDate)
+            if upToDate { skippedParentTasks[value.key] = task }
+        } catch { skippedParentCoverage.rejectUncorrelatableRequester(); skippedDiagnostic("identity-validation-failed") }
+    }
+
     fileprivate var activeTasks: ObjectIDMapping<any ExecutableTask> {
         activeBuild.activeTasks
     }
@@ -1196,6 +1222,20 @@ final class OperationDelegate: BuildOperationDelegate {
             }
         }
         let realStatus = status ?? taskCompletionBasedStatus
+        for key in skippedParentCoverage.qualifiedKeys(operationSucceeded: realStatus == .succeeded) {
+            guard let task = skippedParentTasks[key] else { continue }
+            do {
+                guard let value = try SwiftDriverTaskAction.skippedPlanningIdentity(task,
+                    environment: ProcessInfo.processInfo.environment), value.key == key,
+                      skippedParentCoverage.terminalIdentityMatches(key: key, identity: value.identity),
+                      let proof = try SwiftDriverTaskAction.cachedUpToDateProof(task,
+                        fs: localFS, environment: ProcessInfo.processInfo.environment) else {
+                    skippedDiagnostic("terminal-snapshot-proof-rejected"); continue
+                }
+                request.send(BuildOperationConsoleOutputEmitted(data: Array((proof + "\n").utf8)))
+            } catch { skippedDiagnostic("terminal-snapshot-validation-failed") }
+        }
+
         acceleratorTraceWriter?.buildFinished(status: realStatus, metrics: metrics)
         activeBuild.completeBuild(status: realStatus, metrics: metrics)
         return realStatus
@@ -1320,12 +1360,7 @@ final class OperationDelegate: BuildOperationDelegate {
 
     func taskUpToDate(_ operation: any BuildSystemOperation, taskIdentifier: TaskIdentifier, task: any ExecutableTask) {
         acceleratorTraceWriter?.taskUpToDate(taskIdentifier: taskIdentifier, task: task, reason: .buildDatabase)
-        // The scheduler has verified this exact planning task against its build database.
-        // Failed snapshot/source/key proof emits no accepted event; CLI exact coverage still rejects.
-        if let proof = try? SwiftDriverTaskAction.cachedUpToDateProof(task,
-            fs: localFS, environment: ProcessInfo.processInfo.environment) {
-            request.send(BuildOperationConsoleOutputEmitted(data: Array((proof + "\n").utf8)))
-        }
+        observeSkippedParent(task, upToDate: true)
 
         guard !skipCommandLevelInformation else { return }
 
@@ -1363,6 +1398,7 @@ final class OperationDelegate: BuildOperationDelegate {
     }
 
     func taskStarted(_ operation: any BuildSystemOperation, taskIdentifier: TaskIdentifier, task: any ExecutableTask, dependencyInfo: CommandLineDependencyInfo?) -> any TaskOutputDelegate {
+        observeSkippedParent(task, upToDate: false)
         acceleratorTraceWriter?.taskStarted(taskIdentifier: taskIdentifier, task: task)
 
         if SwiftBuildOptPhaseTimeline.isProcessEnabled {
@@ -1437,10 +1473,26 @@ final class OperationDelegate: BuildOperationDelegate {
 
     func taskRequestedDynamicTask(_ operation: any BuildSystemOperation, requestingTask: any ExecutableTask, dynamicTaskIdentifier: TaskIdentifier) {
         acceleratorTraceWriter?.taskRequestedDynamicTask(requestingTask: requestingTask, dynamicTaskIdentifier: dynamicTaskIdentifier)
+        if (requestingTask.ruleInfo.first ?? "").hasPrefix("SwiftDriver") {
+            if let value = try? SwiftDriverTaskAction.skippedPlanningIdentity(requestingTask,
+                environment: ProcessInfo.processInfo.environment) {
+                skippedParentCoverage.requestedDynamicTask(key: value.key)
+            } else { skippedParentCoverage.rejectUncorrelatableRequester() }
+            skippedDiagnostic("dynamic-request-disqualifies")
+        }
+
     }
 
     func registeredDynamicTask(_ operation: any SWBBuildSystem.BuildSystemOperation, task: any SWBCore.ExecutableTask, dynamicTaskIdentifier: SWBCore.TaskIdentifier) {
         acceleratorTraceWriter?.registeredDynamicTask(task: task, dynamicTaskIdentifier: dynamicTaskIdentifier)
+        if task.ruleInfo.first == "SwiftDriver" {
+            if let value = try? SwiftDriverTaskAction.skippedPlanningIdentity(task,
+                environment: ProcessInfo.processInfo.environment) {
+                skippedParentCoverage.requestedDynamicTask(key: value.key)
+            } else { skippedParentCoverage.rejectUncorrelatableRequester() }
+            skippedDiagnostic("dynamic-registration-disqualifies")
+        }
+
     }
 
     func taskComplete(_ operation: any BuildSystemOperation, taskIdentifier: TaskIdentifier, task: any ExecutableTask, delegate taskDelegate: any TaskOutputDelegate) {

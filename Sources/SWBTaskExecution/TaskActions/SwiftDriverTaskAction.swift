@@ -473,6 +473,33 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
         }
     }
 
+    /// Shared identity of any planning requester, including unsupported scheduling shapes.
+    package static func skippedPlanningIdentity(_ task: any ExecutableTask,
+        environment: [String: String]) throws -> (key: String, identity: String)? {
+        #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+        let environment = environment.merging(task.environment.bindingsDictionary,
+            uniquingKeysWith: { _, taskValue in taskValue })
+        guard environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_ALLOW_UNAFFECTED_NATIVE_PLANNING"] == "1",
+              let payload = task.payload as? SwiftTaskPayload, let driver = payload.driverPayload,
+              driver.eagerCompilationEnabled,
+              let configuration = try SwiftDriverPlanCacheConfiguration(environment: environment),
+              configuration.mode == .replay, configuration.keyScope == .driver,
+              configuration.useLiveCAS else { return nil }
+        let scoped = configuration.scoped(to: swiftDriverPlanCacheScopeIdentity(
+            moduleName: driver.moduleName, outputPrefix: driver.outputPrefix,
+            variant: driver.variant, architecture: driver.architecture,
+            ruleInfo: driver.ruleInfo, commandLine: driver.commandLine))
+        let serializer = MsgPackSerializer(); serializer.serialize(payload)
+        let context = SHA256Context(); context.add(bytes: serializer.byteString.bytes)
+        for field in [task.workingDirectory.str] + environment.keys.sorted().flatMap({ [$0, environment[$0]!] }) {
+            let bytes = Array(field.utf8); context.add(number: UInt64(bytes.count)); context.add(bytes: bytes)
+        }
+        return (scoped.key, context.signature.asString)
+        #else
+        return nil
+        #endif
+    }
+
     /// Called only by the authoritative build-database up-to-date scheduler callback.
     /// This proves the planning task was skipped, not that compilation or product publication succeeded.
     package static func cachedUpToDateProof(_ task: any ExecutableTask,
@@ -481,14 +508,14 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
         let environment = environment.merging(task.environment.bindingsDictionary,
             uniquingKeysWith: { _, taskValue in taskValue })
         guard environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_ALLOW_UNAFFECTED_NATIVE_PLANNING"] == "1",
-              task.ruleInfo.first == "SwiftDriver",
-              task.commandLine.starts(with: ["builtin-SwiftDriver", "--"]),
+              ["SwiftDriver", "SwiftDriver Compilation Requirements", "SwiftDriver Compilation"].contains(task.ruleInfo.first ?? ""),
               let payload = task.payload as? SwiftTaskPayload, let driver = payload.driverPayload,
               driver.eagerCompilationEnabled,
               let configuration = try SwiftDriverPlanCacheConfiguration(environment: environment),
               configuration.mode == .replay, configuration.keyScope == .driver,
               configuration.useLiveCAS, let source = configuration.invalidateSource,
               let cas = driver.casOptions else { return nil }
+        guard driver.commandLine.starts(with: ["builtin-SwiftDriver", "--"]) else { return nil }
         let timer = ElapsedTimer()
         let canonical = try fs.realpath(source)
         guard try fs.getFileInfo(canonical).isFile else { return nil }
