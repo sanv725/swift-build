@@ -167,44 +167,122 @@ private struct GlobalExplicitDependencyTracker {
     /// The collection of *all* explicit module dependency build jobs found so far
     fileprivate private(set) var plannedExplicitDependencyJobs: [LibSwiftDriver.PlannedBuild.PlannedSwiftDriverJob] = []
 
+    /// Stage both tracker and caller map: a collision must not publish half a
+    /// batch or corrupt the caller's Apple planning state.
     mutating func addExplicitDependencyBuildJobs(_ jobs: [SwiftDriverJob], workingDirectory: Path,
                                                  producerMap: inout [Path: LibSwiftDriver.JobKey]) throws -> Set<LibSwiftDriver.JobKey> {
-        // Filter out "new" unique jobs and populate the `producerMap`
-        var jobKeys: Set<LibSwiftDriver.JobKey> = []
-        var jobsWithIndices: [(SwiftDriverJob, LibSwiftDriver.JobIndex)] = []
-        for job in jobs {
-            guard case let .explicitModule(uniqueID) = job.kind else {
-                throw StubError.error("Unexpected job in explicit module builds: \(job.descriptionForLifecycle).")
-            }
-            let trackerIndex: Int
-            if let existingIndex = uniqueIndexMap[uniqueID] {
-                trackerIndex = existingIndex
-                jobKeys.insert(LibSwiftDriver.JobKey.explicitDependencyJob(trackerIndex))
-            } else {
-                trackerIndex = plannedExplicitDependencyJobs.endIndex + jobsWithIndices.count
-                jobsWithIndices.append((job, trackerIndex))
-            }
-            try LibSwiftDriver.PlannedBuild.addProducts(of: job, index: .explicitDependencyJob(trackerIndex), knownJobs: [], to: &producerMap)
-        }
-
-        // Once the producerMap has been populated, create the actual PlannedDriverJobs
-        for (job, trackerIndex) in jobsWithIndices {
-            guard case let .explicitModule(uniqueID) = job.kind else {
-                throw StubError.error("Unexpected job in explicit module builds: \(job.descriptionForLifecycle).")
-            }
-            let jobKey = LibSwiftDriver.JobKey.explicitDependencyJob(trackerIndex)
-            let inputs = job.inputs.compactMap { producerMap[$0] }
-            let dependencies = Set(inputs).sorted()
-            let plannedJob = LibSwiftDriver.PlannedBuild.PlannedSwiftDriverJob(key: jobKey, driverJob: job, dependencies: dependencies, workingDirectory: workingDirectory)
-            assert(trackerIndex == plannedExplicitDependencyJobs.endIndex)
-            plannedExplicitDependencyJobs.append(plannedJob)
-            uniqueIndexMap[uniqueID] = trackerIndex
-            jobKeys.insert(jobKey)
-        }
-
-        assert(jobKeys.count == jobs.count)
-        return jobKeys
+        var staged = self
+        var producers = producerMap
+        let keys = try staged.stageExplicitJobs(jobs, workingDirectory: workingDirectory, producerMap: &producers)
+        self = staged
+        producerMap = producers
+        return keys
     }
+
+    private mutating func stageExplicitJobs(_ jobs: [SwiftDriverJob], workingDirectory: Path,
+                                            producerMap: inout [Path: LibSwiftDriver.JobKey]) throws -> Set<LibSwiftDriver.JobKey> {
+        typealias Planned = LibSwiftDriver.PlannedBuild.PlannedSwiftDriverJob
+        typealias Key = LibSwiftDriver.JobKey
+        let initialCount = plannedExplicitDependencyJobs.count
+        var selected: [(SwiftDriverJob, Int)] = []
+        for job in jobs {
+            guard case let .explicitModule(uid) = job.kind else {
+                throw StubError.error("Unexpected target job in explicit module builds.")
+            }
+            let index: Int
+            if let existing = uniqueIndexMap[uid] {
+                let candidate = plannedExplicitDependencyJobs[existing]
+                guard candidate.driverJob.hasSameExplicitAction(as: job), candidate.workingDirectory == workingDirectory else {
+                    throw StubError.error("Explicit module UID collision with incompatible action.")
+                }
+                index = existing
+            } else if let existing = plannedExplicitDependencyJobs.firstIndex(where: {
+                $0.workingDirectory == workingDirectory && $0.driverJob.hasSameExplicitAction(as: job)
+            }) {
+                index = existing
+            } else {
+                index = plannedExplicitDependencyJobs.count
+                plannedExplicitDependencyJobs.append(Planned(key: .explicitDependencyJob(index), driverJob: job, dependencies: [], workingDirectory: workingDirectory))
+            }
+            uniqueIndexMap[uid] = index
+            let key = Key.explicitDependencyJob(index)
+            for output in job.outputs {
+                if let previous = producerMap[output], previous != key {
+                    throw StubError.error("Explicit module output has an incompatible producer: \(output).")
+                }
+                producerMap[output] = key
+            }
+            selected.append((job, index))
+        }
+        var established: Set<Int> = []
+        for (job, index) in selected {
+            let dependencies = Set(job.inputs.compactMap { producerMap[$0] }).sorted()
+            guard dependencies.allSatisfy({ if case .explicitDependencyJob = $0 { return true }; return false }),
+                  !dependencies.contains(.explicitDependencyJob(index)) else {
+                throw StubError.error("Explicit module dependencies include a target or self edge.")
+            }
+            if index < initialCount || established.contains(index) {
+                guard plannedExplicitDependencyJobs[index].dependencies == dependencies else {
+                    throw StubError.error("Explicit module action has incompatible dependencies.")
+                }
+            } else {
+                plannedExplicitDependencyJobs[index] = Planned(key: .explicitDependencyJob(index), driverJob: job, dependencies: dependencies, workingDirectory: workingDirectory)
+                established.insert(index)
+            }
+        }
+        var visiting: Set<Int> = []
+        var visited: Set<Int> = []
+        func visit(_ index: Int) throws {
+            guard plannedExplicitDependencyJobs.indices.contains(index) else { throw StubError.error("Unknown explicit dependency edge.") }
+            if visited.contains(index) { return }
+            guard visiting.insert(index).inserted else { throw StubError.error("Explicit dependency cycle.") }
+            for dependency in plannedExplicitDependencyJobs[index].dependencies {
+                guard case .explicitDependencyJob(let next) = dependency else { throw StubError.error("Explicit dependency is a target edge.") }
+                try visit(next)
+            }
+            visiting.remove(index)
+            visited.insert(index)
+        }
+        for index in plannedExplicitDependencyJobs.indices { try visit(index) }
+        return Set(selected.map { .explicitDependencyJob($0.1) })
+    }
+
+    #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+    /// Reuse a live signature for shared jobs; newly imported jobs retain the
+    /// recorded signature rather than recomputing a process-local hash.
+    mutating func importingCachedJobs(_ jobs: [LibSwiftDriver.PlannedBuild.PlannedSwiftDriverJob],
+                                     workingDirectory: Path) throws -> [LibSwiftDriver.JobKey: LibSwiftDriver.JobKey] {
+        let initialCount = plannedExplicitDependencyJobs.count
+        var producers: [Path: LibSwiftDriver.JobKey] = [:]
+        let keys = try addExplicitDependencyBuildJobs(jobs.map(\.driverJob), workingDirectory: workingDirectory, producerMap: &producers)
+        var mapping: [LibSwiftDriver.JobKey: LibSwiftDriver.JobKey] = [:]
+        for job in jobs {
+            guard let index = plannedExplicitDependencyJobs.firstIndex(where: {
+                $0.workingDirectory == job.workingDirectory && $0.driverJob.hasSameExplicitAction(as: job.driverJob)
+            }), keys.contains(.explicitDependencyJob(index)) else {
+                throw StubError.error("Cached explicit module action did not reproduce.")
+            }
+            mapping[job.key] = .explicitDependencyJob(index)
+        }
+        for job in jobs {
+            guard let key = mapping[job.key], case .explicitDependencyJob(let index) = key else {
+                throw StubError.error("Cached explicit module key is unmapped.")
+            }
+            let dependencies = try job.dependencies.map { dependency -> LibSwiftDriver.JobKey in
+                guard let mapped = mapping[dependency] else { throw StubError.error("Cached explicit dependency is unmapped.") }
+                return mapped
+            }
+            guard Set(dependencies).sorted() == plannedExplicitDependencyJobs[index].dependencies else {
+                throw StubError.error("Cached explicit module dependencies did not reproduce.")
+            }
+            if index >= initialCount {
+                plannedExplicitDependencyJobs[index] = .init(key: key, driverJob: job.driverJob, dependencies: Set(dependencies).sorted(),
+                                                            workingDirectory: job.workingDirectory, signature: job.signature)
+            }
+        }
+        return mapping
+    }
+    #endif
 
     func getExplicitDependencyBuildJobs(for keys: [LibSwiftDriver.JobKey]) -> [LibSwiftDriver.PlannedBuild.PlannedSwiftDriverJob] {
         var jobs: [LibSwiftDriver.PlannedBuild.PlannedSwiftDriverJob] = []
@@ -259,6 +337,40 @@ public final class SwiftModuleDependencyGraph: SwiftGlobalExplicitDependencyGrap
     private let registryQueue = SWBQueue(label: "SwiftModuleDependencyGraph", autoreleaseFrequency: .workItem)
     private var registry: [String: LibSwiftDriver] = [:]
     private var globalExplicitDependencyTracker = GlobalExplicitDependencyTracker()
+    private enum OutputOwner: Equatable { case target(UUID), explicit(LibSwiftDriver.JobKey) }
+    private var outputOwners: [Path: OutputOwner] = [:]
+    private var issuedTargetTokens: Set<UUID> = []
+    private var revision: UInt64 = 0
+
+    // Tokens/reservations live until this graph is destroyed, including after
+    // cleanup. A late callback cannot acquire a removed target's outputs.
+    internal func makeTargetToken() -> UUID {
+        registryQueue.blocking_sync {
+            let token = UUID()
+            precondition(issuedTargetTokens.insert(token).inserted)
+            return token
+        }
+    }
+
+    private func reserving(_ outputs: [Path], for owner: OutputOwner,
+                          in reservations: [Path: OutputOwner]) throws -> [Path: OutputOwner] {
+        var result = reservations
+        for output in outputs {
+            if let previous = result[output], previous != owner {
+                throw StubError.error("Swift Driver output reservation collision: \(output).")
+            }
+            result[output] = owner
+        }
+        return result
+    }
+
+    internal func reserveTargetOutputs(_ outputs: [Path], token: UUID) throws {
+        try registryQueue.blocking_sync {
+            guard issuedTargetTokens.contains(token) else { throw StubError.error("Unknown target reservation token.") }
+            let reservations = try reserving(outputs, for: .target(token), in: outputOwners)
+            if reservations != outputOwners { outputOwners = reservations; revision += 1 }
+        }
+    }
 
     public init() {}
 
@@ -281,8 +393,12 @@ public final class SwiftModuleDependencyGraph: SwiftGlobalExplicitDependencyGrap
     public func planBuild(key: String, compilerLocation: LibSwiftDriver.CompilerLocation, target: ConfiguredTarget, args: [String], workingDirectory: Path, tempDirPath: Path, explicitModulesTempDirPath: Path, environment: [String: String], eagerCompilationEnabled: Bool, casOptions: CASOptions?) -> (success: Bool, diagnostics: [SWBUtil.Diagnostic]) {
         let result = LibSwiftDriver.createAndPlan(for: self, compilerLocation: compilerLocation, target: target, workingDirectory: workingDirectory, tempDirPath: tempDirPath, explicitModulesTempDirPath: explicitModulesTempDirPath, commandLine: args, environment: environment, eagerCompilationEnabled: eagerCompilationEnabled, casOptions: casOptions)
         if let driver = result.driver {
-            register(key: key, driver: driver)
-            return (true, result.diagnostics)
+            do {
+                try register(key: key, driver: driver)
+                return (true, result.diagnostics)
+            } catch {
+                return (false, result.diagnostics + [SWBUtil.Diagnostic(behavior: .error, location: .unknown, data: DiagnosticData(String(describing: error), component: .swiftCompilerError))])
+            }
         } else {
             return (false, result.diagnostics)
         }
@@ -396,6 +512,45 @@ public final class SwiftModuleDependencyGraph: SwiftGlobalExplicitDependencyGrap
     }
 
     #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+    @_spi(Testing) public var cachedPlanStagingHook: (() throws -> Void)?
+
+    @_spi(Testing) public func reserveNativeTargetForTesting(_ outputs: [Path], token: String? = nil) throws -> String {
+        let owner: UUID
+        if let token {
+            guard let parsed = UUID(uuidString: token) else { throw StubError.error("Malformed target reservation token.") }
+            owner = parsed
+        } else { owner = makeTargetToken() }
+        try reserveTargetOutputs(outputs, token: owner)
+        return owner.uuidString
+    }
+
+    @_spi(Testing) public func registerPlanForTesting(from key: String, as alias: String, lateOutputs: [Path]) throws {
+        let driver = try registryQueue.blocking_sync {
+            guard let driver = registry[key] else { throw StubError.error("Missing testing plan.") }
+            return driver
+        }
+        try register(key: alias, driver: driver, beforePublication: { token in
+            try self.reserveTargetOutputs(lateOutputs, token: token)
+        })
+    }
+
+    @_spi(Testing) public func publicationStateForTesting() -> SWBUtil.ByteString {
+        registryQueue.blocking_sync {
+            let serializer = MsgPackSerializer()
+            serializer.serialize(revision)
+            serializer.serialize(registry.keys.sorted())
+            serializer.serialize(globalExplicitDependencyTracker.plannedExplicitDependencyJobs)
+            for path in outputOwners.keys.sorted() {
+                serializer.serialize(path)
+                switch outputOwners[path]! {
+                case .target(let token): serializer.serialize(token.uuidString)
+                case .explicit(let key): serializer.serialize(key)
+                }
+            }
+            return serializer.byteString
+        }
+    }
+
     public func planCacheSnapshot(for key: String) async throws -> SwiftDriverPlanCacheSnapshot {
         let plannedBuild = try queryPlannedBuild(for: key)
         let plan = plannedBuild.cacheSnapshot()
@@ -429,35 +584,30 @@ public final class SwiftModuleDependencyGraph: SwiftGlobalExplicitDependencyGrap
         guard snapshot.plannedBuild.workingDirectory == workingDirectory else {
             throw StubError.error("Cached Swift Driver working directory does not match the current task.")
         }
-        let isPristine = registryQueue.blocking_sync {
-            registry.isEmpty && globalExplicitDependencyTracker.plannedExplicitDependencyJobs.isEmpty
+        // Snapshot graph state without entering any PlannedBuild queue.
+        let captured = registryQueue.blocking_sync { (revision, globalExplicitDependencyTracker, outputOwners) }
+        let rebased = try snapshot.rebasedForReplay()
+        var tracker = captured.1
+        let mapping = try tracker.importingCachedJobs(rebased.explicitModuleJobs, workingDirectory: workingDirectory)
+        let plan = try rebased.plannedBuild.remappingExplicitKeys(mapping)
+        let snapshot = SwiftDriverPlanCacheSnapshot(
+            plannedBuild: plan,
+            explicitModuleJobs: tracker.getExplicitDependencyBuildJobs(for: Array(plan.explicitModuleBuildJobKeys).sorted()),
+            swiftmodulesNeedingRegistration: rebased.swiftmodulesNeedingRegistration,
+            planningDependencies: rebased.planningDependencies,
+            transitiveDependencyModuleNames: rebased.transitiveDependencyModuleNames)
+        var expectedProducers: [Path: LibSwiftDriver.JobKey] = [:]
+        for job in snapshot.plannedBuild.plannedTargetJobs + snapshot.explicitModuleJobs {
+            for output in job.driverJob.outputs { expectedProducers[output] = job.key }
         }
-        guard isPristine else {
-            throw StubError.error("Swift Driver plan replay currently requires a pristine single-target graph.")
+        guard expectedProducers == plan.producerMap,
+              Set(snapshot.explicitModuleJobs.map(\.key)) == plan.explicitModuleBuildJobKeys else {
+            throw StubError.error("Cached producer map or explicit key coverage did not reproduce.")
         }
-
-        let snapshot = try snapshot.rebasedForReplay()
-        var producerMap = snapshot.plannedBuild.producerMap
-        // Validate a private tracker before publishing anything to the graph.
-        // A rejected cache must leave Apple fallback planning pristine.
-        var tracker = GlobalExplicitDependencyTracker()
-        let installedExplicitKeys = try tracker.addExplicitDependencyBuildJobs(
-            snapshot.explicitModuleJobs.map(\.driverJob),
-            workingDirectory: workingDirectory,
-            producerMap: &producerMap
-        )
-        guard installedExplicitKeys == snapshot.plannedBuild.explicitModuleBuildJobKeys,
-              producerMap == snapshot.plannedBuild.producerMap else {
-            throw StubError.error("Cached Swift Driver explicit-module keys did not reproduce.")
+        var reservations = captured.2
+        for job in tracker.plannedExplicitDependencyJobs {
+            reservations = try reserving(job.driverJob.outputs, for: .explicit(job.key), in: reservations)
         }
-        for original in snapshot.explicitModuleJobs {
-            guard let rebuilt = tracker.plannedExplicitDependencyBuildJob(for: original.key),
-                  rebuilt.dependencies == original.dependencies,
-                  rebuilt.workingDirectory == original.workingDirectory else {
-                throw StubError.error("Cached Swift Driver explicit-module dependencies did not reproduce.")
-            }
-        }
-
         let cachedDriver = try LibSwiftDriver(
             cachedPlan: snapshot,
             graph: self,
@@ -471,27 +621,42 @@ public final class SwiftModuleDependencyGraph: SwiftGlobalExplicitDependencyGrap
             eagerCompilationEnabled: eagerCompilationEnabled,
             casOptions: casOptions
         )
-        registryQueue.blocking_sync {
+        let targetPublication = cachedDriver.plannedBuild.targetOutputPublication()
+        guard let token = targetPublication.token else { throw StubError.error("Missing cached target reservation token.") }
+        reservations = try reserving(targetPublication.outputs, for: .target(token), in: reservations)
+        try cachedPlanStagingHook?()
+        try registryQueue.blocking_sync {
+            guard revision == captured.0, registry[key] == nil, !issuedTargetTokens.contains(token) else {
+                throw StubError.error("Swift Driver graph changed during cached plan staging.")
+            }
+            issuedTargetTokens.insert(token)
             globalExplicitDependencyTracker = tracker
+            outputOwners = reservations
             registry[key] = cachedDriver
+            revision += 1
         }
     }
     #endif
 
-    /// Serialize incremental build state for the given key and removes its state from memory
+    /// Detach under the graph lock; incremental writes enter the plan queue and
+    /// must run outside it. Keep reservations for late callbacks.
     public func cleanUpForAllKeys() -> [SWBUtil.Diagnostic] {
-        registryQueue.blocking_sync {
-            defer { self.registry.removeAll() }
-            return self.registry.values.flatMap { $0.writeIncrementalBuildInformation() }
+        let drivers = registryQueue.blocking_sync {
+            let drivers = Array(registry.values)
+            registry.removeAll()
+            revision += 1
+            return drivers
         }
+        return drivers.flatMap { $0.writeIncrementalBuildInformation() }
     }
 
-    /// Serialize incremental build state for the given key and removes its state from memory
     public func cleanUp(key: String) -> [SWBUtil.Diagnostic] {
-        registryQueue.blocking_sync {
-            guard let driver = self.registry.removeValue(forKey: key) else { return [] }
-            return driver.writeIncrementalBuildInformation()
+        let driver = registryQueue.blocking_sync {
+            let driver = registry.removeValue(forKey: key)
+            revision += 1
+            return driver
         }
+        return driver?.writeIncrementalBuildInformation() ?? []
     }
 
     /// Get the CASDatabases from the casOptions
@@ -549,16 +714,34 @@ public final class SwiftModuleDependencyGraph: SwiftGlobalExplicitDependencyGrap
     }
     #endif
 
-    private func register(key: String, driver: LibSwiftDriver) {
-        registryQueue.async {
-            self.registry[key] = driver
+    private func register(key: String, driver: LibSwiftDriver, beforePublication: ((UUID) throws -> Void)? = nil) throws {
+        let publication = driver.plannedBuild.targetOutputPublication()
+        guard let token = publication.token else { throw StubError.error("Missing native target reservation token.") }
+        try beforePublication?(token)
+        try registryQueue.blocking_sync {
+            guard registry[key] == nil, issuedTargetTokens.contains(token) else { throw StubError.error("Duplicate Swift Driver target registration.") }
+            let reservations = try reserving(publication.outputs, for: .target(token), in: outputOwners)
+            outputOwners = reservations
+            registry[key] = driver
+            revision += 1
         }
     }
 
     public func addExplicitDependencyBuildJobs(_ jobs: [SwiftDriverJob], workingDirectory: Path,
                                                producerMap: inout [Path: LibSwiftDriver.JobKey]) throws -> Set<LibSwiftDriver.JobKey> {
         try registryQueue.blocking_sync {
-            try globalExplicitDependencyTracker.addExplicitDependencyBuildJobs(jobs, workingDirectory: workingDirectory, producerMap: &producerMap)
+            var tracker = globalExplicitDependencyTracker
+            var producers = producerMap
+            let keys = try tracker.addExplicitDependencyBuildJobs(jobs, workingDirectory: workingDirectory, producerMap: &producers)
+            var reservations = outputOwners
+            for job in tracker.getExplicitDependencyBuildJobs(for: Array(keys).sorted()) {
+                reservations = try reserving(job.driverJob.outputs, for: .explicit(job.key), in: reservations)
+            }
+            globalExplicitDependencyTracker = tracker
+            outputOwners = reservations
+            producerMap = producers
+            revision += 1
+            return keys
         }
     }
     public func getExplicitDependencyBuildJobs(for keys: [LibSwiftDriver.JobKey]) -> [LibSwiftDriver.PlannedBuild.PlannedSwiftDriverJob] {
@@ -985,7 +1168,8 @@ public final class LibSwiftDriver {
             cacheSnapshot: cachedPlan.plannedBuild,
             argsResolver: resolver,
             explicitModulesResolver: explicitModulesResolver,
-            globalExplicitDependencyJobGraph: graph
+            globalExplicitDependencyJobGraph: graph,
+            targetReservationToken: UUID()
         )
         self.intermoduleDependencyGraph = nil
         self.cachedPlanQueryResults = cachedPlan

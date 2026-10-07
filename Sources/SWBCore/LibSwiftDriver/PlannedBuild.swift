@@ -182,6 +182,18 @@ public struct SwiftDriverJob: Serializable, CustomDebugStringConvertible {
         self.cacheOutputKindGroups = orderedCacheEntries.map(\.outputKindNames)
     }
 
+    /// Explicit IDs use process-local Swift hashes; every serialized field other
+    /// than that ID remains part of the reusable action identity.
+    internal func hasSameExplicitAction(as other: Self) -> Bool {
+        guard case .explicitModule = kind, case .explicitModule = other.kind else { return false }
+        return ruleInfoType == other.ruleInfoType && moduleName == other.moduleName
+            && inputs == other.inputs && displayInputs == other.displayInputs
+            && outputs == other.outputs && commandLine == other.commandLine
+            && commandLineSignature == other.commandLineSignature
+            && descriptionForLifecycle == other.descriptionForLifecycle
+            && cacheKeys == other.cacheKeys && cacheOutputKindGroups == other.cacheOutputKindGroups
+    }
+
     public func serialize<T>(to serializer: T) where T : Serializer {
         serializer.serializeAggregate(11) {
             serializer.serialize(kind)
@@ -481,6 +493,20 @@ extension LibSwiftDriver {
         let workingDirectory: Path
 
         private var jobsUnfinished: Set<JobKey>
+        private let targetReservationToken: UUID?
+
+        /// Capture plan state before graph registration: graph code never enters
+        /// this queue while holding the graph queue.
+        internal func targetOutputPublication() -> (token: UUID?, outputs: [Path]) {
+            dispatchQueue.blocking_sync { (targetReservationToken, plannedTargetJobs.flatMap { $0.driverJob.outputs }) }
+        }
+
+        private func reserveOutputs(of jobs: [SwiftDriverJob]) throws {
+            if let graph = globalExplicitDependencyJobGraph as? SwiftModuleDependencyGraph {
+                guard let token = targetReservationToken else { throw StubError.error("Missing target reservation token.") }
+                try graph.reserveTargetOutputs(jobs.flatMap(\.outputs), token: token)
+            }
+        }
 
         #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
         private let isCachedPlan: Bool
@@ -488,6 +514,7 @@ extension LibSwiftDriver {
 
         internal init(workload: SwiftDriver.DriverExecutorWorkload, argsResolver: ArgsResolver, explicitModulesResolver: ArgsResolver, jobExecutionDelegate: (any JobExecutionDelegate)?, globalExplicitDependencyJobGraph: (any SwiftGlobalExplicitDependencyGraph)?, workingDirectory: Path, eagerCompilationEnabled: Bool) throws {
             self.globalExplicitDependencyJobGraph = globalExplicitDependencyJobGraph
+            self.targetReservationToken = (globalExplicitDependencyJobGraph as? SwiftModuleDependencyGraph)?.makeTargetToken()
             self.argsResolver = argsResolver
             self.explicitModulesResolver = explicitModulesResolver
             self.eagerCompilationEnabled = eagerCompilationEnabled
@@ -512,6 +539,7 @@ extension LibSwiftDriver {
             #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
             self.isCachedPlan = false
             #endif
+            try reserveOutputs(of: plannedTargetJobs.map(\.driverJob))
         }
 
         #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
@@ -519,9 +547,11 @@ extension LibSwiftDriver {
             cacheSnapshot: CacheSnapshot,
             argsResolver: ArgsResolver,
             explicitModulesResolver: ArgsResolver,
-            globalExplicitDependencyJobGraph: any SwiftGlobalExplicitDependencyGraph
+            globalExplicitDependencyJobGraph: any SwiftGlobalExplicitDependencyGraph,
+            targetReservationToken: UUID
         ) {
             self.globalExplicitDependencyJobGraph = globalExplicitDependencyJobGraph
+            self.targetReservationToken = targetReservationToken
             self.argsResolver = argsResolver
             self.explicitModulesResolver = explicitModulesResolver
             self.eagerCompilationEnabled = true
@@ -648,15 +678,15 @@ extension LibSwiftDriver {
         }
 
         @discardableResult
-        private static func addTargetJobs(_ driverJobs: [SwiftDriverJob], to jobs: inout [SwiftDriverJob], producing producerMap: inout [Path: JobKey]) throws -> Range<JobIndex> {
+        private static func addTargetJobs(_ driverJobs: [SwiftDriverJob], to jobs: inout [SwiftDriverJob], producing producerMap: inout [Path: JobKey], offset: Int = 0) throws -> Range<JobIndex> {
             let initialCount = jobs.count
 
             for job in driverJobs {
-                try addProducts(of: job, index: .targetJob(jobs.count), knownJobs: jobs, to: &producerMap)
+                try addProducts(of: job, index: .targetJob(offset + jobs.count), knownJobs: jobs, to: &producerMap)
                 jobs.append(job)
             }
 
-            return initialCount ..< jobs.count
+            return (offset + initialCount) ..< (offset + jobs.count)
         }
 
         internal static func addProducts(of job: SwiftDriverJob, index: JobKey, knownJobs: [SwiftDriverJob], to producerMap: inout [Path: JobKey]
@@ -788,13 +818,7 @@ extension LibSwiftDriver {
             try dispatchQueue.blocking_sync {
                 let skippedJobs = self.incrementalCompilationState?.skippedJobs ?? []
                 let wrappedJobs = try Self.wrapJobs(skippedJobs, argsResolver: argsResolver, explicitModulesResolver: explicitModulesResolver)
-                var jobs: [SwiftDriverJob] = []
-                try Self.addTargetJobs(wrappedJobs, to: &jobs, producing: &producerMap)
-                let plannedJobs: [PlannedSwiftDriverJob] = jobs.enumerated().map { index, jobToAdd in
-                    let givenDependencies = jobToAdd.inputs.compactMap { producerMap[$0] }
-                    return PlannedSwiftDriverJob(key: .targetJob(self.plannedTargetJobs.count + index), driverJob: jobToAdd, dependencies: givenDependencies, workingDirectory: workingDirectory)
-                }
-                plannedTargetJobs.append(contentsOf: plannedJobs)
+                let plannedJobs = try appendTargetJobs(wrappedJobs, originalJobs: skippedJobs, discovered: false)
 
                 assert(skippedJobs.count == plannedJobs.count, "Unable to plan all skipped driver jobs.")
                 for (driverJob, plannedJob) in zip(skippedJobs, plannedJobs) {
@@ -803,6 +827,35 @@ extension LibSwiftDriver {
                 }
             }
         }
+
+        /// Called with the plan queue held. Every map/job update is staged and
+        /// graph reservations are acquired before any publication or callback.
+        private func appendTargetJobs(_ wrappedJobs: [SwiftDriverJob], originalJobs: [SwiftDriver.Job], discovered: Bool) throws -> [PlannedSwiftDriverJob] {
+            var producers = producerMap
+            var jobs: [SwiftDriverJob] = []
+            let range = try Self.addTargetJobs(wrappedJobs, to: &jobs, producing: &producers, offset: plannedTargetJobs.count)
+            let plannedJobs = jobs.enumerated().map { index, job in
+                PlannedSwiftDriverJob(key: .targetJob(plannedTargetJobs.count + index), driverJob: job,
+                                      dependencies: Set(job.inputs.compactMap { producers[$0] }).sorted(), workingDirectory: workingDirectory)
+            }
+            var targets = plannedTargetJobs + plannedJobs
+            if discovered {
+                let keys = plannedJobs.map(\.key)
+                for index in afterCompilationIndices { targets[index] = targets[index].addingDependencies(keys) }
+            }
+            try reserveOutputs(of: jobs)
+            producerMap = producers
+            plannedTargetJobs = targets
+            driverTargetJobs.append(contentsOf: originalJobs)
+            if discovered { jobsUnfinished.formUnion(range.map { .targetJob($0) }) }
+            return plannedJobs
+        }
+
+        #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+        @_spi(Testing) public func appendTargetJobsForTesting(_ jobs: [SwiftDriverJob], discovered: Bool) throws -> [PlannedSwiftDriverJob] {
+            try dispatchQueue.blocking_sync { try appendTargetJobs(jobs, originalJobs: [], discovered: discovered) }
+        }
+        #endif
 
         public func getCrashReproducerCommand(for job: PlannedSwiftDriverJob, output dir: Path) async throws -> [String]? {
             #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
@@ -818,44 +871,28 @@ extension LibSwiftDriver {
         }
 
         public func getDiscoveredJobsAfterFinishing(job: PlannedSwiftDriverJob) throws -> [PlannedSwiftDriverJob] {
-
-            dispatchQueue.blocking_sync {
-                _ = self.jobsUnfinished.remove(job.key)
-            }
-
-            switch job.key {
-            case .explicitDependencyJob(_):
-                // Explicit dependency jobs do not participate in the incremental machinery
-                return []
-            case .targetJob(let jobIndex):
-                #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
-                if isCachedPlan { return [] }
-                #endif
-                // result is not used but needed for API compatibility
-                let result = TSCBasic.ProcessResult(arguments: [], environmentBlock: ProcessEnvironmentBlock(), exitStatus: .terminated(code: 0), output: .success([]), stderrOutput: .success([]))
-                guard let newJobs = try incrementalCompilationState?.collectJobsDiscoveredToBeNeededAfterFinishing(job: driverTargetJobs[jobIndex], result: result) else {
+            try dispatchQueue.blocking_sync {
+                switch job.key {
+                case .explicitDependencyJob:
+                    jobsUnfinished.remove(job.key)
                     return []
-                }
-                let wrappedJobs = try Self.wrapJobs(newJobs, argsResolver: argsResolver, explicitModulesResolver: explicitModulesResolver)
-                var jobs: [SwiftDriverJob] = []
-                return try dispatchQueue.blocking_sync {
-                    let plannedJobsRange = try Self.addTargetJobs(wrappedJobs, to: &jobs, producing: &producerMap)
-                    let plannedJobs: [PlannedSwiftDriverJob] = jobs.enumerated().map { index, jobToAdd in
-                        let givenDependencies = jobToAdd.inputs.compactMap { producerMap[$0] }
-                        return PlannedSwiftDriverJob(key: .targetJob(self.plannedTargetJobs.count + index), driverJob: jobToAdd, dependencies: givenDependencies, workingDirectory: workingDirectory)
+                case .targetJob(let jobIndex):
+                    #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+                    if isCachedPlan { jobsUnfinished.remove(job.key); return [] }
+                    #endif
+                    let result = TSCBasic.ProcessResult(arguments: [], environmentBlock: ProcessEnvironmentBlock(), exitStatus: .terminated(code: 0), output: .success([]), stderrOutput: .success([]))
+                    guard let newJobs = try incrementalCompilationState?.collectJobsDiscoveredToBeNeededAfterFinishing(job: driverTargetJobs[jobIndex], result: result) else {
+                        jobsUnfinished.remove(job.key)
+                        return []
                     }
-                    self.plannedTargetJobs.append(contentsOf: plannedJobs)
-                    self.jobsUnfinished.formUnion(Set(plannedJobsRange.map { .targetJob($0) }))
-                    // Update secondary jobs' dependencies
-                    let newPrimaryJobsKeys = plannedJobs.map(\.key)
-                    for index in afterCompilationIndices {
-                        plannedTargetJobs[index] = plannedTargetJobs[index].addingDependencies(newPrimaryJobsKeys)
-                    }
-                    self.driverTargetJobs.append(contentsOf: newJobs)
-                    return plannedJobs
+                    let wrapped = try Self.wrapJobs(newJobs, argsResolver: argsResolver, explicitModulesResolver: explicitModulesResolver)
+                    let planned = try appendTargetJobs(wrapped, originalJobs: newJobs, discovered: true)
+                    jobsUnfinished.remove(job.key)
+                    return planned
                 }
             }
         }
+
     }
 }
 
