@@ -643,6 +643,9 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                                 try snapshot.validateForUnchangedNativePlanning(workingDirectory: task.workingDirectory)
                                 guard snapshot.provesSourceAbsent(for: source, canonicalize: { value in
                                     try? executionDelegate.fs.realpath(Path(value)).str
+                                }, isRegularFile: { value in
+                                    guard let path = try? executionDelegate.fs.realpath(Path(value)) else { return false }
+                                    return (try? executionDelegate.fs.getFileInfo(path).isFile) == true
                                 }) else {
                                     throw StubError.error("Unchanged source ownership is unsupported or ambiguous.")
                                 }
