@@ -12,7 +12,7 @@
 
 public import SWBCore
 import SWBLibc
-import SWBUtil
+package import SWBUtil
 import Foundation
 
 #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
@@ -501,6 +501,7 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
         guard info.isFile, info.size > 0, info.size <= 64 * 1024 * 1024 else { return nil }
         let readTimer = ElapsedTimer()
         let bytes = try fs.read(scoped.actionPath)
+        guard bytes.count > 0, bytes.count <= 64 * 1024 * 1024 else { return nil }
         let readNS = readTimer.elapsedTime().nanoseconds
         let snapshot: SwiftDriverPlanCacheSnapshot = try MsgPackDeserializer.deserialize(bytes)
         try snapshot.validateForUnchangedNativePlanning(workingDirectory: task.workingDirectory)
