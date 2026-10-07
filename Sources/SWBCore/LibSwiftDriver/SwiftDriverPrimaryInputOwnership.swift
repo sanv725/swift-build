@@ -24,6 +24,29 @@ public enum SwiftDriverPrimaryInputOwnership {
             && primary.contains(source)
     }
 
+    /// Opt-in ownership follows filesystem identity without rewriting serialized commands.
+    public static func owns(source: String, arguments: [String], inputs: [String],
+                            canonicalize: (String) -> String?, isRegularFile: (String) -> Bool) -> Bool {
+        guard source.hasPrefix("/"), let selected = canonicalize(source), isRegularFile(source),
+              !arguments.contains(where: {
+                  $0.hasPrefix("@") || $0.hasPrefix("-primary-filelist") || $0.hasPrefix("-filelist") ||
+                  $0 == "-wmo" || $0 == "-whole-module-optimization"
+              }) else { return false }
+        var canonicalInputs = Set<String>()
+        for input in inputs {
+            guard input.hasPrefix("/"), let path = canonicalize(input) else { return false }
+            canonicalInputs.insert(path)
+        }
+        guard canonicalInputs.contains(selected) else { return false }
+        var primaries = Set<String>()
+        for index in arguments.indices where arguments[index] == "-primary-file" {
+            guard index + 1 < arguments.count, arguments[index + 1].hasPrefix("/"),
+                  let path = canonicalize(arguments[index + 1]), isRegularFile(arguments[index + 1]),
+                  primaries.insert(path).inserted else { return false }
+        }
+        return !primaries.isEmpty && primaries.isSubset(of: canonicalInputs) && primaries.contains(selected)
+    }
+
     /// Positive absence proof for experimental native planning. Unsupported
     /// ownership and unresolved aliases remain unknown, never "unaffected".
     public static func provesAbsence(source: String, arguments: [String], inputs: [String],

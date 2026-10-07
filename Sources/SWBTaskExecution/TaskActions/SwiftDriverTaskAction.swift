@@ -473,6 +473,49 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
         }
     }
 
+    /// Called only by the authoritative build-database up-to-date scheduler callback.
+    /// This proves the planning task was skipped, not that compilation or product publication succeeded.
+    package static func cachedUpToDateProof(_ task: any ExecutableTask,
+        fs: any FSProxy, environment: [String: String]) throws -> String? {
+        #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+        let environment = environment.merging(task.environment.bindingsDictionary,
+            uniquingKeysWith: { _, taskValue in taskValue })
+        guard environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_ALLOW_UNAFFECTED_NATIVE_PLANNING"] == "1",
+              task.ruleInfo.first == "SwiftDriver",
+              task.commandLine.starts(with: ["builtin-SwiftDriver", "--"]),
+              let payload = task.payload as? SwiftTaskPayload, let driver = payload.driverPayload,
+              driver.eagerCompilationEnabled,
+              let configuration = try SwiftDriverPlanCacheConfiguration(environment: environment),
+              configuration.mode == .replay, configuration.keyScope == .driver,
+              configuration.useLiveCAS, let source = configuration.invalidateSource,
+              let cas = driver.casOptions else { return nil }
+        let timer = ElapsedTimer()
+        let canonical = try fs.realpath(source)
+        guard try fs.getFileInfo(canonical).isFile else { return nil }
+        let scoped = configuration.scoped(to: swiftDriverPlanCacheScopeIdentity(
+            moduleName: driver.moduleName, outputPrefix: driver.outputPrefix,
+            variant: driver.variant, architecture: driver.architecture,
+            ruleInfo: driver.ruleInfo, commandLine: driver.commandLine))
+        try scoped.validateLiveCASReference(at: cas.casPath)
+        let info = try fs.getFileInfo(scoped.actionPath)
+        guard info.isFile, info.size > 0, info.size <= 64 * 1024 * 1024 else { return nil }
+        let readTimer = ElapsedTimer()
+        let bytes = try fs.read(scoped.actionPath)
+        let readNS = readTimer.elapsedTime().nanoseconds
+        let snapshot: SwiftDriverPlanCacheSnapshot = try MsgPackDeserializer.deserialize(bytes)
+        try snapshot.validateForUnchangedNativePlanning(workingDirectory: task.workingDirectory)
+        guard snapshot.provesSourceAbsent(for: source, canonicalize: { value in
+            try? fs.realpath(Path(value)).str
+        }, isRegularFile: { value in
+            guard let path = try? fs.realpath(Path(value)) else { return false }
+            return (try? fs.getFileInfo(path).isFile) == true
+        }) else { return nil }
+        return "SWIFT_DRIVER_PLAN_CACHE outcome=unaffected_build_database_skipped key=\(scoped.key) base_key=\(scoped.baseKey) key_scope=driver cas_mode=live invalidated_jobs=0 source_owned_jobs=0 absence_proof=validated-v1 scheduler_proof=build_database bytes=\(bytes.count) direct_plan_bytes=0 duration_ns=\(timer.elapsedTime().nanoseconds) read_ns=\(readNS) apple_plan_ns=0 write_ns=0"
+        #else
+        return nil
+        #endif
+    }
+
     public override func performTaskAction(_ task: any ExecutableTask, dynamicExecutionDelegate: any DynamicTaskExecutionDelegate, executionDelegate: any TaskExecutionDelegate, clientDelegate: any TaskExecutionClientDelegate, outputDelegate: any TaskOutputDelegate) async -> CommandResult {
         guard let payload = task.payload as? SwiftTaskPayload, let driverPayload = payload.driverPayload else {
             outputDelegate.emitError("Invalid payload for Swift integrated driver support")
@@ -628,7 +671,14 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                         var snapshot: SwiftDriverPlanCacheSnapshot = try MsgPackDeserializer.deserialize(bytes)
                         if let source = planCacheConfiguration.invalidateSource {
                             let invalidation = snapshot.invalidatingCompilationCacheKeys(
-                                for: source
+                                for: source,
+                                canonicalize: allowUnaffectedNativePlanning ? { value in
+                                    try? executionDelegate.fs.realpath(Path(value)).str
+                                } : nil,
+                                isRegularFile: allowUnaffectedNativePlanning ? { value in
+                                    guard let path = try? executionDelegate.fs.realpath(Path(value)) else { return false }
+                                    return (try? executionDelegate.fs.getFileInfo(path).isFile) == true
+                                } : nil
                             )
                             if invalidation.invalidatedJobCount == 0, allowUnaffectedNativePlanning,
                                !planCacheConfiguration.mode.canWrite,

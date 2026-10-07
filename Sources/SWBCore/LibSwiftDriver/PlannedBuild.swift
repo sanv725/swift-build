@@ -404,18 +404,24 @@ extension LibSwiftDriver {
             }
 
             public func invalidatingCompilationCacheKeys(
-                for source: Path
+                for source: Path, canonicalize: ((String) -> String?)? = nil,
+                isRegularFile: ((String) -> Bool)? = nil
             ) -> (snapshot: Self, invalidatedJobCount: Int) {
                 var invalidatedJobCount = 0
                 let jobs = plannedTargetJobs.map { job in
-                    guard job.driverJob.ruleInfoType == "Compile",
-                          SwiftDriverPrimaryInputOwnership.owns(
-                            source: source.str,
-                            arguments: job.driverJob.commandLine.map { $0.asString },
-                            inputs: job.driverJob.inputs.map { $0.str }
-                          ) else {
-                        return job
+                    guard job.driverJob.ruleInfoType == "Compile" else { return job }
+                    let arguments = job.driverJob.commandLine.map { $0.asString }
+                    let inputs = job.driverJob.inputs.map { $0.str }
+                    let owns: Bool
+                    if let canonicalize, let isRegularFile {
+                        owns = SwiftDriverPrimaryInputOwnership.owns(source: source.str,
+                            arguments: arguments, inputs: inputs, canonicalize: canonicalize,
+                            isRegularFile: isRegularFile)
+                    } else {
+                        owns = SwiftDriverPrimaryInputOwnership.owns(source: source.str,
+                            arguments: arguments, inputs: inputs)
                     }
+                    guard owns else { return job }
                     invalidatedJobCount += 1
                     return job.invalidatingCompilationCacheKeys()
                 }

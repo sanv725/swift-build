@@ -121,3 +121,30 @@ struct SwiftDriverPrimaryInputOwnershipTests {
         #expect(!absence(base + ["-load-resolved-plugin", plugin], [other, source]))
     }
 }
+
+@Suite struct CanonicalPrimaryOwnershipTests {
+    @Test func canonicalAliasesDoNotBroadenOwnership() {
+        let source = "/private/tmp/Probe/Value.swift"
+        let alias = "/tmp/Probe/Value.swift"
+        let other = "/private/tmp/Probe/Other.swift"
+        func canonical(_ value: String) -> String? {
+            if value == source || value == alias { return source }
+            if value == other { return other }
+            return nil
+        }
+        func owns(_ args: [String], _ inputs: [String]) -> Bool {
+            SwiftDriverPrimaryInputOwnership.owns(source: source, arguments: args,
+                inputs: inputs, canonicalize: canonical, isRegularFile: { canonical($0) != nil })
+        }
+        #expect(owns(["-primary-file", alias], [alias]))
+        #expect(!SwiftDriverPrimaryInputOwnership.owns(source: source,
+            arguments: ["-primary-file", alias], inputs: [alias]))
+        #expect(!owns(["-primary-file", other], [source, other]))
+        #expect(!owns(["-primary-file", source, "-primary-file", alias], [source, alias]))
+        #expect(!owns(["-primary-file", source], [other]))
+        #expect(!owns(["-primary-file", "/tmp/Probe/Missing.swift"], [source]))
+        for flag in ["@response", "-primary-filelist", "-filelist", "-wmo", "-whole-module-optimization"] {
+            #expect(!owns(["-primary-file", source, flag], [source]))
+        }
+    }
+}

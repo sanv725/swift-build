@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 import struct Foundation.Date
+import class Foundation.ProcessInfo
 
 package import SWBBuildSystem
 public import SWBCore
@@ -1319,6 +1320,12 @@ final class OperationDelegate: BuildOperationDelegate {
 
     func taskUpToDate(_ operation: any BuildSystemOperation, taskIdentifier: TaskIdentifier, task: any ExecutableTask) {
         acceleratorTraceWriter?.taskUpToDate(taskIdentifier: taskIdentifier, task: task, reason: .buildDatabase)
+        // The scheduler has verified this exact planning task against its build database.
+        // Failed snapshot/source/key proof emits no accepted event; CLI exact coverage still rejects.
+        if let proof = try? SwiftDriverTaskAction.cachedUpToDateProof(task,
+            fs: localFS, environment: ProcessInfo.processInfo.environment) {
+            request.send(BuildOperationConsoleOutputEmitted(data: Array((proof + "\n").utf8)))
+        }
 
         guard !skipCommandLevelInformation else { return }
 

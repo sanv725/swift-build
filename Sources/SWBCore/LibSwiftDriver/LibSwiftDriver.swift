@@ -201,9 +201,11 @@ public struct SwiftDriverPlanCacheSnapshot: Serializable {
     }
 
     public func invalidatingCompilationCacheKeys(
-        for source: Path
+        for source: Path, canonicalize: ((String) -> String?)? = nil,
+        isRegularFile: ((String) -> Bool)? = nil
     ) -> (snapshot: Self, invalidatedJobCount: Int) {
-        let result = plannedBuild.invalidatingCompilationCacheKeys(for: source)
+        let result = plannedBuild.invalidatingCompilationCacheKeys(for: source,
+            canonicalize: canonicalize, isRegularFile: isRegularFile)
         return (
             Self(
                 plannedBuild: result.snapshot,
