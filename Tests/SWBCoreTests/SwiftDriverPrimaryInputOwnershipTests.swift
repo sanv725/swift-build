@@ -40,4 +40,39 @@ struct SwiftDriverPrimaryInputOwnershipTests {
             source: source, arguments: ["swift-frontend", "-primary-file", source],
             inputs: ["/tmp/App/Other.swift"]))
     }
+
+    @Test
+    func positiveAbsenceRequiresResolvedCompletePrimaryInputs() {
+        let other = "/tmp/Dependency/Other.swift"
+        let arguments = ["swift-frontend", "-primary-file", other]
+        let canonicalize: (String) -> String? = { $0 == "/tmp/alias.swift" ? source : $0 }
+        #expect(SwiftDriverPrimaryInputOwnership.provesAbsence(
+            source: source, arguments: arguments, inputs: [other], isCompile: true,
+            canonicalize: canonicalize))
+        for (args, inputs) in [
+            (arguments, [other, source]),
+            (arguments, [other, "/tmp/alias.swift"]),
+            (arguments + [source], [other]),
+            (arguments + ["@options.rsp"], [other]),
+            (arguments + ["-filelist", "/tmp/list"], [other]),
+            (arguments + ["-primary-filelist=/tmp/list"], [other]),
+            (arguments + ["-wmo"], [other]),
+            (arguments + ["-whole-module-optimization"], [other]),
+            (arguments + ["Other.swift"], [other]),
+            (arguments + ["-primary-file", other], [other]),
+            (arguments, []),
+            (["swift-frontend", "-primary-file"], [other]),
+            (["swift-frontend"], [other]),
+        ] {
+            #expect(!SwiftDriverPrimaryInputOwnership.provesAbsence(
+                source: source, arguments: args, inputs: inputs, isCompile: true,
+                canonicalize: canonicalize))
+        }
+        #expect(!SwiftDriverPrimaryInputOwnership.provesAbsence(
+            source: source, arguments: arguments, inputs: [other], isCompile: true,
+            canonicalize: { _ in nil }))
+        #expect(!SwiftDriverPrimaryInputOwnership.provesAbsence(
+            source: "Changed.swift", arguments: arguments, inputs: [other], isCompile: true,
+            canonicalize: canonicalize))
+    }
 }

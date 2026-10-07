@@ -519,6 +519,8 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
             var planCacheBytes = 0
             var directPlanBytes = 0
             var planCacheInvalidatedJobCount = 0
+            var pendingUnaffectedNativePlanning = false
+            var allowUnaffectedNativePlanning = false
             #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
             var dependencyObservationManifest: SwiftDependencyModuleManifest?
             var dependencyObservationOutcome = "off"
@@ -528,6 +530,15 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
             var dependencyPreflightConfiguration: SwiftDependencyShadowConfiguration?
             #endif
             do {
+                #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
+                let rawUnaffected = experimentControlEnvironment["SWIFT_BUILD_DRIVER_PLAN_CACHE_ALLOW_UNAFFECTED_NATIVE_PLANNING"] ?? "0"
+                #else
+                let rawUnaffected = environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_ALLOW_UNAFFECTED_NATIVE_PLANNING"] ?? "0"
+                #endif
+                guard rawUnaffected == "0" || rawUnaffected == "1" else {
+                    throw StubError.error("Invalid unaffected native planning policy.")
+                }
+                allowUnaffectedNativePlanning = rawUnaffected == "1"
                 #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
                 planCacheConfiguration = try SwiftDriverPlanCacheConfiguration(
                     environment: experimentControlEnvironment
@@ -619,30 +630,52 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                             let invalidation = snapshot.invalidatingCompilationCacheKeys(
                                 for: source
                             )
-                            guard invalidation.invalidatedJobCount == 1 else {
-                                throw StubError.error(
-                                    "Cached plan expected exactly one changed source job, found \(invalidation.invalidatedJobCount)."
-                                )
+                            if invalidation.invalidatedJobCount == 0, allowUnaffectedNativePlanning,
+                               !planCacheConfiguration.mode.canWrite,
+                               planCacheConfiguration.keyScope == .driver,
+                               planCacheConfiguration.useLiveCAS,
+                               driverPayload.eagerCompilationEnabled,
+                               source.isAbsolute {
+                                let canonicalSource = try executionDelegate.fs.realpath(source)
+                                guard try executionDelegate.fs.getFileInfo(canonicalSource).isFile else {
+                                    throw StubError.error("Unaffected native planning requires a regular source file.")
+                                }
+                                try snapshot.validateForUnchangedNativePlanning(workingDirectory: task.workingDirectory)
+                                guard snapshot.provesSourceAbsent(for: source, canonicalize: { value in
+                                    try? executionDelegate.fs.realpath(Path(value)).str
+                                }) else {
+                                    throw StubError.error("Unchanged source ownership is unsupported or ambiguous.")
+                                }
+                                pendingUnaffectedNativePlanning = true
+                            } else {
+                                guard invalidation.invalidatedJobCount == 1 else {
+                                    throw StubError.error(
+                                        "Cached plan expected exactly one changed source job, found \(invalidation.invalidatedJobCount)."
+                                    )
+                                }
+                                snapshot = invalidation.snapshot
+                                planCacheInvalidatedJobCount = invalidation.invalidatedJobCount
                             }
-                            snapshot = invalidation.snapshot
-                            planCacheInvalidatedJobCount = invalidation.invalidatedJobCount
                         }
-                        try dependencyGraph.installCachedPlan(
-                            key: driverPayload.uniqueID,
-                            compilerLocation: driverPayload.compilerLocation,
-                            target: target,
-                            args: Array(commandLine),
-                            workingDirectory: task.workingDirectory,
-                            tempDirPath: driverPayload.tempDirPath,
-                            explicitModulesTempDirPath: driverPayload.explicitModulesTempDirPath,
-                            environment: environment,
-                            eagerCompilationEnabled: driverPayload.eagerCompilationEnabled,
-                            casOptions: driverPayload.casOptions,
-                            snapshot: snapshot
-                        )
-                        plannedFromCache = true
-                        planCacheOutcome = "hit"
+                        if !pendingUnaffectedNativePlanning {
+                            try dependencyGraph.installCachedPlan(
+                                key: driverPayload.uniqueID,
+                                compilerLocation: driverPayload.compilerLocation,
+                                target: target,
+                                args: Array(commandLine),
+                                workingDirectory: task.workingDirectory,
+                                tempDirPath: driverPayload.tempDirPath,
+                                explicitModulesTempDirPath: driverPayload.explicitModulesTempDirPath,
+                                environment: environment,
+                                eagerCompilationEnabled: driverPayload.eagerCompilationEnabled,
+                                casOptions: driverPayload.casOptions,
+                                snapshot: snapshot
+                            )
+                            plannedFromCache = true
+                            planCacheOutcome = "hit"
+                        }
                     } catch {
+                        pendingUnaffectedNativePlanning = false
                         planCacheOutcome = "invalid"
                         outputDelegate.note("SWIFT_DRIVER_PLAN_CACHE outcome=invalid fallback=apple error=\(error.localizedDescription)")
                     }
@@ -903,6 +936,9 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
             guard planningSucceeded else { return .failed }
 
             #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
+            if pendingUnaffectedNativePlanning {
+                planCacheOutcome = "unaffected_native_planned"
+            }
             if !plannedFromCache, let planCacheConfiguration, planCacheConfiguration.mode.canWrite {
                 let writeTimer = ElapsedTimer()
                 do {
@@ -1011,8 +1047,9 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                 planCacheWriteDurationNS = writeTimer.elapsedTime().nanoseconds
             }
             if planCacheConfiguration != nil {
+                let unaffectedProof = planCacheOutcome == "unaffected_native_planned" ? " source_owned_jobs=0 absence_proof=validated-v1" : ""
                 outputDelegate.note(
-                    "SWIFT_DRIVER_PLAN_CACHE outcome=\(planCacheOutcome) key=\(planCacheConfiguration?.key ?? "none") base_key=\(planCacheConfiguration?.baseKey ?? "none") key_scope=\(planCacheConfiguration?.keyScope.rawValue ?? "none") cas_mode=\(planCacheConfiguration?.useLiveCAS == true ? "live" : "snapshot") invalidated_jobs=\(planCacheInvalidatedJobCount) bytes=\(planCacheBytes) direct_plan_bytes=\(directPlanBytes) duration_ns=\(planCacheTimer.elapsedTime().nanoseconds) read_ns=\(planCacheReadDurationNS) apple_plan_ns=\(planCachePlanDurationNS) write_ns=\(planCacheWriteDurationNS)"
+                    "SWIFT_DRIVER_PLAN_CACHE outcome=\(planCacheOutcome) key=\(planCacheConfiguration?.key ?? "none") base_key=\(planCacheConfiguration?.baseKey ?? "none") key_scope=\(planCacheConfiguration?.keyScope.rawValue ?? "none") cas_mode=\(planCacheConfiguration?.useLiveCAS == true ? "live" : "snapshot") invalidated_jobs=\(planCacheInvalidatedJobCount) bytes=\(planCacheBytes) direct_plan_bytes=\(directPlanBytes) duration_ns=\(planCacheTimer.elapsedTime().nanoseconds) read_ns=\(planCacheReadDurationNS) apple_plan_ns=\(planCachePlanDurationNS) write_ns=\(planCacheWriteDurationNS)\(unaffectedProof)"
                 )
                 #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
                 if planCacheConfiguration?.dependencyObservation != nil

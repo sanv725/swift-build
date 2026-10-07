@@ -117,6 +117,83 @@ public struct SwiftDriverPlanCacheSnapshot: Serializable {
         )
     }
 
+    /// Side-effect-free, conservative structure validation for the opt-in
+    /// absence telemetry. Does not install a cached plan or publish graph state.
+    public func validateForUnchangedNativePlanning(workingDirectory: Path) throws {
+        let snapshot = try rebasedForReplay()
+        let plan = snapshot.plannedBuild
+        let targetCount = plan.plannedTargetJobs.count
+        guard plan.workingDirectory == workingDirectory,
+              targetCount <= 4096, snapshot.explicitModuleJobs.count <= 4096 else {
+            throw StubError.error("Unchanged planning snapshot directory or bound is invalid.")
+        }
+        let phases = [plan.compilationRequirementsIndices, plan.compilationIndices,
+                      plan.verificationIndices, plan.afterCompilationIndices]
+        var end = 0
+        for phase in phases {
+            guard phase.lowerBound == end, phase.upperBound >= end,
+                  phase.upperBound <= targetCount else {
+                throw StubError.error("Unchanged planning snapshot phase coverage is invalid.")
+            }
+            end = phase.upperBound
+        }
+        guard end == targetCount else {
+            throw StubError.error("Unchanged planning snapshot target coverage is incomplete.")
+        }
+        for (index, job) in plan.plannedTargetJobs.enumerated() {
+            guard job.key == .targetJob(index) else {
+                throw StubError.error("Unchanged planning snapshot target keys are invalid.")
+            }
+        }
+        let jobs = plan.plannedTargetJobs + snapshot.explicitModuleJobs
+        let keys = Set(jobs.map(\.key))
+        guard keys.count == jobs.count else {
+            throw StubError.error("Unchanged planning snapshot has duplicate jobs.")
+        }
+        var producers: [Path: LibSwiftDriver.JobKey] = [:]
+        var incoming: [LibSwiftDriver.JobKey: Int] = [:]
+        var consumers: [LibSwiftDriver.JobKey: [LibSwiftDriver.JobKey]] = [:]
+        for job in jobs {
+            guard job.workingDirectory == workingDirectory,
+                  Set(job.dependencies).count == job.dependencies.count,
+                  job.dependencies.allSatisfy({ keys.contains($0) && $0 != job.key }) else {
+                throw StubError.error("Unchanged planning snapshot dependencies are invalid.")
+            }
+            incoming[job.key] = job.dependencies.count
+            for dependency in job.dependencies { consumers[dependency, default: []].append(job.key) }
+            for output in job.driverJob.outputs {
+                guard output.isAbsolute, producers.updateValue(job.key, forKey: output) == nil else {
+                    throw StubError.error("Unchanged planning snapshot output ownership is ambiguous.")
+                }
+            }
+        }
+        guard producers == plan.producerMap else {
+            throw StubError.error("Unchanged planning snapshot producer map did not reproduce.")
+        }
+        var queue = jobs.filter { $0.dependencies.isEmpty }.map(\.key)
+        var cursor = 0
+        while cursor < queue.count {
+            let key = queue[cursor]; cursor += 1
+            for consumer in consumers[key] ?? [] {
+                incoming[consumer]! -= 1
+                if incoming[consumer] == 0 { queue.append(consumer) }
+            }
+        }
+        guard queue.count == jobs.count else {
+            throw StubError.error("Unchanged planning snapshot dependency graph is cyclic.")
+        }
+    }
+
+    public func provesSourceAbsent(for source: Path, canonicalize: (String) -> String?) -> Bool {
+        let jobs = plannedBuild.plannedTargetJobs + explicitModuleJobs
+        return !jobs.isEmpty && jobs.allSatisfy { job in
+            SwiftDriverPrimaryInputOwnership.provesAbsence(
+                source: source.str, arguments: job.driverJob.commandLine.map { $0.asString },
+                inputs: job.driverJob.inputs.map { $0.str },
+                isCompile: job.driverJob.ruleInfoType == "Compile", canonicalize: canonicalize)
+        }
+    }
+
     public func invalidatingCompilationCacheKeys(
         for source: Path
     ) -> (snapshot: Self, invalidatedJobCount: Int) {
