@@ -185,12 +185,18 @@ public struct SwiftDriverPlanCacheSnapshot: Serializable {
     }
 
     public func provesSourceAbsent(for source: Path, canonicalize: (String) -> String?) -> Bool {
+        provesSourceAbsent(for: source, canonicalize: canonicalize, isRegularFile: { _ in false })
+    }
+
+    public func provesSourceAbsent(for source: Path, canonicalize: (String) -> String?,
+                                  isRegularFile: (String) -> Bool) -> Bool {
         let jobs = plannedBuild.plannedTargetJobs + explicitModuleJobs
         return !jobs.isEmpty && jobs.allSatisfy { job in
             SwiftDriverPrimaryInputOwnership.provesAbsence(
                 source: source.str, arguments: job.driverJob.commandLine.map { $0.asString },
                 inputs: job.driverJob.inputs.map { $0.str },
-                isCompile: job.driverJob.ruleInfoType == "Compile", canonicalize: canonicalize)
+                isCompile: job.driverJob.ruleInfoType == "Compile", canonicalize: canonicalize,
+                isRegularFile: isRegularFile)
         }
     }
 
