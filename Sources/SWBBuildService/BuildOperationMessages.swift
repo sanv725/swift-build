@@ -1222,6 +1222,10 @@ final class OperationDelegate: BuildOperationDelegate {
             }
         }
         let realStatus = status ?? taskCompletionBasedStatus
+        if ProcessInfo.processInfo.environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_ALLOW_UNAFFECTED_NATIVE_PLANNING"] == "1" {
+            request.send(BuildOperationConsoleOutputEmitted(data: Array((
+                skippedParentCoverage.coverageSummary(operationSucceeded: realStatus == .succeeded) + "\n").utf8)))
+        }
         for key in skippedParentCoverage.qualifiedKeys(operationSucceeded: realStatus == .succeeded) {
             guard let task = skippedParentTasks[key] else { continue }
             do {

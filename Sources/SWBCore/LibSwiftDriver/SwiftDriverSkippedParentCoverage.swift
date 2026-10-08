@@ -29,6 +29,26 @@ public struct SwiftDriverSkippedParentCoverage: Sendable {
     public mutating func rejectUncorrelatableRequester() { uncorrelatable = true }
     public func qualifiedIdentity(key: String) -> String? { records[key]?.identity }
     public func terminalIdentityMatches(key: String, identity: String) -> Bool { records[key]?.identity == identity }
+    /// Diagnostic only: why each observed key does or does not qualify.
+    public func coverageSummary(operationSucceeded: Bool) -> String {
+        let required = Set(["SwiftDriver Compilation Requirements", "SwiftDriver Compilation"])
+        var counts: [String: Int] = [:]
+        var examples: [String] = []
+        for (key, r) in records.sorted(by: { $0.key < $1.key }) {
+            let reason: String
+            if r.rejected { reason = "rejected" }
+            else if blockedKeys.contains(key) { reason = "dynamic-request" }
+            else if r.roles != required { reason = "roles" }
+            else { reason = "qualified" }
+            counts[reason, default: 0] += 1
+            if reason != "qualified", examples.count < 8 {
+                examples.append("\(reason):[\(r.roles.sorted().joined(separator: "|"))]x\(r.taskIDs.count)")
+            }
+        }
+        let summary = counts.sorted(by: { $0.key < $1.key }).map { "\($0.key)=\($0.value)" }.joined(separator: " ")
+        return "SWIFT_DRIVER_SKIPPED_COVERAGE succeeded=\(operationSucceeded) uncorrelatable=\(uncorrelatable) keys=\(records.count) \(summary) examples=\(examples.joined(separator: ";"))"
+    }
+
     public func qualifiedKeys(operationSucceeded: Bool) -> [String] {
         guard operationSucceeded, !uncorrelatable else { return [] }
         return records.keys.filter { key in
