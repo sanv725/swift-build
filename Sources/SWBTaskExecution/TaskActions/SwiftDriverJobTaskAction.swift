@@ -1780,6 +1780,13 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 }
             }
             #endif
+            #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT && canImport(Darwin)
+            let replaySkipHandle = SwiftCachedReplaySkipHandle(
+                value: SwiftCachedReplaySkip(environment: ProcessInfo.processInfo.environment.merging(
+                    environment, uniquingKeysWith: { _, taskValue in taskValue })))
+            #else
+            let replaySkipHandle: SwiftCachedReplaySkipHandle? = nil
+            #endif
             if Self.usesStockCacheReplayPath(mode: acceleratorPolicy.mode)
                 && !dependencyCompatiblePlanExecution {
                 // Keep the upstream cache creation, pruning, replay, counters, and
@@ -1810,7 +1817,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                                                       dynamicExecutionDelegate: dynamicExecutionDelegate,
                                                       outputDelegate: outputDelegate,
                                                       casOptions: casOpts,
-                                                      reportCacheKeys: executionDelegate.enableTaskCacheKeyReporting) {
+                                                      reportCacheKeys: executionDelegate.enableTaskCacheKeyReporting,
+                                                      replaySkip: replaySkipHandle) {
                         // Replay completed the job without spawning a compiler. The
                         // driver still needs a successful result to mark its inputs
                         // up to date in the next incremental build record. Pair the
@@ -3747,7 +3755,8 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                                     dynamicExecutionDelegate: any DynamicTaskExecutionDelegate,
                                     outputDelegate: any TaskOutputDelegate,
                                     casOptions: CASOptions,
-                                    reportCacheKeys: Bool
+                                    reportCacheKeys: Bool,
+                                    replaySkip: SwiftCachedReplaySkipHandle? = nil
     ) async throws -> Bool {
         let enableDiagnosticRemarks = casOptions.enableDiagnosticRemarks
         let cacheKeys = plannedJob.driverJob.cacheKeys
@@ -3789,6 +3798,19 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 comps.append(comp)
             }
 
+            #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT && canImport(Darwin)
+            let skipOutputs = plannedJob.driverJob.outputs
+            if let skip = replaySkip?.value {
+                if let streams = skip.reusable(cacheKeys: cacheKeys, outputs: skipOutputs) {
+                    outputDelegate.emitOutput(ByteString(encodingAsUTF8: streams.standardOutput))
+                    outputDelegate.emitOutput(ByteString(encodingAsUTF8: streams.standardError))
+                    outputDelegate.note("SWIFT_CACHED_REPLAY_SKIP outcome=reused outputs=\(skipOutputs.count)")
+                    replaySkip?.reused = true
+                    return true
+                }
+                skip.invalidate(cacheKeys: cacheKeys, outputs: skipOutputs)
+            }
+            #endif
             // Replay after all checks are done.
             let instance = try cas.createReplayInstance(cmd: Array(commandLine.dropFirst(1))) // drop executable name
             let replayResults: [Result<SwiftCacheReplayResult, any Error>] = await comps.concurrentMap(maximumParallelism: 10) { comp in
@@ -3798,12 +3820,20 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                     return .failure(error)
                 }
             }
+            var standardOutput = "", standardError = ""
             for replayResult in replayResults {
                 let result = try replayResult.get()
                 // emit stdout/stderr
-                outputDelegate.emitOutput(ByteString(encodingAsUTF8: try result.getStdOut()))
-                outputDelegate.emitOutput(ByteString(encodingAsUTF8: try result.getStdErr()))
+                let out = try result.getStdOut(), err = try result.getStdErr()
+                outputDelegate.emitOutput(ByteString(encodingAsUTF8: out))
+                outputDelegate.emitOutput(ByteString(encodingAsUTF8: err))
+                standardOutput += out
+                standardError += err
             }
+            #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT && canImport(Darwin)
+            replaySkip?.value?.record(cacheKeys: cacheKeys, outputs: skipOutputs,
+                                      streams: .init(standardOutput: standardOutput, standardError: standardError))
+            #endif
             return true
         }
 
