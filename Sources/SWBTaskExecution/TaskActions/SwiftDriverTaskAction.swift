@@ -134,6 +134,10 @@ private struct SwiftDriverPlanCacheConfiguration {
     /// Multi-file replay v1: newline-separated absolute paths, anchor first.
     static let invalidateSourcesVariable =
         "SWIFT_BUILD_DRIVER_PLAN_CACHE_INVALIDATE_SOURCES"
+    /// Multi-file replay v1: the subset of the invalidated sources changed since the client's last
+    /// successful request (newline-separated; empty means none).
+    static let recentSourcesVariable =
+        "SWIFT_BUILD_DRIVER_PLAN_CACHE_RECENT_SOURCES"
 
     let root: Path
     let mode: SwiftDriverPlanCacheMode
@@ -144,6 +148,9 @@ private struct SwiftDriverPlanCacheConfiguration {
     let invalidateSource: Path?
     /// Every edited source to invalidate (the anchor alone unless the plural variable is set).
     let invalidateSources: [Path]
+    /// Sources a driver skipped by the build database must prove absent. Older edits were
+    /// recompiled or proven by the client's previous successful request; defaults to all.
+    let upToDateProofSources: [Path]
     #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
     let dependencyObservation: SwiftDriverDependencyPlanObservationConfiguration?
     #endif
@@ -207,6 +214,18 @@ private struct SwiftDriverPlanCacheConfiguration {
             self.invalidateSources = sources
         } else {
             self.invalidateSources = invalidateSource.map { [$0] } ?? []
+        }
+        if let rawRecent = environment[Self.recentSourcesVariable] {
+            let recent = rawRecent.isEmpty ? [] : rawRecent.split(separator: "\n", omittingEmptySubsequences: false)
+                .map { Path(String($0)) }
+            guard environment[Self.invalidateSourcesVariable] != nil,
+                  Set(recent.map(\.str)).count == recent.count,
+                  Set(recent.map(\.str)).isSubset(of: Set(self.invalidateSources.map(\.str))) else {
+                throw StubError.error("\(Self.recentSourcesVariable) must be a unique subset of \(Self.invalidateSourcesVariable).")
+            }
+            self.upToDateProofSources = recent
+        } else {
+            self.upToDateProofSources = self.invalidateSources
         }
         #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
         self.dependencyObservation = try SwiftDriverDependencyPlanObservationConfiguration(
@@ -554,10 +573,14 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
         let snapshot: SwiftDriverPlanCacheSnapshot = try MsgPackDeserializer.deserialize(bytes)
         try snapshot.validateForUnchangedNativePlanning(workingDirectory: task.workingDirectory)
         let queries = PlanFilesystemQueries(fs: fs)
-        guard snapshot.provesSourcesAbsent(configuration.invalidateSources, canonicalize: queries.canonical,
+        // No source changed since the client's last successful request: nothing to prove absent.
+        guard configuration.upToDateProofSources.isEmpty
+                || snapshot.provesSourcesAbsent(configuration.upToDateProofSources, canonicalize: queries.canonical,
             isRegularFile: queries.isRegularFile, readFileList: queries.fileList,
             readResponseFile: queries.text, rejection: { reason in rejection?("absence " + reason) }) else { return nil }
-        return "SWIFT_DRIVER_PLAN_CACHE outcome=unaffected_build_database_skipped key=\(scoped.key) base_key=\(scoped.baseKey) key_scope=driver cas_mode=live invalidated_jobs=0 source_owned_jobs=0 absence_proof=validated-v1 scheduler_proof=build_database bytes=\(bytes.count) direct_plan_bytes=0 duration_ns=\(timer.elapsedTime().nanoseconds) read_ns=\(readNS) apple_plan_ns=0 write_ns=0"
+        let proofScope = configuration.upToDateProofSources.count == configuration.invalidateSources.count
+            ? "all" : "recent-\(configuration.upToDateProofSources.count)-of-\(configuration.invalidateSources.count)"
+        return "SWIFT_DRIVER_PLAN_CACHE outcome=unaffected_build_database_skipped proof_sources=\(proofScope) key=\(scoped.key) base_key=\(scoped.baseKey) key_scope=driver cas_mode=live invalidated_jobs=0 source_owned_jobs=0 absence_proof=validated-v1 scheduler_proof=build_database bytes=\(bytes.count) direct_plan_bytes=0 duration_ns=\(timer.elapsedTime().nanoseconds) read_ns=\(readNS) apple_plan_ns=0 write_ns=0"
         #else
         return nil
         #endif
