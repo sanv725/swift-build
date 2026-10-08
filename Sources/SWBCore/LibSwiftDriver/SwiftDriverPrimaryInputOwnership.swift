@@ -72,6 +72,29 @@ public enum SwiftDriverPrimaryInputOwnership {
         return !primaries.isEmpty && primaries.isSubset(of: canonicalInputs) && primaries.contains(selected)
     }
 
+    /// Parses a driver response file written with `spm_shellEscaped` (one argument per line;
+    /// single-quoted when needed, with embedded quotes written as '\\''). Callers must verify the
+    /// result against the planned command-line signature.
+    public static func parseResponseFile(_ text: String) -> [String] {
+        text.split(separator: "\n", omittingEmptySubsequences: false).map { line in
+            guard line.count >= 2, line.hasPrefix("'"), line.hasSuffix("'") else { return String(line) }
+            let inner = line.dropFirst().dropLast()
+            let pattern = "'\\''"
+            var result = ""
+            var index = inner.startIndex
+            while index < inner.endIndex {
+                if inner[index...].hasPrefix(pattern) {
+                    result.append("'")
+                    index = inner.index(index, offsetBy: pattern.count)
+                } else {
+                    result.append(inner[index])
+                    index = inner.index(after: index)
+                }
+            }
+            return result
+        }
+    }
+
     /// Positive absence proof for experimental native planning. Unsupported
     /// ownership and unresolved aliases remain unknown, never "unaffected".
     public static func provesAbsence(source: String, arguments: [String], inputs: [String],
@@ -128,8 +151,9 @@ public enum SwiftDriverPrimaryInputOwnership {
         }
         guard primaries.isSubset(of: canonicalInputs) else { return reject("primary-not-input") }
         var operandIndices = Set<Int>()
-        var pluginSeen = false
         var indexMetadata = Set<String>()
+        var pluginOperands = Set<String>()
+        var pluginModules = Set<String>()
         func moduleIdentifier(_ value: Substring) -> Bool {
             let characters = Array(value.utf8)
             func letter(_ c: UInt8) -> Bool { c == 95 || (65...90).contains(c) || (97...122).contains(c) }
@@ -153,8 +177,9 @@ public enum SwiftDriverPrimaryInputOwnership {
         // -index-unit-output-path is index identity metadata, not a read input.
         for index in arguments.indices {
             if arguments[index] == "-load-resolved-plugin" {
-                guard !pluginSeen, index + 1 < arguments.count else { return reject("plugin") }
-                pluginSeen = true
+                // Several distinct macro plugins may be loaded; each operand is validated
+                // independently, and repeated operands or module names stay rejected.
+                guard index + 1 < arguments.count, pluginOperands.insert(arguments[index + 1]).inserted else { return reject("plugin") }
                 let parts = arguments[index + 1].split(separator: "#", omittingEmptySubsequences: false)
                 guard parts.count == 3, !parts[0].isEmpty || !parts[1].isEmpty else { return reject("plugin") }
                 for component in parts.prefix(2) where !component.isEmpty {
@@ -165,7 +190,8 @@ public enum SwiftDriverPrimaryInputOwnership {
                 }
                 let modules = parts[2].split(separator: ",", omittingEmptySubsequences: false)
                 guard !modules.isEmpty, Set(modules).count == modules.count,
-                      modules.allSatisfy(moduleIdentifier) else { return reject("plugin-modules") }
+                      modules.allSatisfy(moduleIdentifier),
+                      modules.allSatisfy({ pluginModules.insert(String($0)).inserted }) else { return reject("plugin-modules") }
                 operandIndices.insert(index + 1)
             } else if arguments[index] == "-index-unit-output-path" {
                 guard index + 1 < arguments.count else { return reject("index-unit") }

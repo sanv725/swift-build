@@ -228,3 +228,26 @@ struct SwiftDriverPrimaryInputOwnershipTests {
         #expect(!ok && reasons == ["filelist-unreadable"])                       // two lists
     }
 }
+
+@Suite struct ResponseFileAndPluginAbsenceTests {
+    @Test func parsesShellEscapedResponseFiles() {
+        let text = ["-frontend", "'/tmp/A B/x.swift'", "'it'\\''s'", "-DFOO=1"].joined(separator: "\n")
+        #expect(SwiftDriverPrimaryInputOwnership.parseResponseFile(text) == ["-frontend", "/tmp/A B/x.swift", "it's", "-DFOO=1"])
+    }
+
+    @Test func acceptsSeveralValidatedPlugins() {
+        let source = "/private/tmp/App/Edited.swift"
+        let input = "/private/tmp/Pkg/A.swift"
+        let p1 = "/private/tmp/Plugins/libA.dylib", p2 = "/private/tmp/Plugins/libB.dylib"
+        let known: Set<String> = [source, input, p1, p2]
+        func absent(_ args: [String]) -> Bool {
+            SwiftDriverPrimaryInputOwnership.provesAbsence(source: source, arguments: args, inputs: [input],
+                isCompile: true, canonicalize: { known.contains($0) ? $0 : nil }, isRegularFile: { known.contains($0) },
+                readFileList: nil, rejection: nil)
+        }
+        let base = ["-frontend", "-c", "-primary-file", input]
+        #expect(absent(base + ["-load-resolved-plugin", p1 + "##MacroA", "-load-resolved-plugin", p2 + "##MacroB"]))
+        #expect(!absent(base + ["-load-resolved-plugin", p1 + "##MacroA", "-load-resolved-plugin", source + "##MacroB"]))
+        #expect(!absent(base + ["-load-resolved-plugin", p1 + "##Bad-Name"]))
+    }
+}

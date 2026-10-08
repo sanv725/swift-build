@@ -373,6 +373,29 @@ extension LibSwiftDriver {
             public let verificationIndices: Range<JobIndex>
             public let workingDirectory: Path
 
+            /// Extends the snapshot with explicit module jobs that its own explicit jobs depend on.
+            /// A job reused from an earlier target keeps that target's dependencies, so they must
+            /// travel with the snapshot. Returns nil if an output would gain a conflicting producer.
+            public func closingExplicitDependencies(keys closed: Set<JobKey>, jobs: [PlannedSwiftDriverJob]) -> Self? {
+                var producers = producerMap
+                for job in jobs where !explicitModuleBuildJobKeys.contains(job.key) {
+                    for output in job.driverJob.outputs {
+                        if let existing = producers[output] {
+                            guard existing == job.key else { return nil }
+                        } else {
+                            producers[output] = job.key
+                        }
+                    }
+                }
+                return Self(plannedTargetJobs: plannedTargetJobs, producerMap: producers,
+                            explicitModuleBuildJobKeys: closed,
+                            compilationRequirementsIndices: compilationRequirementsIndices,
+                            compilationIndices: compilationIndices,
+                            afterCompilationIndices: afterCompilationIndices,
+                            verificationIndices: verificationIndices,
+                            workingDirectory: workingDirectory)
+            }
+
             fileprivate init(plannedBuild: PlannedBuild) {
                 self.plannedTargetJobs = plannedBuild.plannedTargetJobs
                 self.producerMap = plannedBuild.producerMap

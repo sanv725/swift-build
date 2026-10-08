@@ -545,6 +545,10 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                   let text = bytes.stringValue else { return nil }
             let lines = text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
             return lines.count <= 200_000 ? lines : nil
+        }, readResponseFile: { value in
+            guard let path = try? fs.realpath(Path(value)), (try? fs.getFileInfo(path).isFile) == true,
+                  let bytes = try? fs.read(path), bytes.count <= 32 * 1024 * 1024 else { return nil }
+            return bytes.stringValue
         }, rejection: { reason in rejection?("absence " + reason) }) else { return nil }
         return "SWIFT_DRIVER_PLAN_CACHE outcome=unaffected_build_database_skipped key=\(scoped.key) base_key=\(scoped.baseKey) key_scope=driver cas_mode=live invalidated_jobs=0 source_owned_jobs=0 absence_proof=validated-v1 scheduler_proof=build_database bytes=\(bytes.count) direct_plan_bytes=0 duration_ns=\(timer.elapsedTime().nanoseconds) read_ns=\(readNS) apple_plan_ns=0 write_ns=0"
         #else

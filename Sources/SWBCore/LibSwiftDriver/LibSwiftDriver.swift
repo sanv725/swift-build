@@ -191,12 +191,30 @@ public struct SwiftDriverPlanCacheSnapshot: Serializable {
     public func provesSourceAbsent(for source: Path, canonicalize: (String) -> String?,
                                   isRegularFile: (String) -> Bool,
                                   readFileList: ((String) -> [String]?)? = nil,
+                                  readResponseFile: ((String) -> String?)? = nil,
                                   rejection: ((String) -> Void)? = nil) -> Bool {
         let jobs = plannedBuild.plannedTargetJobs + explicitModuleJobs
         guard !jobs.isEmpty else { rejection?("no-jobs"); return false }
         return jobs.allSatisfy { job in
-            SwiftDriverPrimaryInputOwnership.provesAbsence(
-                source: source.str, arguments: job.driverJob.commandLine.map { $0.asString },
+            var arguments = job.driverJob.commandLine.map { $0.asString }
+            if arguments.contains(where: { $0.hasPrefix("@") }) {
+                // Expand one trailing driver response file only when it reproduces the planned
+                // command-line signature exactly; otherwise the proof stays unproven.
+                guard let readResponseFile, arguments.count == 3, arguments[2].hasPrefix("@/"),
+                      !arguments[0].hasPrefix("@"), !arguments[1].hasPrefix("@"),
+                      let text = readResponseFile(String(arguments[2].dropFirst())) else {
+                    rejection?(job.driverJob.ruleInfoType + ": response-file-unreadable"); return false
+                }
+                let expanded = Array(arguments[0..<2]) + SwiftDriverPrimaryInputOwnership.parseResponseFile(text)
+                let context = InsecureHashContext()
+                for argument in expanded { context.add(string: argument) }
+                guard context.signature == job.driverJob.commandLineSignature else {
+                    rejection?(job.driverJob.ruleInfoType + ": response-file-signature"); return false
+                }
+                arguments = expanded
+            }
+            return SwiftDriverPrimaryInputOwnership.provesAbsence(
+                source: source.str, arguments: arguments,
                 inputs: job.driverJob.inputs.map { $0.str },
                 isCompile: job.driverJob.ruleInfoType == "Compile", canonicalize: canonicalize,
                 isRegularFile: isRegularFile, readFileList: readFileList,
@@ -650,7 +668,20 @@ public final class SwiftModuleDependencyGraph: SwiftGlobalExplicitDependencyGrap
 
     public func planCacheSnapshot(for key: String) async throws -> SwiftDriverPlanCacheSnapshot {
         let plannedBuild = try queryPlannedBuild(for: key)
-        let plan = plannedBuild.cacheSnapshot()
+        let base = plannedBuild.cacheSnapshot()
+        // Record the transitive explicit-dependency closure: a job reused from an earlier target
+        // can depend on jobs outside this target's own set (Reframe, C959).
+        var keys = base.explicitModuleBuildJobKeys
+        var frontier = Array(keys)
+        while let next = frontier.popLast() {
+            guard let job = plannedExplicitDependencyBuildJob(for: next) else { continue }
+            for dependency in job.dependencies where !keys.contains(dependency) {
+                keys.insert(dependency)
+                frontier.append(dependency)
+            }
+        }
+        let plan = keys == base.explicitModuleBuildJobKeys ? base
+            : (base.closingExplicitDependencies(keys: keys, jobs: getExplicitDependencyBuildJobs(for: Array(keys).sorted())) ?? base)
         return SwiftDriverPlanCacheSnapshot(
             plannedBuild: plan,
             explicitModuleJobs: getExplicitDependencyBuildJobs(
