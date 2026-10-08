@@ -1226,18 +1226,30 @@ final class OperationDelegate: BuildOperationDelegate {
             request.send(BuildOperationConsoleOutputEmitted(data: Array((
                 skippedParentCoverage.coverageSummary(operationSucceeded: realStatus == .succeeded) + "\n").utf8)))
         }
+        var proofTally: [String: Int] = [:]
         for key in skippedParentCoverage.qualifiedKeys(operationSucceeded: realStatus == .succeeded) {
-            guard let task = skippedParentTasks[key] else { continue }
+            guard let task = skippedParentTasks[key] else { proofTally["missing-task", default: 0] += 1; continue }
             do {
+                var reason = "identity"
                 guard let value = try SwiftDriverTaskAction.skippedPlanningIdentity(task,
                     environment: ProcessInfo.processInfo.environment), value.key == key,
                       skippedParentCoverage.terminalIdentityMatches(key: key, identity: value.identity),
                       let proof = try SwiftDriverTaskAction.cachedUpToDateProof(task,
-                        fs: localFS, environment: ProcessInfo.processInfo.environment) else {
+                        fs: localFS, environment: ProcessInfo.processInfo.environment,
+                        rejection: { reason = $0 }) else {
+                    proofTally[reason, default: 0] += 1
                     skippedDiagnostic("terminal-snapshot-proof-rejected"); continue
                 }
+                proofTally["emitted", default: 0] += 1
                 request.send(BuildOperationConsoleOutputEmitted(data: Array((proof + "\n").utf8)))
-            } catch { skippedDiagnostic("terminal-snapshot-validation-failed") }
+            } catch {
+                proofTally["error " + String(describing: error).prefix(80), default: 0] += 1
+                skippedDiagnostic("terminal-snapshot-validation-failed")
+            }
+        }
+        if ProcessInfo.processInfo.environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_ALLOW_UNAFFECTED_NATIVE_PLANNING"] == "1" {
+            let tally = proofTally.sorted(by: { $0.key < $1.key }).map { "\($0.key)=\($0.value)" }.joined(separator: "; ")
+            request.send(BuildOperationConsoleOutputEmitted(data: Array(("SWIFT_DRIVER_SKIPPED_PROOFS " + tally + "\n").utf8)))
         }
 
         acceleratorTraceWriter?.buildFinished(status: realStatus, metrics: metrics)
