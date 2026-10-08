@@ -88,29 +88,45 @@ public enum SwiftDriverPrimaryInputOwnership {
                                      isCompile: Bool,
                                      canonicalize: (String) -> String?,
                                      isRegularFile: (String) -> Bool) -> Bool {
-        guard source.hasPrefix("/"), let source = canonicalize(source),
-              !arguments.contains(where: {
+        provesAbsence(source: source, arguments: arguments, inputs: inputs, isCompile: isCompile,
+                      canonicalize: canonicalize, isRegularFile: isRegularFile, readFileList: nil, rejection: nil)
+    }
+
+    /// As above. With `readFileList`, one `-filelist <absolute path>` is accepted when its
+    /// canonical entries exclude the source and equal the job's canonical Swift inputs.
+    /// `rejection` receives a short reason when the proof fails (diagnostic only).
+    public static func provesAbsence(source: String, arguments: [String], inputs: [String],
+                                     isCompile: Bool,
+                                     canonicalize: (String) -> String?,
+                                     isRegularFile: (String) -> Bool,
+                                     readFileList: ((String) -> [String]?)?,
+                                     rejection: ((String) -> Void)?) -> Bool {
+        func reject(_ reason: String) -> Bool { rejection?(reason); return false }
+        guard source.hasPrefix("/"), let source = canonicalize(source) else { return reject("source") }
+        if let flag = arguments.first(where: {
                   $0.hasPrefix("@") || $0.hasPrefix("-primary-filelist") ||
-                  $0.hasPrefix("-filelist") || $0.hasPrefix("-index-unit-output-path-filelist") ||
+                  ($0.hasPrefix("-filelist") && ($0 != "-filelist" || readFileList == nil)) ||
+                  $0.hasPrefix("-index-unit-output-path-filelist") ||
                   $0 == "-wmo" ||
                   $0 == "-whole-module-optimization" ||
                   ($0.hasPrefix("-load-resolved-plugin") && $0 != "-load-resolved-plugin") ||
                   ($0.hasPrefix("-index-unit-output-path") && $0 != "-index-unit-output-path")
-              }) else { return false }
+              }) { return reject("unsupported-flag " + String(flag.prefix(40))) }
         var primaries = Set<String>()
         for index in arguments.indices where arguments[index] == "-primary-file" {
             guard index + 1 < arguments.count,
                   arguments[index + 1].hasPrefix("/"),
                   let primary = canonicalize(arguments[index + 1]),
-                  primaries.insert(primary).inserted else { return false }
+                  primaries.insert(primary).inserted else { return reject("primary") }
         }
-        guard !isCompile || !primaries.isEmpty else { return false }
+        guard !isCompile || !primaries.isEmpty else { return reject("compile-without-primary") }
         var canonicalInputs = Set<String>()
         for input in inputs {
-            guard input.hasPrefix("/"), let path = canonicalize(input), path != source else { return false }
+            guard input.hasPrefix("/"), let path = canonicalize(input) else { return reject("input-unresolved") }
+            guard path != source else { return reject("source-is-input") }
             canonicalInputs.insert(path)
         }
-        guard primaries.isSubset(of: canonicalInputs) else { return false }
+        guard primaries.isSubset(of: canonicalInputs) else { return reject("primary-not-input") }
         var operandIndices = Set<Int>()
         var pluginSeen = false
         var indexMetadata = Set<String>()
@@ -120,40 +136,57 @@ public enum SwiftDriverPrimaryInputOwnership {
             guard let first = characters.first, letter(first) else { return false }
             return characters.dropFirst().allSatisfy { letter($0) || (48...57).contains($0) }
         }
+        let fileLists = arguments.indices.filter { arguments[$0] == "-filelist" }
+        if !fileLists.isEmpty {
+            guard fileLists.count == 1, let readFileList, fileLists[0] + 1 < arguments.count,
+                  arguments[fileLists[0] + 1].hasPrefix("/"),
+                  let entries = readFileList(arguments[fileLists[0] + 1]), !entries.isEmpty else { return reject("filelist-unreadable") }
+            var listed = Set<String>()
+            for entry in entries {
+                guard entry.hasPrefix("/"), let path = canonicalize(entry), path != source,
+                      listed.insert(path).inserted else { return reject("filelist-entry") }
+            }
+            guard listed == canonicalInputs.filter({ $0.hasSuffix(".swift") }) else { return reject("filelist-mismatch") }
+            operandIndices.insert(fileLists[0] + 1)
+        }
         // SwiftOptions: -load-resolved-plugin <library>#<executable>#<modules>;
         // -index-unit-output-path is index identity metadata, not a read input.
         for index in arguments.indices {
             if arguments[index] == "-load-resolved-plugin" {
-                guard !pluginSeen, index + 1 < arguments.count else { return false }
+                guard !pluginSeen, index + 1 < arguments.count else { return reject("plugin") }
                 pluginSeen = true
                 let parts = arguments[index + 1].split(separator: "#", omittingEmptySubsequences: false)
-                guard parts.count == 3, !parts[0].isEmpty || !parts[1].isEmpty else { return false }
+                guard parts.count == 3, !parts[0].isEmpty || !parts[1].isEmpty else { return reject("plugin") }
                 for component in parts.prefix(2) where !component.isEmpty {
                     let file = String(component)
                     guard file.hasPrefix("/"), !file.utf8.contains(0),
                           let path = canonicalize(file), path != source,
-                          isRegularFile(file) else { return false }
+                          isRegularFile(file) else { return reject("plugin-file") }
                 }
                 let modules = parts[2].split(separator: ",", omittingEmptySubsequences: false)
                 guard !modules.isEmpty, Set(modules).count == modules.count,
-                      modules.allSatisfy(moduleIdentifier) else { return false }
+                      modules.allSatisfy(moduleIdentifier) else { return reject("plugin-modules") }
                 operandIndices.insert(index + 1)
             } else if arguments[index] == "-index-unit-output-path" {
-                guard index + 1 < arguments.count else { return false }
+                guard index + 1 < arguments.count else { return reject("index-unit") }
                 let value = arguments[index + 1]
                 guard value.hasPrefix("/"), !value.utf8.contains(0), value != source,
-                      indexMetadata.insert(value).inserted else { return false }
+                      indexMetadata.insert(value).inserted else { return reject("index-unit") }
                 operandIndices.insert(index + 1)
             }
         }
         for (index, argument) in arguments.enumerated() where !operandIndices.contains(index) {
             if argument.hasPrefix("/") {
-                guard let path = canonicalize(argument), path != source else { return false }
+                guard let path = canonicalize(argument) else {
+                    let previous = index > 0 ? arguments[index - 1] : ""
+                    return reject("unresolved-path after " + String(previous.prefix(40)))
+                }
+                guard path != source else { return reject("source-argument") }
             } else if argument.hasSuffix(".swift") || argument.hasSuffix(".swiftinterface") {
-                return false
+                return reject("relative-swift-argument")
             }
         }
-        return !primaries.contains(source)
+        return primaries.contains(source) ? reject("source-is-primary") : true
     }
 
 }

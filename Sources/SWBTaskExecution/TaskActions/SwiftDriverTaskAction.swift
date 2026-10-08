@@ -526,10 +526,11 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
             ruleInfo: driver.ruleInfo, commandLine: driver.commandLine))
         try scoped.validateLiveCASReference(at: cas.casPath)
         let info = try fs.getFileInfo(scoped.actionPath)
-        guard info.isFile, info.size > 0, info.size <= 64 * 1024 * 1024 else { rejection?("plan-size \(info.size)"); return nil }
+        // Large targets (Reframe: 110-140 MB plans) exceed 64 MiB; replay already reads them.
+        guard info.isFile, info.size > 0, info.size <= 256 * 1024 * 1024 else { rejection?("plan-size \(info.size)"); return nil }
         let readTimer = ElapsedTimer()
         let bytes = try fs.read(scoped.actionPath)
-        guard bytes.count > 0, bytes.count <= 64 * 1024 * 1024 else { rejection?("plan-read-size"); return nil }
+        guard bytes.count > 0, bytes.count <= 256 * 1024 * 1024 else { rejection?("plan-read-size"); return nil }
         let readNS = readTimer.elapsedTime().nanoseconds
         let snapshot: SwiftDriverPlanCacheSnapshot = try MsgPackDeserializer.deserialize(bytes)
         try snapshot.validateForUnchangedNativePlanning(workingDirectory: task.workingDirectory)
@@ -538,7 +539,13 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
         }, isRegularFile: { value in
             guard let path = try? fs.realpath(Path(value)) else { return false }
             return (try? fs.getFileInfo(path).isFile) == true
-        }) else { rejection?("source-absence-unproven"); return nil }
+        }, readFileList: { value in
+            guard let path = try? fs.realpath(Path(value)), (try? fs.getFileInfo(path).isFile) == true,
+                  let bytes = try? fs.read(path), bytes.count <= 32 * 1024 * 1024,
+                  let text = bytes.stringValue else { return nil }
+            let lines = text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+            return lines.count <= 200_000 ? lines : nil
+        }, rejection: { reason in rejection?("absence " + reason) }) else { return nil }
         return "SWIFT_DRIVER_PLAN_CACHE outcome=unaffected_build_database_skipped key=\(scoped.key) base_key=\(scoped.baseKey) key_scope=driver cas_mode=live invalidated_jobs=0 source_owned_jobs=0 absence_proof=validated-v1 scheduler_proof=build_database bytes=\(bytes.count) direct_plan_bytes=0 duration_ns=\(timer.elapsedTime().nanoseconds) read_ns=\(readNS) apple_plan_ns=0 write_ns=0"
         #else
         return nil

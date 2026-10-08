@@ -197,3 +197,34 @@ struct SwiftDriverPrimaryInputOwnershipTests {
         #expect(!owns(base, inputs: [source, other], entries: [source, other]))   // no explicit primary
     }
 }
+
+@Suite struct ValidatedFileListAbsenceTests {
+    let source = "/private/tmp/App/Edited.swift"
+    let a = "/private/tmp/Pkg/A.swift"
+    let b = "/private/tmp/Pkg/B.swift"
+    let list = "/private/tmp/DD/sources-2"
+
+    func absent(_ args: [String], inputs: [String], entries: [String]?, reader: Bool = true) -> (Bool, [String]) {
+        let known: Set<String> = [source, a, b, list]
+        var reasons: [String] = []
+        let result = SwiftDriverPrimaryInputOwnership.provesAbsence(source: source, arguments: args, inputs: inputs,
+            isCompile: true, canonicalize: { known.contains($0) ? $0 : nil }, isRegularFile: { known.contains($0) },
+            readFileList: reader ? { $0 == list ? entries : nil } : nil, rejection: { reasons.append($0) })
+        return (result, reasons)
+    }
+
+    @Test func provesAbsenceThroughMatchingFileList() {
+        let args = ["-frontend", "-c", "-filelist", list, "-primary-file", a]
+        #expect(absent(args, inputs: [a, b], entries: [a, b]).0)
+    }
+
+    @Test func refusesUnsafeFileLists() {
+        let args = ["-frontend", "-c", "-filelist", list, "-primary-file", a]
+        #expect(!absent(args, inputs: [a, b], entries: [a, b, source]).0)        // lists the edited source
+        #expect(!absent(args, inputs: [a, b], entries: [a]).0)                   // incomplete
+        #expect(!absent(args, inputs: [a, b], entries: nil).0)                   // unreadable
+        #expect(!absent(args, inputs: [a, b], entries: [a, b], reader: false).0) // no reader: strict path
+        let (ok, reasons) = absent(args + ["-filelist", list], inputs: [a, b], entries: [a, b])
+        #expect(!ok && reasons == ["filelist-unreadable"])                       // two lists
+    }
+}
