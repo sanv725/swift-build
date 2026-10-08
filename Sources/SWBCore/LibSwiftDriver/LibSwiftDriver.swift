@@ -278,7 +278,7 @@ private struct GlobalExplicitDependencyTracker {
             if let existing = uniqueIndexMap[uid] {
                 let candidate = plannedExplicitDependencyJobs[existing]
                 guard candidate.driverJob.hasSameExplicitAction(as: job), candidate.workingDirectory == workingDirectory else {
-                    throw StubError.error("Explicit module UID collision with incompatible action.")
+                    throw StubError.error("Explicit module UID collision with incompatible action. " + candidate.driverJob.explicitActionDifferences(from: job, workingDirectory: candidate.workingDirectory, other: workingDirectory))
                 }
                 index = existing
             } else if let existing = plannedExplicitDependencyJobs.firstIndex(where: {

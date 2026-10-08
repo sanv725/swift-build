@@ -184,6 +184,27 @@ public struct SwiftDriverJob: Serializable, CustomDebugStringConvertible {
 
     /// Explicit IDs use process-local Swift hashes; every serialized field other
     /// than that ID remains part of the reusable action identity.
+    /// Names the fields that differ between two explicit module actions (diagnostic only).
+    internal func explicitActionDifferences(from other: Self, workingDirectory: Path, other otherDirectory: Path) -> String {
+        var fields: [String] = []
+        if ruleInfoType != other.ruleInfoType { fields.append("ruleInfoType") }
+        if moduleName != other.moduleName { fields.append("moduleName") }
+        if inputs != other.inputs { fields.append("inputs") }
+        if displayInputs != other.displayInputs { fields.append("displayInputs") }
+        if outputs != other.outputs { fields.append("outputs") }
+        if commandLine != other.commandLine {
+            let a = commandLine.map { $0.asString }, b = other.commandLine.map { $0.asString }
+            let onlyA = Array(Set(a).subtracting(b)).sorted().prefix(4), onlyB = Array(Set(b).subtracting(a)).sorted().prefix(4)
+            fields.append("commandLine(count \(a.count)/\(b.count); only-first \(Array(onlyA)); only-second \(Array(onlyB)))")
+        }
+        if commandLineSignature != other.commandLineSignature { fields.append("commandLineSignature") }
+        if descriptionForLifecycle != other.descriptionForLifecycle { fields.append("descriptionForLifecycle") }
+        if cacheKeys != other.cacheKeys { fields.append("cacheKeys") }
+        if cacheOutputKindGroups != other.cacheOutputKindGroups { fields.append("cacheOutputKindGroups") }
+        if workingDirectory != otherDirectory { fields.append("workingDirectory(\(workingDirectory.str) vs \(otherDirectory.str))") }
+        return "module \(moduleName); differs: " + fields.joined(separator: ", ")
+    }
+
     internal func hasSameExplicitAction(as other: Self) -> Bool {
         guard case .explicitModule = kind, case .explicitModule = other.kind else { return false }
         return ruleInfoType == other.ruleInfoType && moduleName == other.moduleName
