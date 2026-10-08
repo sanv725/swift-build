@@ -131,6 +131,9 @@ private struct SwiftDriverPlanCacheConfiguration {
     static let liveCASVariable = "SWIFT_BUILD_DRIVER_PLAN_CACHE_LIVE_CAS"
     static let invalidateSourceVariable =
         "SWIFT_BUILD_DRIVER_PLAN_CACHE_INVALIDATE_SOURCE"
+    /// Multi-file replay v1: newline-separated absolute paths, anchor first.
+    static let invalidateSourcesVariable =
+        "SWIFT_BUILD_DRIVER_PLAN_CACHE_INVALIDATE_SOURCES"
 
     let root: Path
     let mode: SwiftDriverPlanCacheMode
@@ -139,6 +142,8 @@ private struct SwiftDriverPlanCacheConfiguration {
     let keyScope: SwiftDriverPlanCacheKeyScope
     let useLiveCAS: Bool
     let invalidateSource: Path?
+    /// Every edited source to invalidate (the anchor alone unless the plural variable is set).
+    let invalidateSources: [Path]
     #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
     let dependencyObservation: SwiftDriverDependencyPlanObservationConfiguration?
     #endif
@@ -192,6 +197,17 @@ private struct SwiftDriverPlanCacheConfiguration {
         self.keyScope = keyScope
         self.useLiveCAS = useLiveCAS
         self.invalidateSource = invalidateSource
+        if let rawSources = environment[Self.invalidateSourcesVariable] {
+            let sources = rawSources.split(separator: "\n", omittingEmptySubsequences: false).map { Path(String($0)) }
+            guard !sources.isEmpty, sources.count <= 4096, sources.allSatisfy({ $0.isAbsolute }),
+                  Set(sources.map(\.str)).count == sources.count,
+                  invalidateSource.map({ sources.first == $0 }) != false else {
+                throw StubError.error("\(Self.invalidateSourcesVariable) must list unique absolute paths, anchor first.")
+            }
+            self.invalidateSources = sources
+        } else {
+            self.invalidateSources = invalidateSource.map { [$0] } ?? []
+        }
         #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
         self.dependencyObservation = try SwiftDriverDependencyPlanObservationConfiguration(
             environment: environment
@@ -515,11 +531,14 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
               let configuration = try SwiftDriverPlanCacheConfiguration(environment: environment),
               configuration.mode == .replay, configuration.keyScope == .driver,
               configuration.useLiveCAS, let source = configuration.invalidateSource,
+              !configuration.invalidateSources.isEmpty,
               let cas = driver.casOptions else { rejection?("configuration"); return nil }
         guard driver.commandLine.starts(with: ["builtin-SwiftDriver", "--"]) else { rejection?("command-prefix"); return nil }
         let timer = ElapsedTimer()
-        let canonical = try fs.realpath(source)
-        guard try fs.getFileInfo(canonical).isFile else { rejection?("source-not-file"); return nil }
+        for edited in configuration.invalidateSources {
+            guard try fs.getFileInfo(try fs.realpath(edited)).isFile else { rejection?("source-not-file"); return nil }
+        }
+        _ = source
         let scoped = configuration.scoped(to: swiftDriverPlanCacheScopeIdentity(
             moduleName: driver.moduleName, outputPrefix: driver.outputPrefix,
             variant: driver.variant, architecture: driver.architecture,
@@ -535,7 +554,7 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
         let snapshot: SwiftDriverPlanCacheSnapshot = try MsgPackDeserializer.deserialize(bytes)
         try snapshot.validateForUnchangedNativePlanning(workingDirectory: task.workingDirectory)
         let queries = PlanFilesystemQueries(fs: fs)
-        guard snapshot.provesSourceAbsent(for: source, canonicalize: queries.canonical,
+        guard snapshot.provesSourcesAbsent(configuration.invalidateSources, canonicalize: queries.canonical,
             isRegularFile: queries.isRegularFile, readFileList: queries.fileList,
             readResponseFile: queries.text, rejection: { reason in rejection?("absence " + reason) }) else { return nil }
         return "SWIFT_DRIVER_PLAN_CACHE outcome=unaffected_build_database_skipped key=\(scoped.key) base_key=\(scoped.baseKey) key_scope=driver cas_mode=live invalidated_jobs=0 source_owned_jobs=0 absence_proof=validated-v1 scheduler_proof=build_database bytes=\(bytes.count) direct_plan_bytes=0 duration_ns=\(timer.elapsedTime().nanoseconds) read_ns=\(readNS) apple_plan_ns=0 write_ns=0"
@@ -697,10 +716,11 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                         let bytes = try executionDelegate.fs.read(planCacheConfiguration.actionPath)
                         planCacheBytes = bytes.count
                         var snapshot: SwiftDriverPlanCacheSnapshot = try MsgPackDeserializer.deserialize(bytes)
-                        if let source = planCacheConfiguration.invalidateSource {
+                        let sources = planCacheConfiguration.invalidateSources
+                        if let source = sources.first {
                             let queries = PlanFilesystemQueries(fs: executionDelegate.fs)
                             let invalidation = snapshot.invalidatingCompilationCacheKeys(
-                                for: source,
+                                forSources: sources,
                                 canonicalize: allowUnaffectedNativePlanning ? queries.canonical : nil,
                                 isRegularFile: allowUnaffectedNativePlanning ? queries.isRegularFile : nil,
                                 readFileList: allowUnaffectedNativePlanning ? queries.fileList : nil
@@ -711,22 +731,37 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                                planCacheConfiguration.useLiveCAS,
                                driverPayload.eagerCompilationEnabled,
                                source.isAbsolute {
-                                let canonicalSource = try executionDelegate.fs.realpath(source)
-                                guard try executionDelegate.fs.getFileInfo(canonicalSource).isFile else {
-                                    throw StubError.error("Unaffected native planning requires a regular source file.")
+                                for edited in sources {
+                                    guard try executionDelegate.fs.getFileInfo(try executionDelegate.fs.realpath(edited)).isFile else {
+                                        throw StubError.error("Unaffected native planning requires a regular source file.")
+                                    }
                                 }
                                 try snapshot.validateForUnchangedNativePlanning(workingDirectory: task.workingDirectory)
-                                guard snapshot.provesSourceAbsent(for: source, canonicalize: queries.canonical,
-                                                                  isRegularFile: queries.isRegularFile) else {
+                                guard snapshot.provesSourcesAbsent(sources, canonicalize: queries.canonical,
+                                                                   isRegularFile: queries.isRegularFile) else {
                                     throw StubError.error("Unchanged source ownership is unsupported or ambiguous.")
                                 }
                                 pendingUnaffectedNativePlanning = true
                             } else {
-                                guard invalidation.invalidatedJobCount == 1 else {
+                                // Each edited source is owned by at most one job; unowned edited sources must be
+                                // provably absent from this driver (multi-file replay v1). One source keeps the
+                                // original exactly-one-job rule.
+                                guard invalidation.ownership.allSatisfy({ $0 <= 1 }),
+                                      sources.count > 1 || invalidation.invalidatedJobCount == 1 else {
                                     throw StubError.error(
                                         "Cached plan expected exactly one changed source job, found \(invalidation.invalidatedJobCount)."
                                     )
                                 }
+                                let unowned = zip(sources, invalidation.ownership).filter { $0.1 == 0 }.map(\.0)
+                                if !unowned.isEmpty {
+                                    guard allowUnaffectedNativePlanning,
+                                          snapshot.provesSourcesAbsent(unowned, canonicalize: queries.canonical,
+                                                                       isRegularFile: queries.isRegularFile,
+                                                                       readFileList: queries.fileList) else {
+                                        throw StubError.error("Edited source is neither owned by one job nor provably absent.")
+                                    }
+                                }
+                                _ = source
                                 snapshot = invalidation.snapshot
                                 planCacheInvalidatedJobCount = invalidation.invalidatedJobCount
                             }

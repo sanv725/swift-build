@@ -455,6 +455,50 @@ extension LibSwiftDriver {
                 )
             }
 
+            /// Multi-file replay v1: invalidates every compile job that owns any of `sources`, and
+            /// reports how many jobs own each source (callers require at most one).
+            public func invalidatingCompilationCacheKeys(
+                forSources sources: [Path], canonicalize: ((String) -> String?)? = nil,
+                isRegularFile: ((String) -> Bool)? = nil,
+                readFileList: ((String) -> [String]?)? = nil
+            ) -> (snapshot: Self, invalidatedJobCount: Int, ownership: [Int]) {
+                var invalidatedJobCount = 0
+                var ownership = Array(repeating: 0, count: sources.count)
+                let jobs = plannedTargetJobs.map { job in
+                    guard job.driverJob.ruleInfoType == "Compile" else { return job }
+                    let arguments = job.driverJob.commandLine.map { $0.asString }
+                    let inputs = job.driverJob.inputs.map { $0.str }
+                    var owned = false
+                    for (index, source) in sources.enumerated() {
+                        let owns: Bool
+                        if let canonicalize, let isRegularFile {
+                            owns = SwiftDriverPrimaryInputOwnership.owns(source: source.str,
+                                arguments: arguments, inputs: inputs, canonicalize: canonicalize,
+                                isRegularFile: isRegularFile, readFileList: readFileList)
+                        } else {
+                            owns = SwiftDriverPrimaryInputOwnership.owns(source: source.str,
+                                arguments: arguments, inputs: inputs)
+                        }
+                        if owns { ownership[index] += 1; owned = true }
+                    }
+                    guard owned else { return job }
+                    invalidatedJobCount += 1
+                    return job.invalidatingCompilationCacheKeys()
+                }
+                return (
+                    Self(
+                        plannedTargetJobs: jobs, producerMap: producerMap,
+                        explicitModuleBuildJobKeys: explicitModuleBuildJobKeys,
+                        compilationRequirementsIndices: compilationRequirementsIndices,
+                        compilationIndices: compilationIndices,
+                        afterCompilationIndices: afterCompilationIndices,
+                        verificationIndices: verificationIndices,
+                        workingDirectory: workingDirectory
+                    ),
+                    invalidatedJobCount, ownership
+                )
+            }
+
             public func invalidatingCompilationCacheKeys(
                 for source: Path, canonicalize: ((String) -> String?)? = nil,
                 isRegularFile: ((String) -> Bool)? = nil,

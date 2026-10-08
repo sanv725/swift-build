@@ -222,6 +222,37 @@ public struct SwiftDriverPlanCacheSnapshot: Serializable {
         }
     }
 
+    /// Multi-file replay v1: sources must each be checked with `provesSourcesAbsent` when unowned.
+    public func provesSourcesAbsent(_ sources: [Path], canonicalize: (String) -> String?,
+                                   isRegularFile: (String) -> Bool,
+                                   readFileList: ((String) -> [String]?)? = nil,
+                                   readResponseFile: ((String) -> String?)? = nil,
+                                   rejection: ((String) -> Void)? = nil) -> Bool {
+        !sources.isEmpty && sources.allSatisfy { source in
+            provesSourceAbsent(for: source, canonicalize: canonicalize, isRegularFile: isRegularFile,
+                               readFileList: readFileList, readResponseFile: readResponseFile, rejection: rejection)
+        }
+    }
+
+    public func invalidatingCompilationCacheKeys(
+        forSources sources: [Path], canonicalize: ((String) -> String?)? = nil,
+        isRegularFile: ((String) -> Bool)? = nil,
+        readFileList: ((String) -> [String]?)? = nil
+    ) -> (snapshot: Self, invalidatedJobCount: Int, ownership: [Int]) {
+        let result = plannedBuild.invalidatingCompilationCacheKeys(forSources: sources,
+            canonicalize: canonicalize, isRegularFile: isRegularFile, readFileList: readFileList)
+        return (
+            Self(
+                plannedBuild: result.snapshot,
+                explicitModuleJobs: explicitModuleJobs,
+                swiftmodulesNeedingRegistration: swiftmodulesNeedingRegistration,
+                planningDependencies: planningDependencies,
+                transitiveDependencyModuleNames: transitiveDependencyModuleNames
+            ),
+            result.invalidatedJobCount, result.ownership
+        )
+    }
+
     public func invalidatingCompilationCacheKeys(
         for source: Path, canonicalize: ((String) -> String?)? = nil,
         isRegularFile: ((String) -> Bool)? = nil,
