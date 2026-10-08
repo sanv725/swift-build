@@ -309,7 +309,8 @@ private struct GlobalExplicitDependencyTracker {
             }
             if index < initialCount || established.contains(index) {
                 guard plannedExplicitDependencyJobs[index].dependencies == dependencies else {
-                    throw StubError.error("Explicit module action has incompatible dependencies.")
+                    let previous = Set(plannedExplicitDependencyJobs[index].dependencies), current = Set(dependencies)
+                    throw StubError.error("Explicit module action has incompatible dependencies. module \(job.moduleName); first \(previous.count) new \(current.count); only-first \(previous.subtracting(current).count); only-new \(current.subtracting(previous).count); first-was-in-earlier-batch \(index < initialCount)")
                 }
             } else {
                 plannedExplicitDependencyJobs[index] = Planned(key: .explicitDependencyJob(index), driverJob: job, dependencies: dependencies, workingDirectory: workingDirectory)
