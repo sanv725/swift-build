@@ -308,7 +308,13 @@ private struct GlobalExplicitDependencyTracker {
                 throw StubError.error("Explicit module dependencies include a target or self edge.")
             }
             if index < initialCount || established.contains(index) {
-                guard plannedExplicitDependencyJobs[index].dependencies == dependencies else {
+                // A later target only sees producers in its own planning map, so it can rebuild a
+                // subset of the dependencies of a job first planned in an earlier batch. Reframe
+                // (C959) showed this for CFNetwork, Darwin, Dispatch, Security and os_workgroup,
+                // all with only-new 0. The established superset already orders every edge this
+                // target can see. Any new dependency the established job lacks is still rejected.
+                // Approved by the owner on 2026-10-07.
+                guard Set(dependencies).isSubset(of: Set(plannedExplicitDependencyJobs[index].dependencies)) else {
                     let previous = Set(plannedExplicitDependencyJobs[index].dependencies), current = Set(dependencies)
                     throw StubError.error("Explicit module action has incompatible dependencies. module \(job.moduleName); first \(previous.count) new \(current.count); only-first \(previous.subtracting(current).count); only-new \(current.subtracting(previous).count); first-was-in-earlier-batch \(index < initialCount)")
                 }
