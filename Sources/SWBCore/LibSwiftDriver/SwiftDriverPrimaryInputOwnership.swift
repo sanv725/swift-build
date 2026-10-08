@@ -27,9 +27,23 @@ public enum SwiftDriverPrimaryInputOwnership {
     /// Opt-in ownership follows filesystem identity without rewriting serialized commands.
     public static func owns(source: String, arguments: [String], inputs: [String],
                             canonicalize: (String) -> String?, isRegularFile: (String) -> Bool) -> Bool {
+        owns(source: source, arguments: arguments, inputs: inputs, canonicalize: canonicalize,
+             isRegularFile: isRegularFile, readFileList: nil)
+    }
+
+    /// As above. A `-filelist` (non-primary module sources, used by large targets) is
+    /// accepted only when `readFileList` is supplied, the command has exactly one
+    /// `-filelist <absolute path>`, and the list's canonical entries equal the job's
+    /// canonical Swift inputs. Then the list cannot hide a source. Primaries must
+    /// still be explicit `-primary-file` arguments. Response files,
+    /// `-primary-filelist` and whole-module builds remain unsupported.
+    public static func owns(source: String, arguments: [String], inputs: [String],
+                            canonicalize: (String) -> String?, isRegularFile: (String) -> Bool,
+                            readFileList: ((String) -> [String]?)?) -> Bool {
         guard source.hasPrefix("/"), let selected = canonicalize(source), isRegularFile(source),
               !arguments.contains(where: {
-                  $0.hasPrefix("@") || $0.hasPrefix("-primary-filelist") || $0.hasPrefix("-filelist") ||
+                  $0.hasPrefix("@") || $0.hasPrefix("-primary-filelist") ||
+                  ($0.hasPrefix("-filelist") && ($0 != "-filelist" || readFileList == nil)) ||
                   $0 == "-wmo" || $0 == "-whole-module-optimization"
               }) else { return false }
         var canonicalInputs = Set<String>()
@@ -38,6 +52,17 @@ public enum SwiftDriverPrimaryInputOwnership {
             canonicalInputs.insert(path)
         }
         guard canonicalInputs.contains(selected) else { return false }
+        let fileLists = arguments.indices.filter { arguments[$0] == "-filelist" }
+        if !fileLists.isEmpty {
+            guard fileLists.count == 1, let readFileList, fileLists[0] + 1 < arguments.count,
+                  arguments[fileLists[0] + 1].hasPrefix("/"),
+                  let entries = readFileList(arguments[fileLists[0] + 1]), !entries.isEmpty else { return false }
+            var listed = Set<String>()
+            for entry in entries {
+                guard entry.hasPrefix("/"), let path = canonicalize(entry), listed.insert(path).inserted else { return false }
+            }
+            guard listed == canonicalInputs.filter({ $0.hasSuffix(".swift") }) else { return false }
+        }
         var primaries = Set<String>()
         for index in arguments.indices where arguments[index] == "-primary-file" {
             guard index + 1 < arguments.count, arguments[index + 1].hasPrefix("/"),

@@ -434,7 +434,8 @@ extension LibSwiftDriver {
 
             public func invalidatingCompilationCacheKeys(
                 for source: Path, canonicalize: ((String) -> String?)? = nil,
-                isRegularFile: ((String) -> Bool)? = nil
+                isRegularFile: ((String) -> Bool)? = nil,
+                readFileList: ((String) -> [String]?)? = nil
             ) -> (snapshot: Self, invalidatedJobCount: Int) {
                 var invalidatedJobCount = 0
                 let jobs = plannedTargetJobs.map { job in
@@ -445,7 +446,7 @@ extension LibSwiftDriver {
                     if let canonicalize, let isRegularFile {
                         owns = SwiftDriverPrimaryInputOwnership.owns(source: source.str,
                             arguments: arguments, inputs: inputs, canonicalize: canonicalize,
-                            isRegularFile: isRegularFile)
+                            isRegularFile: isRegularFile, readFileList: readFileList)
                     } else {
                         owns = SwiftDriverPrimaryInputOwnership.owns(source: source.str,
                             arguments: arguments, inputs: inputs)

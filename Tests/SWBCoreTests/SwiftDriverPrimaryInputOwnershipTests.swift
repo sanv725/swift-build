@@ -148,3 +148,52 @@ struct SwiftDriverPrimaryInputOwnershipTests {
         }
     }
 }
+
+@Suite struct ValidatedFileListOwnershipTests {
+    // Large targets (Reframe, C959) pass non-primary sources with `-filelist` and keep
+    // explicit `-primary-file` arguments. The list must equal the job's Swift inputs.
+    let source = "/private/tmp/App/Edited.swift"
+    let other = "/private/tmp/App/Other.swift"
+    let list = "/private/tmp/DD/sources-1"
+
+    func owns(_ args: [String], inputs: [String], entries: [String]?) -> Bool {
+        let known: Set<String> = [source, other, "/private/tmp/App/Third.swift", list, "/private/tmp/DD/Module.swiftmodule"]
+        func canonical(_ value: String) -> String? {
+            let v = value.hasPrefix("/tmp/") ? "/private" + value : value
+            return known.contains(v) ? v : nil
+        }
+        return SwiftDriverPrimaryInputOwnership.owns(source: source, arguments: args, inputs: inputs,
+            canonicalize: canonical, isRegularFile: { canonical($0) != nil },
+            readFileList: { $0 == list ? entries : nil })
+    }
+
+    @Test func acceptsMatchingFileListWithExplicitPrimary() {
+        let args = ["-frontend", "-c", "-filelist", list, "-primary-file", source]
+        #expect(owns(args, inputs: [source, other], entries: [source, other]))
+        // `/tmp` aliases in the list canonicalize like the inputs do.
+        #expect(owns(args, inputs: [source, other], entries: ["/tmp/App/Edited.swift", "/tmp/App/Other.swift"]))
+        // Non-Swift inputs are not part of the source list.
+        #expect(owns(args, inputs: [source, other, "/private/tmp/DD/Module.swiftmodule"], entries: [source, other]))
+    }
+
+    @Test func rejectsFileListThatDoesNotMatchInputs() {
+        let args = ["-frontend", "-c", "-filelist", list, "-primary-file", source]
+        #expect(!owns(args, inputs: [source, other], entries: [source]))                                    // missing
+        #expect(!owns(args, inputs: [source, other], entries: [source, other, "/private/tmp/App/Third.swift"])) // extra
+        #expect(!owns(args, inputs: [source, other], entries: [source, other, other]))                     // duplicate
+        #expect(!owns(args, inputs: [source, other], entries: [source, "/private/tmp/App/Unknown.swift"]))  // unresolvable
+        #expect(!owns(args, inputs: [source, other], entries: nil))                                          // unreadable
+        #expect(!owns(args, inputs: [source, other], entries: []))                                           // empty
+    }
+
+    @Test func keepsOtherRefusals() {
+        let base = ["-frontend", "-c", "-filelist", list]
+        #expect(!owns(base + ["-primary-file", other], inputs: [source, other], entries: [source, other]))
+        #expect(!owns(base + ["-filelist", list, "-primary-file", source], inputs: [source, other], entries: [source, other]))
+        #expect(!owns(["-frontend", "-c", "-filelist=" + list, "-primary-file", source], inputs: [source, other], entries: [source, other]))
+        for flag in ["@response", "-primary-filelist", "-wmo", "-whole-module-optimization"] {
+            #expect(!owns(base + ["-primary-file", source, flag], inputs: [source, other], entries: [source, other]))
+        }
+        #expect(!owns(base, inputs: [source, other], entries: [source, other]))   // no explicit primary
+    }
+}

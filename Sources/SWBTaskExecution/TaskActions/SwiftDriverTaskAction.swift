@@ -706,6 +706,15 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                                 isRegularFile: allowUnaffectedNativePlanning ? { value in
                                     guard let path = try? executionDelegate.fs.realpath(Path(value)) else { return false }
                                     return (try? executionDelegate.fs.getFileInfo(path).isFile) == true
+                                } : nil,
+                                readFileList: allowUnaffectedNativePlanning ? { value in
+                                    // Driver file lists: one unescaped absolute path per line, bounded.
+                                    guard let path = try? executionDelegate.fs.realpath(Path(value)),
+                                          (try? executionDelegate.fs.getFileInfo(path).isFile) == true,
+                                          let bytes = try? executionDelegate.fs.read(path), bytes.count <= 32 * 1024 * 1024,
+                                          let text = bytes.stringValue else { return nil }
+                                    let lines = text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+                                    return lines.count <= 200_000 ? lines : nil
                                 } : nil
                             )
                             if invalidation.invalidatedJobCount == 0, allowUnaffectedNativePlanning,
