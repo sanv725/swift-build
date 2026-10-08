@@ -211,8 +211,12 @@ public struct SwiftDriverJob: Serializable, CustomDebugStringConvertible {
 
     internal func hasSameExplicitAction(as other: Self) -> Bool {
         guard case .explicitModule = kind, case .explicitModule = other.kind else { return false }
+        // Input order is not part of the action: Reframe (C959) planned identical explicit
+        // module jobs (same command line, outputs and cache keys) whose 17 inputs differed only
+        // in order, which varies between planning runs. Compare inputs as a sorted multiset.
         return ruleInfoType == other.ruleInfoType && moduleName == other.moduleName
-            && inputs == other.inputs && displayInputs == other.displayInputs
+            && inputs.map(\.str).sorted() == other.inputs.map(\.str).sorted()
+            && displayInputs == other.displayInputs
             && outputs == other.outputs && commandLine == other.commandLine
             && commandLineSignature == other.commandLineSignature
             && descriptionForLifecycle == other.descriptionForLifecycle
