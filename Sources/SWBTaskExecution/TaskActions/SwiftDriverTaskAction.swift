@@ -534,22 +534,10 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
         let readNS = readTimer.elapsedTime().nanoseconds
         let snapshot: SwiftDriverPlanCacheSnapshot = try MsgPackDeserializer.deserialize(bytes)
         try snapshot.validateForUnchangedNativePlanning(workingDirectory: task.workingDirectory)
-        guard snapshot.provesSourceAbsent(for: source, canonicalize: { value in
-            try? fs.realpath(Path(value)).str
-        }, isRegularFile: { value in
-            guard let path = try? fs.realpath(Path(value)) else { return false }
-            return (try? fs.getFileInfo(path).isFile) == true
-        }, readFileList: { value in
-            guard let path = try? fs.realpath(Path(value)), (try? fs.getFileInfo(path).isFile) == true,
-                  let bytes = try? fs.read(path), bytes.count <= 32 * 1024 * 1024,
-                  let text = bytes.stringValue else { return nil }
-            let lines = text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
-            return lines.count <= 200_000 ? lines : nil
-        }, readResponseFile: { value in
-            guard let path = try? fs.realpath(Path(value)), (try? fs.getFileInfo(path).isFile) == true,
-                  let bytes = try? fs.read(path), bytes.count <= 32 * 1024 * 1024 else { return nil }
-            return bytes.stringValue
-        }, rejection: { reason in rejection?("absence " + reason) }) else { return nil }
+        let queries = PlanFilesystemQueries(fs: fs)
+        guard snapshot.provesSourceAbsent(for: source, canonicalize: queries.canonical,
+            isRegularFile: queries.isRegularFile, readFileList: queries.fileList,
+            readResponseFile: queries.text, rejection: { reason in rejection?("absence " + reason) }) else { return nil }
         return "SWIFT_DRIVER_PLAN_CACHE outcome=unaffected_build_database_skipped key=\(scoped.key) base_key=\(scoped.baseKey) key_scope=driver cas_mode=live invalidated_jobs=0 source_owned_jobs=0 absence_proof=validated-v1 scheduler_proof=build_database bytes=\(bytes.count) direct_plan_bytes=0 duration_ns=\(timer.elapsedTime().nanoseconds) read_ns=\(readNS) apple_plan_ns=0 write_ns=0"
         #else
         return nil
@@ -710,24 +698,12 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                         planCacheBytes = bytes.count
                         var snapshot: SwiftDriverPlanCacheSnapshot = try MsgPackDeserializer.deserialize(bytes)
                         if let source = planCacheConfiguration.invalidateSource {
+                            let queries = PlanFilesystemQueries(fs: executionDelegate.fs)
                             let invalidation = snapshot.invalidatingCompilationCacheKeys(
                                 for: source,
-                                canonicalize: allowUnaffectedNativePlanning ? { value in
-                                    try? executionDelegate.fs.realpath(Path(value)).str
-                                } : nil,
-                                isRegularFile: allowUnaffectedNativePlanning ? { value in
-                                    guard let path = try? executionDelegate.fs.realpath(Path(value)) else { return false }
-                                    return (try? executionDelegate.fs.getFileInfo(path).isFile) == true
-                                } : nil,
-                                readFileList: allowUnaffectedNativePlanning ? { value in
-                                    // Driver file lists: one unescaped absolute path per line, bounded.
-                                    guard let path = try? executionDelegate.fs.realpath(Path(value)),
-                                          (try? executionDelegate.fs.getFileInfo(path).isFile) == true,
-                                          let bytes = try? executionDelegate.fs.read(path), bytes.count <= 32 * 1024 * 1024,
-                                          let text = bytes.stringValue else { return nil }
-                                    let lines = text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
-                                    return lines.count <= 200_000 ? lines : nil
-                                } : nil
+                                canonicalize: allowUnaffectedNativePlanning ? queries.canonical : nil,
+                                isRegularFile: allowUnaffectedNativePlanning ? queries.isRegularFile : nil,
+                                readFileList: allowUnaffectedNativePlanning ? queries.fileList : nil
                             )
                             if invalidation.invalidatedJobCount == 0, allowUnaffectedNativePlanning,
                                !planCacheConfiguration.mode.canWrite,
@@ -740,12 +716,8 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                                     throw StubError.error("Unaffected native planning requires a regular source file.")
                                 }
                                 try snapshot.validateForUnchangedNativePlanning(workingDirectory: task.workingDirectory)
-                                guard snapshot.provesSourceAbsent(for: source, canonicalize: { value in
-                                    try? executionDelegate.fs.realpath(Path(value)).str
-                                }, isRegularFile: { value in
-                                    guard let path = try? executionDelegate.fs.realpath(Path(value)) else { return false }
-                                    return (try? executionDelegate.fs.getFileInfo(path).isFile) == true
-                                }) else {
+                                guard snapshot.provesSourceAbsent(for: source, canonicalize: queries.canonical,
+                                                                  isRegularFile: queries.isRegularFile) else {
                                     throw StubError.error("Unchanged source ownership is unsupported or ambiguous.")
                                 }
                                 pendingUnaffectedNativePlanning = true
@@ -1217,5 +1189,55 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
             outputDelegate.error("Unexpected error in querying jobs from dependency graph: \(error)")
             return .failed
         }
+    }
+}
+
+
+/// Memoizes filesystem identity queries for one plan ownership or absence check.
+/// The filesystem is not expected to change during a single check, so answers are
+/// identical. Caching removes about a million repeated realpath/stat/read calls per
+/// Reframe edit (about 170 batch jobs times 4,246 inputs; one file list re-read per job).
+final class PlanFilesystemQueries {
+    private let fs: any FSProxy
+    private var canonicalPaths: [String: String?] = [:]
+    private var regularFiles: [String: Bool] = [:]
+    private var texts: [String: String?] = [:]
+    private var fileLists: [String: [String]?] = [:]
+
+    init(fs: any FSProxy) { self.fs = fs }
+
+    func canonical(_ value: String) -> String? {
+        if let cached = canonicalPaths[value] { return cached }
+        let result = try? fs.realpath(Path(value)).str
+        canonicalPaths[value] = result
+        return result
+    }
+
+    func isRegularFile(_ value: String) -> Bool {
+        if let cached = regularFiles[value] { return cached }
+        let result = canonical(value).map { (try? fs.getFileInfo(Path($0)).isFile) == true } ?? false
+        regularFiles[value] = result
+        return result
+    }
+
+    /// Bounded file contents (at most 32 MiB) of a regular file.
+    func text(_ value: String) -> String? {
+        if let cached = texts[value] { return cached }
+        var result: String?
+        if isRegularFile(value), let path = canonical(value),
+           let bytes = try? fs.read(Path(path)), bytes.count <= 32 * 1024 * 1024 {
+            result = bytes.stringValue
+        }
+        texts[value] = result
+        return result
+    }
+
+    /// Driver file list: one unescaped absolute path per line, at most 200,000 lines.
+    func fileList(_ value: String) -> [String]? {
+        if let cached = fileLists[value] { return cached }
+        let lines = text(value).map { $0.split(separator: "\n", omittingEmptySubsequences: true).map(String.init) }
+        let result = lines.flatMap { $0.count <= 200_000 ? $0 : nil }
+        fileLists[value] = result
+        return result
     }
 }
