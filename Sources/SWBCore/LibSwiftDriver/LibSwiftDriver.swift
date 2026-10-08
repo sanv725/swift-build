@@ -743,57 +743,65 @@ public final class SwiftModuleDependencyGraph: SwiftGlobalExplicitDependencyGrap
         guard snapshot.plannedBuild.workingDirectory == workingDirectory else {
             throw StubError.error("Cached Swift Driver working directory does not match the current task.")
         }
-        // Snapshot graph state without entering any PlannedBuild queue.
-        let captured = registryQueue.blocking_sync { (revision, globalExplicitDependencyTracker, outputOwners) }
-        let rebased = try snapshot.rebasedForReplay()
-        var tracker = captured.1
-        let mapping = try tracker.importingCachedJobs(rebased.explicitModuleJobs, workingDirectory: workingDirectory)
-        let plan = try rebased.plannedBuild.remappingExplicitKeys(mapping)
-        let snapshot = SwiftDriverPlanCacheSnapshot(
-            plannedBuild: plan,
-            explicitModuleJobs: tracker.getExplicitDependencyBuildJobs(for: Array(plan.explicitModuleBuildJobKeys).sorted()),
-            swiftmodulesNeedingRegistration: rebased.swiftmodulesNeedingRegistration,
-            planningDependencies: rebased.planningDependencies,
-            transitiveDependencyModuleNames: rebased.transitiveDependencyModuleNames)
-        var expectedProducers: [Path: LibSwiftDriver.JobKey] = [:]
-        for job in snapshot.plannedBuild.plannedTargetJobs + snapshot.explicitModuleJobs {
-            for output in job.driverJob.outputs { expectedProducers[output] = job.key }
-        }
-        guard expectedProducers == plan.producerMap,
-              Set(snapshot.explicitModuleJobs.map(\.key)) == plan.explicitModuleBuildJobKeys else {
-            throw StubError.error("Cached producer map or explicit key coverage did not reproduce.")
-        }
-        var reservations = captured.2
-        for job in tracker.plannedExplicitDependencyJobs {
-            reservations = try reserving(job.driverJob.outputs, for: .explicit(job.key), in: reservations)
-        }
-        let cachedDriver = try LibSwiftDriver(
-            cachedPlan: snapshot,
-            graph: self,
-            compilerLocation: compilerLocation,
-            target: target,
-            workingDirectory: workingDirectory,
-            tempDirPath: tempDirPath,
-            explicitModulesTempDirPath: explicitModulesTempDirPath,
-            commandLine: args,
-            environment: environment,
-            eagerCompilationEnabled: eagerCompilationEnabled,
-            casOptions: casOptions
-        )
-        let targetPublication = cachedDriver.plannedBuild.targetOutputPublication()
-        guard let token = targetPublication.token else { throw StubError.error("Missing cached target reservation token.") }
-        reservations = try reserving(targetPublication.outputs, for: .target(token), in: reservations)
-        try cachedPlanStagingHook?()
-        try registryQueue.blocking_sync {
-            guard revision == captured.0, registry[key] == nil, !issuedTargetTokens.contains(token) else {
-                throw StubError.error("Swift Driver graph changed during cached plan staging.")
+        // Snapshot graph state without entering any PlannedBuild queue; bounded optimistic retries.
+        for _ in 0..<8 {
+            let captured = registryQueue.blocking_sync { (revision, globalExplicitDependencyTracker, outputOwners) }
+            let rebased = try snapshot.rebasedForReplay()
+            var tracker = captured.1
+            let mapping = try tracker.importingCachedJobs(rebased.explicitModuleJobs, workingDirectory: workingDirectory)
+            let plan = try rebased.plannedBuild.remappingExplicitKeys(mapping)
+            let staged = SwiftDriverPlanCacheSnapshot(
+                plannedBuild: plan,
+                explicitModuleJobs: tracker.getExplicitDependencyBuildJobs(for: Array(plan.explicitModuleBuildJobKeys).sorted()),
+                swiftmodulesNeedingRegistration: rebased.swiftmodulesNeedingRegistration,
+                planningDependencies: rebased.planningDependencies,
+                transitiveDependencyModuleNames: rebased.transitiveDependencyModuleNames)
+            var expectedProducers: [Path: LibSwiftDriver.JobKey] = [:]
+            for job in staged.plannedBuild.plannedTargetJobs + staged.explicitModuleJobs {
+                for output in job.driverJob.outputs { expectedProducers[output] = job.key }
             }
-            issuedTargetTokens.insert(token)
-            globalExplicitDependencyTracker = tracker
-            outputOwners = reservations
-            registry[key] = cachedDriver
-            revision += 1
+            guard expectedProducers == plan.producerMap,
+                  Set(staged.explicitModuleJobs.map(\.key)) == plan.explicitModuleBuildJobKeys else {
+                throw StubError.error("Cached producer map or explicit key coverage did not reproduce.")
+            }
+            var reservations = captured.2
+            for job in tracker.plannedExplicitDependencyJobs {
+                reservations = try reserving(job.driverJob.outputs, for: .explicit(job.key), in: reservations)
+            }
+            let cachedDriver = try LibSwiftDriver(
+                cachedPlan: staged,
+                graph: self,
+                compilerLocation: compilerLocation,
+                target: target,
+                workingDirectory: workingDirectory,
+                tempDirPath: tempDirPath,
+                explicitModulesTempDirPath: explicitModulesTempDirPath,
+                commandLine: args,
+                environment: environment,
+                eagerCompilationEnabled: eagerCompilationEnabled,
+                casOptions: casOptions
+            )
+            let targetPublication = cachedDriver.plannedBuild.targetOutputPublication()
+            guard let token = targetPublication.token else { throw StubError.error("Missing cached target reservation token.") }
+            reservations = try reserving(targetPublication.outputs, for: .target(token), in: reservations)
+            try cachedPlanStagingHook?()
+            let committed: Bool = try registryQueue.blocking_sync {
+                guard registry[key] == nil, !issuedTargetTokens.contains(token) else {
+                    throw StubError.error("Swift Driver graph changed during cached plan staging.")
+                }
+                // Another driver registered meanwhile (several targets replay at once in multi-file
+                // edits, C963): restage from the new graph state instead of failing.
+                guard revision == captured.0 else { return false }
+                issuedTargetTokens.insert(token)
+                globalExplicitDependencyTracker = tracker
+                outputOwners = reservations
+                registry[key] = cachedDriver
+                revision += 1
+                return true
+            }
+            if committed { return }
         }
+        throw StubError.error("Swift Driver graph changed during cached plan staging.")
     }
     #endif
 

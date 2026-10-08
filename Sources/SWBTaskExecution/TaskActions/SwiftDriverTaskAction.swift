@@ -760,9 +760,13 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                                     }
                                 }
                                 try snapshot.validateForUnchangedNativePlanning(workingDirectory: task.workingDirectory)
+                                var reasons: [String] = []
                                 guard snapshot.provesSourcesAbsent(sources, canonicalize: queries.canonical,
-                                                                   isRegularFile: queries.isRegularFile) else {
-                                    throw StubError.error("Unchanged source ownership is unsupported or ambiguous.")
+                                                                   isRegularFile: queries.isRegularFile,
+                                                                   readFileList: queries.fileList,
+                                                                   readResponseFile: queries.text,
+                                                                   rejection: { reasons.append($0) }) else {
+                                    throw StubError.error("Unchanged source ownership is unsupported or ambiguous (\(reasons.prefix(3).joined(separator: "; "))).")
                                 }
                                 pendingUnaffectedNativePlanning = true
                             } else {
@@ -777,11 +781,16 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                                 }
                                 let unowned = zip(sources, invalidation.ownership).filter { $0.1 == 0 }.map(\.0)
                                 if !unowned.isEmpty {
+                                    // Same proof as the up-to-date path, including verified response files (C963:
+                                    // Reframe's main target failed without them for a Widgets-only source).
+                                    var reasons: [String] = []
                                     guard allowUnaffectedNativePlanning,
                                           snapshot.provesSourcesAbsent(unowned, canonicalize: queries.canonical,
                                                                        isRegularFile: queries.isRegularFile,
-                                                                       readFileList: queries.fileList) else {
-                                        throw StubError.error("Edited source is neither owned by one job nor provably absent.")
+                                                                       readFileList: queries.fileList,
+                                                                       readResponseFile: queries.text,
+                                                                       rejection: { reasons.append($0) }) else {
+                                        throw StubError.error("Edited source is neither owned by one job nor provably absent (\(reasons.prefix(3).joined(separator: "; "))).")
                                     }
                                 }
                                 _ = source
