@@ -189,7 +189,11 @@ public struct SwiftDriverJob: Serializable, CustomDebugStringConvertible {
         var fields: [String] = []
         if ruleInfoType != other.ruleInfoType { fields.append("ruleInfoType") }
         if moduleName != other.moduleName { fields.append("moduleName") }
-        if inputs != other.inputs { fields.append("inputs") }
+        if inputs != other.inputs {
+            let a = inputs.map { $0.str }, b = other.inputs.map { $0.str }
+            let onlyA = Array(Set(a).subtracting(b)).sorted().prefix(4), onlyB = Array(Set(b).subtracting(a)).sorted().prefix(4)
+            fields.append("inputs(count \(a.count)/\(b.count); same-set \(Set(a) == Set(b)); only-first \(Array(onlyA)); only-second \(Array(onlyB)))")
+        }
         if displayInputs != other.displayInputs { fields.append("displayInputs") }
         if outputs != other.outputs { fields.append("outputs") }
         if commandLine != other.commandLine {
