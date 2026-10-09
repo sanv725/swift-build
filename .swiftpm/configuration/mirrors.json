@@ -1,0 +1,9 @@
+{
+  "object" : [
+    {
+      "mirror" : "https://github.com/sanv725/swift-llbuild.git",
+      "original" : "https://github.com/swiftlang/swift-llbuild.git"
+    }
+  ],
+  "version" : 1
+}

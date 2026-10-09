@@ -1,5 +1,5 @@
 {
-  "originHash" : "d6c150afd2ae95384fceeaf112f6b443d71884cf41eb319f0c7d51299e19ac23",
+  "originHash" : "ab7ab98f35dd944ecc87f8cb7ddfd1124fae04969525b6b8c8ca5c95df684b86",
   "pins" : [
     {
       "identity" : "swift-argument-parser",
@@ -25,7 +25,7 @@
       "location" : "https://github.com/swiftlang/swift-llbuild.git",
       "state" : {
         "branch" : "main",
-        "revision" : "3e472c2b8feb5bf3fdfd206a195b5712654a5371"
+        "revision" : "e646916065927b55e6edb61ef383bdc340e6a12a"
       }
     },
     {
@@ -42,8 +42,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/swiftlang/swift-toolchain-sqlite",
       "state" : {
-        "revision" : "cc7ea00f730c2234a332cd264c6e5cdbb6c4f971",
-        "version" : "1.0.12"
+        "revision" : "d9b11cb79071d5ab992ff47dfd2e8d6e19418d97",
+        "version" : "1.0.13"
       }
     },
     {
