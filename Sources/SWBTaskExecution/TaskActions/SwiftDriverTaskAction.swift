@@ -627,6 +627,13 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
             var planCacheConfiguration: SwiftDriverPlanCacheConfiguration?
             var planCacheOutcome = "off"
             var planCacheReadDurationNS: UInt64 = 0
+            // Sub-phases of the cached-plan replay (SwiftBuildOptimizer C968 attribution).
+            var planReplayPhaseNS: [(String, UInt64)] = []
+            var planReplayPhaseTimer = ElapsedTimer()
+            func endPlanReplayPhase(_ name: String) {
+                planReplayPhaseNS.append((name, planReplayPhaseTimer.elapsedTime().nanoseconds))
+                planReplayPhaseTimer = ElapsedTimer()
+            }
             var planCachePlanDurationNS: UInt64 = 0
             var planCacheWriteDurationNS: UInt64 = 0
             var planCacheBytes = 0
@@ -736,9 +743,12 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                                 to: casOptions.casPath
                             )
                         }
+                        planReplayPhaseTimer = ElapsedTimer()
                         let bytes = try executionDelegate.fs.read(planCacheConfiguration.actionPath)
                         planCacheBytes = bytes.count
+                        endPlanReplayPhase("file")
                         var snapshot: SwiftDriverPlanCacheSnapshot = try MsgPackDeserializer.deserialize(bytes)
+                        endPlanReplayPhase("decode")
                         let sources = planCacheConfiguration.invalidateSources
                         if let source = sources.first {
                             let queries = PlanFilesystemQueries(fs: executionDelegate.fs)
@@ -798,6 +808,7 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                                 planCacheInvalidatedJobCount = invalidation.invalidatedJobCount
                             }
                         }
+                        endPlanReplayPhase("invalidate")
                         if !pendingUnaffectedNativePlanning {
                             try dependencyGraph.installCachedPlan(
                                 key: driverPayload.uniqueID,
@@ -814,6 +825,7 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                             )
                             plannedFromCache = true
                             planCacheOutcome = "hit"
+                            endPlanReplayPhase("install")
                         }
                     } catch {
                         pendingUnaffectedNativePlanning = false
@@ -1190,7 +1202,7 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
             if planCacheConfiguration != nil {
                 let unaffectedProof = planCacheOutcome == "unaffected_native_planned" ? " source_owned_jobs=0 absence_proof=validated-v1" : ""
                 outputDelegate.note(
-                    "SWIFT_DRIVER_PLAN_CACHE outcome=\(planCacheOutcome) key=\(planCacheConfiguration?.key ?? "none") base_key=\(planCacheConfiguration?.baseKey ?? "none") key_scope=\(planCacheConfiguration?.keyScope.rawValue ?? "none") cas_mode=\(planCacheConfiguration?.useLiveCAS == true ? "live" : "snapshot") invalidated_jobs=\(planCacheInvalidatedJobCount) bytes=\(planCacheBytes) direct_plan_bytes=\(directPlanBytes) duration_ns=\(planCacheTimer.elapsedTime().nanoseconds) read_ns=\(planCacheReadDurationNS) apple_plan_ns=\(planCachePlanDurationNS) write_ns=\(planCacheWriteDurationNS)\(unaffectedProof)"
+                    "SWIFT_DRIVER_PLAN_CACHE outcome=\(planCacheOutcome) key=\(planCacheConfiguration?.key ?? "none") base_key=\(planCacheConfiguration?.baseKey ?? "none") key_scope=\(planCacheConfiguration?.keyScope.rawValue ?? "none") cas_mode=\(planCacheConfiguration?.useLiveCAS == true ? "live" : "snapshot") invalidated_jobs=\(planCacheInvalidatedJobCount) bytes=\(planCacheBytes) direct_plan_bytes=\(directPlanBytes) duration_ns=\(planCacheTimer.elapsedTime().nanoseconds) read_ns=\(planCacheReadDurationNS) apple_plan_ns=\(planCachePlanDurationNS) write_ns=\(planCacheWriteDurationNS)\(unaffectedProof)\(planReplayPhaseNS.isEmpty ? "" : " read_phases=" + planReplayPhaseNS.map { "\($0.0):\($0.1)" }.joined(separator: ","))"
                 )
                 #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
                 if planCacheConfiguration?.dependencyObservation != nil
