@@ -137,6 +137,22 @@ public struct SwiftDriverJob: Serializable, CustomDebugStringConvertible {
             commandLineSignature: signatureContext.signature, cacheKeys: []
         )
     }
+
+    /// Rebuilds a recorded skipped compile job (``SwiftDriverSkippedCompileJobs``). Its cache
+    /// keys stay empty: it runs only after invalidation, which drops them anyway.
+    init(skippedCompileModule moduleName: String, inputs: [Path], displayInputs: [Path],
+         descriptionForLifecycle: String, outputs: [Path], commandLine: [SWBUtil.ByteString]) {
+        let signatureContext = InsecureHashContext()
+        for argument in commandLine {
+            signatureContext.add(string: argument.asString)
+        }
+        self.init(
+            kind: .target, ruleInfoType: "Compile", moduleName: moduleName, inputs: inputs,
+            displayInputs: displayInputs, descriptionForLifecycle: descriptionForLifecycle,
+            outputs: outputs, cacheOutputKindGroups: [], commandLine: commandLine,
+            commandLineSignature: signatureContext.signature, cacheKeys: []
+        )
+    }
     #endif
 
     fileprivate init(job: SwiftDriver.Job, resolver: ArgsResolver, explicitModulesResolver: ArgsResolver) throws {
@@ -495,8 +511,9 @@ extension LibSwiftDriver {
             public func invalidatingCompilationCacheKeys(
                 forSources sources: [Path], canonicalize: ((String) -> String?)? = nil,
                 isRegularFile: ((String) -> Bool)? = nil,
-                readFileList: ((String) -> [String]?)? = nil
-            ) -> (snapshot: Self, invalidatedJobCount: Int, ownership: [Int], droppedPrimaries: Int) {
+                readFileList: ((String) -> [String]?)? = nil,
+                skipped: SwiftDriverSkippedCompileJobs = .empty
+            ) -> (snapshot: Self, invalidatedJobCount: Int, ownership: [Int], droppedPrimaries: Int, promotedSkipped: Int) {
                 var invalidatedJobCount = 0
                 var droppedPrimaries = 0
                 var ownership = Array(repeating: 0, count: sources.count)
@@ -530,17 +547,106 @@ extension LibSwiftDriver {
                     droppedPrimaries += invalidated.droppedPrimaries
                     return invalidated.job
                 }
-                return (
-                    Self(
-                        plannedTargetJobs: jobs, producerMap: producerMap,
-                        explicitModuleBuildJobKeys: explicitModuleBuildJobKeys,
-                        compilationRequirementsIndices: compilationRequirementsIndices,
-                        compilationIndices: compilationIndices,
-                        afterCompilationIndices: afterCompilationIndices,
-                        verificationIndices: verificationIndices,
-                        workingDirectory: workingDirectory
-                    ),
-                    invalidatedJobCount, ownership, droppedPrimaries
+                let plannedOwnership = ownership
+                let promotion = Self.promotingSkippedJobs(skipped, owning: sources, ownership: &ownership,
+                                                          canonicalize: canonicalize, isRegularFile: isRegularFile,
+                                                          readFileList: readFileList)
+                let snapshot = Self(
+                    plannedTargetJobs: jobs, producerMap: producerMap,
+                    explicitModuleBuildJobKeys: explicitModuleBuildJobKeys,
+                    compilationRequirementsIndices: compilationRequirementsIndices,
+                    compilationIndices: compilationIndices,
+                    afterCompilationIndices: afterCompilationIndices,
+                    verificationIndices: verificationIndices,
+                    workingDirectory: workingDirectory
+                )
+                guard !promotion.isEmpty else {
+                    return (snapshot, invalidatedJobCount, ownership, droppedPrimaries, 0)
+                }
+                guard let promoted = snapshot.inserting(compileJobs: promotion) else {
+                    // An output already has a producer: leave the sources unowned, so replay refuses.
+                    return (snapshot, invalidatedJobCount, plannedOwnership, droppedPrimaries, 0)
+                }
+                return (promoted, invalidatedJobCount + promotion.count, ownership, droppedPrimaries, promotion.count)
+            }
+
+            /// For each source no planned job owns, the uncached skipped compile job that owns it
+            /// (SwiftBuildOptimizer C977). Adds every skipped owner to `ownership`, so a source with
+            /// two owners is still refused. Requires the canonicalizing ownership grammar.
+            private static func promotingSkippedJobs(
+                _ skipped: SwiftDriverSkippedCompileJobs, owning sources: [Path], ownership: inout [Int],
+                canonicalize: ((String) -> String?)?, isRegularFile: ((String) -> Bool)?,
+                readFileList: ((String) -> [String]?)?
+            ) -> [SwiftDriverJob] {
+                guard skipped.count > 0, let canonicalize, let isRegularFile else { return [] }
+                let unowned = sources.indices.filter { ownership[$0] == 0 }
+                guard !unowned.isEmpty else { return [] }
+                let names = Set(unowned.map { sources[$0].basename })
+                var promoted: [Int: SwiftDriverJob] = [:]
+                for entry in 0..<skipped.count {
+                    // Owning a source requires naming it as a primary; compare base names first.
+                    guard skipped.primaryFiles(of: entry).contains(where: { names.contains(Path($0).basename) }) else { continue }
+                    let job = skipped.job(at: entry)
+                    let arguments = job.commandLine.map { $0.asString }
+                    let inputs = job.inputs.map { $0.str }
+                    for index in unowned where SwiftDriverPrimaryInputOwnership.owns(
+                        source: sources[index].str, arguments: arguments, inputs: inputs,
+                        canonicalize: canonicalize, isRegularFile: isRegularFile, readFileList: readFileList) {
+                        ownership[index] += 1
+                        promoted[entry] = job.invalidatingCompilationCacheKeys()
+                    }
+                }
+                return promoted.keys.sorted().map { promoted[$0]! }
+            }
+
+            /// Inserts uncached compile jobs at the end of the compilation phase, shifting later
+            /// target keys. Each depends, like a planned compile job, on the producers of its
+            /// inputs and on the explicit module jobs; an after-compilation job that waits for
+            /// every compile job (no eager compilation) waits for these too. Nil when an output
+            /// already has a producer.
+            fileprivate func inserting(compileJobs: [SwiftDriverJob]) -> Self? {
+                let at = compilationIndices.upperBound
+                let count = compileJobs.count
+                func shifted(_ key: JobKey) -> JobKey {
+                    if case .targetJob(let index) = key, index >= at { return .targetJob(index + count) }
+                    return key
+                }
+                var producers = producerMap.mapValues(shifted)
+                let inserted = compileJobs.enumerated().map { offset, job in
+                    PlannedSwiftDriverJob(
+                        key: .targetJob(at + offset), driverJob: job,
+                        dependencies: Set(job.inputs.compactMap { producers[$0] }).union(explicitModuleBuildJobKeys).sorted(),
+                        workingDirectory: workingDirectory)
+                }
+                for job in inserted {
+                    for output in job.driverJob.outputs {
+                        guard producers.updateValue(job.key, forKey: output) == nil else { return nil }
+                    }
+                }
+                let compileKeys = Set(compilationIndices.map { JobKey.targetJob($0) })
+                let insertedKeys = inserted.map(\.key)
+                var jobs = plannedTargetJobs.map { job in
+                    var dependencies = job.dependencies.map(shifted)
+                    if case .targetJob(let index) = job.key, afterCompilationIndices.contains(index),
+                       !compileKeys.isEmpty, compileKeys.isSubset(of: job.dependencies) {
+                        dependencies = Set(dependencies + insertedKeys).sorted()
+                    }
+                    return PlannedSwiftDriverJob(key: shifted(job.key), driverJob: job.driverJob,
+                                                 dependencies: dependencies, workingDirectory: job.workingDirectory,
+                                                 signature: job.signature)
+                }
+                jobs.insert(contentsOf: inserted, at: at)
+                func moved(_ range: Range<JobIndex>) -> Range<JobIndex> {
+                    range.lowerBound >= at ? (range.lowerBound + count)..<(range.upperBound + count) : range
+                }
+                return Self(
+                    plannedTargetJobs: jobs, producerMap: producers,
+                    explicitModuleBuildJobKeys: explicitModuleBuildJobKeys,
+                    compilationRequirementsIndices: compilationRequirementsIndices,
+                    compilationIndices: compilationIndices.lowerBound..<(at + count),
+                    afterCompilationIndices: moved(afterCompilationIndices),
+                    verificationIndices: moved(verificationIndices),
+                    workingDirectory: workingDirectory
                 )
             }
 
@@ -733,6 +839,22 @@ extension LibSwiftDriver {
         public func cacheSnapshot() -> CacheSnapshot {
             dispatchQueue.blocking_sync {
                 CacheSnapshot(plannedBuild: self)
+            }
+        }
+
+        /// The compile jobs the incremental driver skipped, for ``SwiftDriverSkippedCompileJobs``.
+        /// Empty for a cold or replayed plan, or when the jobs cannot be recorded; replay then
+        /// refuses edits to files the plan does not compile, as before.
+        public func skippedCompileJobsSnapshot() -> SwiftDriverSkippedCompileJobs {
+            dispatchQueue.blocking_sync {
+                guard !isCachedPlan, let state = incrementalCompilationState else { return .empty }
+                let skipped = state.skippedJobs
+                guard !skipped.isEmpty,
+                      let wrapped = try? Self.wrapJobs(skipped, argsResolver: argsResolver,
+                                                       explicitModulesResolver: explicitModulesResolver) else {
+                    return .empty
+                }
+                return SwiftDriverSkippedCompileJobs(jobs: wrapped) ?? .empty
             }
         }
         #endif

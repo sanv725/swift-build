@@ -51,7 +51,8 @@ public protocol SwiftGlobalExplicitDependencyGraph : AnyObject {
 /// phase. The wrapper's exact action key owns compatibility and invalidation.
 public struct SwiftDriverPlanCacheSnapshot: Serializable {
     // Version 2 plans retain debugger search paths in compilation cache keys.
-    public static let schemaVersion = 2
+    // Version 3 plans record the driver's skipped compile jobs (SwiftBuildOptimizer C977).
+    public static let schemaVersion = 3
 
     public let schemaVersion: Int
     public let plannedBuild: LibSwiftDriver.PlannedBuild.CacheSnapshot
@@ -59,13 +60,15 @@ public struct SwiftDriverPlanCacheSnapshot: Serializable {
     public let swiftmodulesNeedingRegistration: [String]
     public let planningDependencies: [String]
     public let transitiveDependencyModuleNames: [String]
+    public let skippedCompileJobs: SwiftDriverSkippedCompileJobs
 
     public init(
         plannedBuild: LibSwiftDriver.PlannedBuild.CacheSnapshot,
         explicitModuleJobs: [LibSwiftDriver.PlannedBuild.PlannedSwiftDriverJob],
         swiftmodulesNeedingRegistration: [String],
         planningDependencies: [String],
-        transitiveDependencyModuleNames: [String]
+        transitiveDependencyModuleNames: [String],
+        skippedCompileJobs: SwiftDriverSkippedCompileJobs = .empty
     ) {
         self.schemaVersion = Self.schemaVersion
         self.plannedBuild = plannedBuild
@@ -73,6 +76,7 @@ public struct SwiftDriverPlanCacheSnapshot: Serializable {
         self.swiftmodulesNeedingRegistration = swiftmodulesNeedingRegistration
         self.planningDependencies = planningDependencies
         self.transitiveDependencyModuleNames = transitiveDependencyModuleNames
+        self.skippedCompileJobs = skippedCompileJobs
     }
 
     /// A recorded target selects sparse IDs from the build-wide tracker. Replay
@@ -113,7 +117,8 @@ public struct SwiftDriverPlanCacheSnapshot: Serializable {
             },
             swiftmodulesNeedingRegistration: swiftmodulesNeedingRegistration,
             planningDependencies: planningDependencies,
-            transitiveDependencyModuleNames: transitiveDependencyModuleNames
+            transitiveDependencyModuleNames: transitiveDependencyModuleNames,
+            skippedCompileJobs: skippedCompileJobs
         )
     }
 
@@ -196,6 +201,20 @@ public struct SwiftDriverPlanCacheSnapshot: Serializable {
                                   referenced: ((String) -> Void)? = nil) -> Bool {
         let jobs = plannedBuild.plannedTargetJobs + explicitModuleJobs
         guard !jobs.isEmpty else { rejection?("no-jobs"); return false }
+        // A skipped compile job reads every module source (C977): its inputs are not absent.
+        if skippedCompileJobs.count > 0 {
+            guard source.isAbsolute, let canonicalSource = canonicalize(source.str) else {
+                rejection?("Compile: source"); return false
+            }
+            for inputs in skippedCompileJobs.distinctInputLists {
+                for input in inputs {
+                    guard input.isAbsolute, let path = canonicalize(input.str) else {
+                        rejection?("Compile: skipped-input-unresolved"); return false
+                    }
+                    guard path != canonicalSource else { rejection?("Compile: skipped-source-is-input"); return false }
+                }
+            }
+        }
         return jobs.allSatisfy { job in
             var arguments = job.driverJob.commandLine.map { $0.asString }
             if arguments.contains(where: { $0.hasPrefix("@") }) {
@@ -263,18 +282,20 @@ public struct SwiftDriverPlanCacheSnapshot: Serializable {
         forSources sources: [Path], canonicalize: ((String) -> String?)? = nil,
         isRegularFile: ((String) -> Bool)? = nil,
         readFileList: ((String) -> [String]?)? = nil
-    ) -> (snapshot: Self, invalidatedJobCount: Int, ownership: [Int], droppedPrimaries: Int) {
+    ) -> (snapshot: Self, invalidatedJobCount: Int, ownership: [Int], droppedPrimaries: Int, promotedSkipped: Int) {
         let result = plannedBuild.invalidatingCompilationCacheKeys(forSources: sources,
-            canonicalize: canonicalize, isRegularFile: isRegularFile, readFileList: readFileList)
+            canonicalize: canonicalize, isRegularFile: isRegularFile, readFileList: readFileList,
+            skipped: skippedCompileJobs)
         return (
             Self(
                 plannedBuild: result.snapshot,
                 explicitModuleJobs: explicitModuleJobs,
                 swiftmodulesNeedingRegistration: swiftmodulesNeedingRegistration,
                 planningDependencies: planningDependencies,
-                transitiveDependencyModuleNames: transitiveDependencyModuleNames
+                transitiveDependencyModuleNames: transitiveDependencyModuleNames,
+                skippedCompileJobs: skippedCompileJobs
             ),
-            result.invalidatedJobCount, result.ownership, result.droppedPrimaries
+            result.invalidatedJobCount, result.ownership, result.droppedPrimaries, result.promotedSkipped
         )
     }
 
@@ -298,18 +319,19 @@ public struct SwiftDriverPlanCacheSnapshot: Serializable {
     }
 
     public func serialize<T>(to serializer: T) where T: Serializer {
-        serializer.serializeAggregate(6) {
+        serializer.serializeAggregate(7) {
             serializer.serialize(schemaVersion)
             serializer.serialize(plannedBuild)
             serializer.serialize(explicitModuleJobs)
             serializer.serialize(swiftmodulesNeedingRegistration)
             serializer.serialize(planningDependencies)
             serializer.serialize(transitiveDependencyModuleNames)
+            serializer.serialize(skippedCompileJobs)
         }
     }
 
     public init(from deserializer: any Deserializer) throws {
-        try deserializer.beginAggregate(6)
+        try deserializer.beginAggregate(7)
         try schemaVersion = deserializer.deserialize()
         guard schemaVersion == Self.schemaVersion else {
             throw StubError.error("Unsupported Swift Driver plan cache schema \(schemaVersion).")
@@ -319,6 +341,7 @@ public struct SwiftDriverPlanCacheSnapshot: Serializable {
         try swiftmodulesNeedingRegistration = deserializer.deserialize()
         try planningDependencies = deserializer.deserialize()
         try transitiveDependencyModuleNames = deserializer.deserialize()
+        try skippedCompileJobs = deserializer.deserialize()
     }
 }
 #endif
@@ -774,7 +797,8 @@ public final class SwiftModuleDependencyGraph: SwiftGlobalExplicitDependencyGrap
             ),
             swiftmodulesNeedingRegistration: try querySwiftmodulesNeedingRegistrationForDebugging(for: key),
             planningDependencies: try queryPlanningDependencies(for: key),
-            transitiveDependencyModuleNames: try await queryTransitiveDependencyModuleNames(for: key)
+            transitiveDependencyModuleNames: try await queryTransitiveDependencyModuleNames(for: key),
+            skippedCompileJobs: plannedBuild.skippedCompileJobsSnapshot()
         )
     }
 
