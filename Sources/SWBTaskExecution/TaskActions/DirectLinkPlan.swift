@@ -19,7 +19,7 @@ enum DirectLinkPlanExporter {
 
         init(task: any ExecutableTask, commandLine: [String]) {
             schema = Self.schema
-            actionKey = ProcessInfo.processInfo.environment[
+            actionKey = ServiceEnvironment.snapshot[
                 "SWIFT_BUILD_DRIVER_PLAN_CACHE_KEY"
             ]
             commandDigest = Self.digest(
@@ -52,7 +52,7 @@ enum DirectLinkPlanExporter {
         commandLine: [String],
         fs: any FSProxy
     ) throws {
-        let environment = ProcessInfo.processInfo.environment
+        let environment = ServiceEnvironment.snapshot
         guard
             task.ruleInfo.first == "Ld",
             let root = environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_ROOT"],

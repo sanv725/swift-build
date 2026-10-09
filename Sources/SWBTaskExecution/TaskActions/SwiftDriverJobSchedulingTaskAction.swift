@@ -339,7 +339,7 @@ open class SwiftDriverJobSchedulingTaskAction: TaskAction {
                 }
             }
             #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
-            let experimentControlEnvironment = ProcessInfo.processInfo.environment.merging(
+            let experimentControlEnvironment = ServiceEnvironment.snapshot.merging(
                 task.environment.bindingsDictionary,
                 uniquingKeysWith: { _, taskValue in taskValue }
             )

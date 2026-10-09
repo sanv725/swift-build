@@ -1110,7 +1110,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
         // into dynamic task environments. A native service launcher therefore
         // scopes experiment controls to this process. Prefer an explicit task
         // value when present, but otherwise consume the service-scoped value.
-        let experimentControlEnvironment = ProcessInfo.processInfo.environment.merging(
+        let experimentControlEnvironment = ServiceEnvironment.snapshot.merging(
             environment,
             uniquingKeysWith: { _, taskValue in taskValue }
         )
@@ -1782,7 +1782,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             #endif
             #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT && canImport(Darwin)
             let replaySkipHandle = SwiftCachedReplaySkipHandle(
-                value: SwiftCachedReplaySkip(environment: ProcessInfo.processInfo.environment.merging(
+                value: SwiftCachedReplaySkip(environment: ServiceEnvironment.snapshot.merging(
                     environment, uniquingKeysWith: { _, taskValue in taskValue })))
             #else
             let replaySkipHandle: SwiftCachedReplaySkipHandle? = nil

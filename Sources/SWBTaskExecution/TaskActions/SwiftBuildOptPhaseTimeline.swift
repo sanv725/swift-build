@@ -9,6 +9,7 @@
 
 import Dispatch
 import Foundation
+import SWBUtil
 
 /// Opt-in monotonic phase markers used by Swift Build Optimizer experiments.
 ///
@@ -25,7 +26,7 @@ package enum SwiftBuildOptPhaseTimeline {
     }
 
     package static var isProcessEnabled: Bool {
-        isEnabled(environment: ProcessInfo.processInfo.environment)
+        isEnabled(environment: ServiceEnvironment.snapshot)
     }
 
     package static func now() -> UInt64 {

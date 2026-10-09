@@ -1233,7 +1233,7 @@ private class InProcessCommand: SWBLLBuild.ExternalCommand, SWBLLBuild.ExternalD
     }
 
     var shouldReceiveInputValues: Bool {
-        guard ProcessInfo.processInfo.environment[
+        guard ServiceEnvironment.snapshot[
             "SWIFT_BUILD_OPT_LLBUILD_PASSIVE_INPUT_FAST_PATH"
         ] == "1" else {
             return true
@@ -1297,15 +1297,18 @@ private class InProcessCommand: SWBLLBuild.ExternalCommand, SWBLLBuild.ExternalD
         action.taskSetup(task, executionDelegate: adaptor.operation, dynamicExecutionDelegate: adaptorInterfaceDelegate)
     }
 
+    /// Read once per service process: `ProcessInfo.environment` rebuilds its dictionary on every call, and this
+    /// callback runs for every input of every in-process task (about 1.7 s per Reframe edit, SwiftBuildOptimizer C965).
+    private static let skipNoopDependencyCallbacks =
+        ServiceEnvironment.snapshot["SWIFT_BUILD_OPT_SKIP_NOOP_DEPENDENCY_CALLBACKS"] == "1"
+
     fileprivate func provideValue(
         _ command: Command,
         _ commandInterface: BuildSystemCommandInterface,
         _ buildValue: BuildValue,
         _ inputID: UInt
     ) {
-        if ProcessInfo.processInfo.environment[
-            "SWIFT_BUILD_OPT_SKIP_NOOP_DEPENDENCY_CALLBACKS"
-        ] == "1", !action.needsDependencyReadyCallbacks {
+        if Self.skipNoopDependencyCallbacks, !action.needsDependencyReadyCallbacks {
             return
         }
         let adaptorInterfaceDelegate = OperatorSystemAdaptorDynamicContext(

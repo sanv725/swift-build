@@ -612,7 +612,7 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                 environment = task.environment.bindingsDictionary
             }
             #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
-            let experimentControlEnvironment = ProcessInfo.processInfo.environment.merging(
+            let experimentControlEnvironment = ServiceEnvironment.snapshot.merging(
                 environment,
                 uniquingKeysWith: { _, taskValue in taskValue }
             )
