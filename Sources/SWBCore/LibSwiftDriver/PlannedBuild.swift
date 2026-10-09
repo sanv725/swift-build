@@ -455,6 +455,26 @@ extension LibSwiftDriver {
                 )
             }
 
+            /// Necessary condition for `SwiftDriverPrimaryInputOwnership.owns`: one of the job's
+            /// `-primary-file` arguments (canonicalized when `canonicalize` is given) names a selected
+            /// source. Every `owns` variant requires this, so skipping jobs that fail it changes no
+            /// result; it avoids materializing each job's full input list. On Reframe's 4,246-file
+            /// target that list made invalidation cost about 2.3 s per edit (SwiftBuildOptimizer C968).
+            private static func mayOwn(arguments: [String], selected: Set<String>,
+                                       canonicalize: ((String) -> String?)?) -> Bool {
+                for index in arguments.indices where arguments[index] == "-primary-file" && index + 1 < arguments.count {
+                    let raw = arguments[index + 1]
+                    if let value = canonicalize.map({ $0(raw) }) ?? raw, selected.contains(value) { return true }
+                }
+                return false
+            }
+
+            private static func selectedPaths(_ sources: [Path], canonicalize: ((String) -> String?)?,
+                                              isRegularFile: ((String) -> Bool)?) -> Set<String> {
+                guard let canonicalize, isRegularFile != nil else { return Set(sources.map(\.str)) }
+                return Set(sources.compactMap { canonicalize($0.str) })
+            }
+
             /// Multi-file replay v1: invalidates every compile job that owns any of `sources`, and
             /// reports how many jobs own each source (callers require at most one).
             public func invalidatingCompilationCacheKeys(
@@ -464,9 +484,14 @@ extension LibSwiftDriver {
             ) -> (snapshot: Self, invalidatedJobCount: Int, ownership: [Int]) {
                 var invalidatedJobCount = 0
                 var ownership = Array(repeating: 0, count: sources.count)
+                let selected = Self.selectedPaths(sources, canonicalize: canonicalize, isRegularFile: isRegularFile)
                 let jobs = plannedTargetJobs.map { job in
                     guard job.driverJob.ruleInfoType == "Compile" else { return job }
                     let arguments = job.driverJob.commandLine.map { $0.asString }
+                    guard Self.mayOwn(arguments: arguments, selected: selected,
+                                      canonicalize: canonicalize != nil && isRegularFile != nil ? canonicalize : nil) else {
+                        return job
+                    }
                     let inputs = job.driverJob.inputs.map { $0.str }
                     var owned = false
                     for (index, source) in sources.enumerated() {
@@ -505,9 +530,14 @@ extension LibSwiftDriver {
                 readFileList: ((String) -> [String]?)? = nil
             ) -> (snapshot: Self, invalidatedJobCount: Int) {
                 var invalidatedJobCount = 0
+                let selected = Self.selectedPaths([source], canonicalize: canonicalize, isRegularFile: isRegularFile)
                 let jobs = plannedTargetJobs.map { job in
                     guard job.driverJob.ruleInfoType == "Compile" else { return job }
                     let arguments = job.driverJob.commandLine.map { $0.asString }
+                    guard Self.mayOwn(arguments: arguments, selected: selected,
+                                      canonicalize: canonicalize != nil && isRegularFile != nil ? canonicalize : nil) else {
+                        return job
+                    }
                     let inputs = job.driverJob.inputs.map { $0.str }
                     let owns: Bool
                     if let canonicalize, let isRegularFile {
