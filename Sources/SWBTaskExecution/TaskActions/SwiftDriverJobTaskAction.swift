@@ -2175,6 +2175,28 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             }
             #endif
 
+            #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT && canImport(Darwin)
+            if driverJob.driverJob.ruleInfoType == "EmitModule" {
+                let controls = ServiceEnvironment.snapshot.merging(environment, uniquingKeysWith: { _, taskValue in taskValue })
+                SwiftDeferredEmitModule.removeControlVariables(from: &environment)
+                if let deferral = SwiftDeferredEmitModule(environment: controls),
+                   deferral.moduleName == driverJob.driverJob.moduleName {
+                    if let record = deferral.enqueue(
+                        commandLine: compilerCommandLine, environment: environment,
+                        workingDirectory: task.workingDirectory, outputs: plannedOutputs, cacheKeys: cacheKeys
+                    ) {
+                        outputDelegate.note(
+                            "SWIFT_DEFER_EMIT_MODULE outcome=deferred module=\(driverJob.driverJob.moduleName) record=\(record.str) process=skipped"
+                        )
+                        return .succeeded
+                    }
+                    outputDelegate.note(
+                        "SWIFT_DEFER_EMIT_MODULE outcome=ran module=\(driverJob.driverJob.moduleName) reason=outputs_missing_or_queue_unwritable"
+                    )
+                }
+            }
+            #endif
+
             #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
             if driverJob.driverJob.ruleInfoType == "Compile",
                let moduleArtifactReuseCoordinator,
