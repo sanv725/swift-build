@@ -2179,20 +2179,26 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             if driverJob.driverJob.ruleInfoType == "EmitModule" {
                 let controls = ServiceEnvironment.snapshot.merging(environment, uniquingKeysWith: { _, taskValue in taskValue })
                 SwiftDeferredEmitModule.removeControlVariables(from: &environment)
-                if let deferral = SwiftDeferredEmitModule(environment: controls),
-                   deferral.moduleName == driverJob.driverJob.moduleName {
-                    if let record = deferral.enqueue(
-                        commandLine: compilerCommandLine, environment: environment,
+                if let deferral = SwiftDeferredEmitModule(environment: controls) {
+                    let module = driverJob.driverJob.moduleName
+                    if let reason = SwiftDeferredEmitModule.ineligibility(
+                        productType: (task.forTarget?.target as? SWBCore.StandardTarget)?.productTypeIdentifier,
+                        commandLine: compilerCommandLine
+                    ) {
+                        outputDelegate.note("SWIFT_DEFER_EMIT_MODULE outcome=ran module=\(module) reason=\(reason)")
+                    } else if let record = deferral.enqueue(
+                        moduleName: module, commandLine: compilerCommandLine, environment: environment,
                         workingDirectory: task.workingDirectory, outputs: plannedOutputs, cacheKeys: cacheKeys
                     ) {
                         outputDelegate.note(
-                            "SWIFT_DEFER_EMIT_MODULE outcome=deferred module=\(driverJob.driverJob.moduleName) record=\(record.str) process=skipped"
+                            "SWIFT_DEFER_EMIT_MODULE outcome=deferred module=\(module) record=\(record.str) process=skipped"
                         )
                         return .succeeded
+                    } else {
+                        outputDelegate.note(
+                            "SWIFT_DEFER_EMIT_MODULE outcome=ran module=\(module) reason=outputs_missing_or_queue_unwritable"
+                        )
                     }
-                    outputDelegate.note(
-                        "SWIFT_DEFER_EMIT_MODULE outcome=ran module=\(driverJob.driverJob.moduleName) reason=outputs_missing_or_queue_unwritable"
-                    )
                 }
             }
             #endif
