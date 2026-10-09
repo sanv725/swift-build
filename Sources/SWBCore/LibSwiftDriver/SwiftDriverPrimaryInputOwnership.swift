@@ -163,12 +163,15 @@ public enum SwiftDriverPrimaryInputOwnership {
     /// As above. With `readFileList`, one `-filelist <absolute path>` is accepted when its
     /// canonical entries exclude the source and equal the job's canonical Swift inputs.
     /// `rejection` receives a short reason when the proof fails (diagnostic only).
+    /// `referenced` receives each uncanonicalized value compared with the source; every other
+    /// comparison is against a `canonicalize` result.
     public static func provesAbsence(source: String, arguments: [String], inputs: [String],
                                      isCompile: Bool,
                                      canonicalize: (String) -> String?,
                                      isRegularFile: (String) -> Bool,
                                      readFileList: ((String) -> [String]?)?,
-                                     rejection: ((String) -> Void)?) -> Bool {
+                                     rejection: ((String) -> Void)?,
+                                     referenced: ((String) -> Void)? = nil) -> Bool {
         func reject(_ reason: String) -> Bool { rejection?(reason); return false }
         guard source.hasPrefix("/"), let source = canonicalize(source) else { return reject("source") }
         if let flag = arguments.first(where: {
@@ -241,6 +244,7 @@ public enum SwiftDriverPrimaryInputOwnership {
             } else if arguments[index] == "-index-unit-output-path" {
                 guard index + 1 < arguments.count else { return reject("index-unit") }
                 let value = arguments[index + 1]
+                referenced?(value)
                 guard value.hasPrefix("/"), !value.utf8.contains(0), value != source,
                       indexMetadata.insert(value).inserted else { return reject("index-unit") }
                 operandIndices.insert(index + 1)

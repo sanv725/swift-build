@@ -262,6 +262,11 @@ private struct SwiftDriverPlanCacheConfiguration {
         root.join("actions").join(String(actionKey.prefix(2))).join("\(actionKey).msgpack")
     }
 
+    /// Source-independent absence proof of the plan at `actionPath`, for skipped drivers.
+    var absenceCertificatePath: Path {
+        root.join("absence").join(String(key.prefix(2))).join("\(key).msgpack")
+    }
+
     func casSnapshotPath(for actionKey: String) -> Path {
         root.join("cas").join(String(actionKey.prefix(2))).join(actionKey)
     }
@@ -563,6 +568,47 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
             variant: driver.variant, architecture: driver.architecture,
             ruleInfo: driver.ruleInfo, commandLine: driver.commandLine))
         try scoped.validateLiveCASReference(at: cas.casPath)
+        let proofScope = configuration.upToDateProofSources.count == configuration.invalidateSources.count
+            ? "all" : "recent-\(configuration.upToDateProofSources.count)-of-\(configuration.invalidateSources.count)"
+        func proofLine(bytes: Int, readNS: UInt64, certificate: String) -> String {
+            "SWIFT_DRIVER_PLAN_CACHE outcome=unaffected_build_database_skipped proof_sources=\(proofScope) key=\(scoped.key) base_key=\(scoped.baseKey) key_scope=driver cas_mode=live invalidated_jobs=0 source_owned_jobs=0 absence_proof=validated-v1 absence_certificate=\(certificate) scheduler_proof=build_database bytes=\(bytes) direct_plan_bytes=0 duration_ns=\(timer.elapsedTime().nanoseconds) read_ns=\(readNS) apple_plan_ns=0 write_ns=0"
+        }
+        // The proof holds when every source resolves outside the plan's source-independent references.
+        func provesAbsent(_ references: Set<String>, _ canonical: (String) -> String?) -> Bool {
+            configuration.upToDateProofSources.allSatisfy { source in
+                guard source.str.hasPrefix("/"), let path = canonical(source.str) else { return false }
+                return !references.contains(path)
+            }
+        }
+        let certificatePath = scoped.absenceCertificatePath
+        let planIdentity = SwiftDriverAbsenceCertificate.identity(scoped.actionPath.str, follow: true)
+        var certificateOutcome = "none"
+        if let planIdentity, fs.exists(certificatePath) {
+            do {
+                let certificate = try SwiftDriverAbsenceCertificate.decode(try fs.read(certificatePath))
+                let queries = PlanFilesystemQueries(fs: fs)
+                switch certificate.plan != planIdentity || certificate.workingDirectory != task.workingDirectory.str
+                    ? .stale("plan") : certificate.revalidated(
+                    lstat: { SwiftDriverAbsenceCertificate.identity($0, follow: false) },
+                    stat: { SwiftDriverAbsenceCertificate.identity($0, follow: true) },
+                    resolve: queries.canonical, isRegularFile: queries.isRegularFile) {
+                case .stale(let reason):
+                    certificateOutcome = "stale-" + reason
+                case .valid(let refreshed):
+                    guard provesAbsent(Set(certificate.references), queries.canonical) else {
+                        rejection?("absence certificate-reference"); return nil
+                    }
+                    certificateOutcome = "hit"
+                    if let refreshed {
+                        let written = (try? fs.write(certificatePath, contents: refreshed.encoded(), atomically: true)) != nil
+                        certificateOutcome = written ? "refreshed" : "refresh-failed"
+                    }
+                    return proofLine(bytes: Int(planIdentity.size), readNS: 0, certificate: certificateOutcome)
+                }
+            } catch {
+                certificateOutcome = "stale-unreadable"
+            }
+        }
         let info = try fs.getFileInfo(scoped.actionPath)
         // Large targets (Reframe: 110-140 MB plans) exceed 64 MiB; replay already reads them.
         guard info.isFile, info.size > 0, info.size <= 256 * 1024 * 1024 else { rejection?("plan-size \(info.size)"); return nil }
@@ -573,14 +619,32 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
         let snapshot: SwiftDriverPlanCacheSnapshot = try MsgPackDeserializer.deserialize(bytes)
         try snapshot.validateForUnchangedNativePlanning(workingDirectory: task.workingDirectory)
         let queries = PlanFilesystemQueries(fs: fs)
+        let recorder = SwiftDriverAbsenceCertificate.Recorder(resolve: { try? fs.realpath(Path($0)).str })
+        let references = snapshot.absenceReferences(canonicalize: recorder.canonical,
+            isRegularFile: { recorder.isRegularFile($0, queries.isRegularFile) },
+            readFileList: { recorder.text($0, queries.fileList) },
+            readResponseFile: { recorder.text($0, queries.text) },
+            rejection: { reason in rejection?("absence " + reason) })
         // No source changed since the client's last successful request: nothing to prove absent.
         guard configuration.upToDateProofSources.isEmpty
-                || snapshot.provesSourcesAbsent(configuration.upToDateProofSources, canonicalize: queries.canonical,
-            isRegularFile: queries.isRegularFile, readFileList: queries.fileList,
-            readResponseFile: queries.text, rejection: { reason in rejection?("absence " + reason) }) else { return nil }
-        let proofScope = configuration.upToDateProofSources.count == configuration.invalidateSources.count
-            ? "all" : "recent-\(configuration.upToDateProofSources.count)-of-\(configuration.invalidateSources.count)"
-        return "SWIFT_DRIVER_PLAN_CACHE outcome=unaffected_build_database_skipped proof_sources=\(proofScope) key=\(scoped.key) base_key=\(scoped.baseKey) key_scope=driver cas_mode=live invalidated_jobs=0 source_owned_jobs=0 absence_proof=validated-v1 scheduler_proof=build_database bytes=\(bytes.count) direct_plan_bytes=0 duration_ns=\(timer.elapsedTime().nanoseconds) read_ns=\(readNS) apple_plan_ns=0 write_ns=0"
+                || references.map({ provesAbsent($0, queries.canonical) }) == true else {
+            if references != nil { rejection?("absence source-referenced") }
+            return nil
+        }
+        // Certify only a plan that did not change while it was read.
+        if let references, let planIdentity,
+           SwiftDriverAbsenceCertificate.identity(scoped.actionPath.str, follow: true) == planIdentity,
+           let certificate = recorder.certificate(plan: planIdentity, workingDirectory: task.workingDirectory.str,
+                                                  references: references) {
+            do {
+                try fs.createDirectory(certificatePath.dirname, recursive: true)
+                try fs.write(certificatePath, contents: certificate.encoded(), atomically: true)
+                certificateOutcome = certificateOutcome == "none" ? "created" : certificateOutcome + "-recreated"
+            } catch {
+                certificateOutcome += "-write-failed"
+            }
+        }
+        return proofLine(bytes: bytes.count, readNS: readNS, certificate: certificateOutcome)
         #else
         return nil
         #endif

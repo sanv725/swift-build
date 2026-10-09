@@ -192,7 +192,8 @@ public struct SwiftDriverPlanCacheSnapshot: Serializable {
                                   isRegularFile: (String) -> Bool,
                                   readFileList: ((String) -> [String]?)? = nil,
                                   readResponseFile: ((String) -> String?)? = nil,
-                                  rejection: ((String) -> Void)? = nil) -> Bool {
+                                  rejection: ((String) -> Void)? = nil,
+                                  referenced: ((String) -> Void)? = nil) -> Bool {
         let jobs = plannedBuild.plannedTargetJobs + explicitModuleJobs
         guard !jobs.isEmpty else { rejection?("no-jobs"); return false }
         return jobs.allSatisfy { job in
@@ -218,8 +219,32 @@ public struct SwiftDriverPlanCacheSnapshot: Serializable {
                 inputs: job.driverJob.inputs.map { $0.str },
                 isCompile: job.driverJob.ruleInfoType == "Compile", canonicalize: canonicalize,
                 isRegularFile: isRegularFile, readFileList: readFileList,
-                rejection: rejection.map { report in { report(job.driverJob.ruleInfoType + ": " + $0) } })
+                rejection: rejection.map { report in { report(job.driverJob.ruleInfoType + ": " + $0) } },
+                referenced: referenced)
         }
+    }
+
+    /// Source-independent half of `provesSourcesAbsent`, for a persistent absence certificate:
+    /// every path any source would be compared with, or nil when the proof fails regardless of
+    /// the source. A source is then proven absent exactly when it canonicalizes to a path
+    /// outside the returned set.
+    public func absenceReferences(canonicalize: (String) -> String?,
+                                  isRegularFile: (String) -> Bool,
+                                  readFileList: ((String) -> [String]?)? = nil,
+                                  readResponseFile: ((String) -> String?)? = nil,
+                                  rejection: ((String) -> Void)? = nil) -> Set<String>? {
+        // A path no plan names. Were one to match, the proof would only fail (conservative).
+        let sentinel = "/.swift-build-absence-sentinel-" + UUID().uuidString
+        var references = Set<String>()
+        let proven = provesSourceAbsent(for: Path(sentinel), canonicalize: { value in
+            if value == sentinel { return sentinel }
+            let result = canonicalize(value)
+            if let result { references.insert(result) }
+            return result
+        }, isRegularFile: isRegularFile, readFileList: readFileList,
+           readResponseFile: readResponseFile, rejection: rejection,
+           referenced: { references.insert($0) })
+        return proven ? references : nil
     }
 
     /// Multi-file replay v1: sources must each be checked with `provesSourcesAbsent` when unowned.
