@@ -902,6 +902,16 @@ public final class SwiftModuleDependencyGraph: SwiftGlobalExplicitDependencyGrap
             let keys = try tracker.addExplicitDependencyBuildJobs(jobs, workingDirectory: workingDirectory, producerMap: &producers)
             var reservations = outputOwners
             for job in tracker.getExplicitDependencyBuildJobs(for: Array(keys).sorted()) {
+                // Diagnostic (SwiftBuildOptimizer C969): name what differs when two explicit module jobs
+                // claim one output, e.g. the same Clang module planned by package targets.
+                for output in job.driverJob.outputs {
+                    if case .explicit(let previousKey)? = reservations[output], previousKey != job.key,
+                       let previous = tracker.getExplicitDependencyBuildJobs(for: [previousKey]).first {
+                        throw StubError.error("Swift Driver output reservation collision: \(output). " +
+                            previous.driverJob.explicitActionDifferences(from: job.driverJob,
+                                workingDirectory: previous.workingDirectory, other: job.workingDirectory))
+                    }
+                }
                 reservations = try reserving(job.driverJob.outputs, for: .explicit(job.key), in: reservations)
             }
             globalExplicitDependencyTracker = tracker
