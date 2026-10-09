@@ -109,10 +109,14 @@ public struct SwiftDriverJob: Serializable, CustomDebugStringConvertible {
         self.cacheKeys = cacheKeys
     }
 
-    public func invalidatingCompilationCacheKeys() -> Self {
-        var uncachedCommandLine = commandLine.filter {
-            $0.asString != "-cache-compile-job"
-        }
+    /// `removing` drops command-line indices and `droppedPrimaries` the matching display
+    /// inputs when a batch compile is narrowed to its edited primaries (see
+    /// ``SwiftDriverPrimaryInputOwnership/narrowedBatch(arguments:keeping:canonicalize:isRegularFile:)``).
+    /// Declared outputs stay as planned: the dropped primaries' outputs remain in place.
+    public func invalidatingCompilationCacheKeys(removing removed: Set<Int> = [], droppedPrimaries: [String] = []) -> Self {
+        var uncachedCommandLine = commandLine.enumerated().filter {
+            !removed.contains($0.offset) && $0.element.asString != "-cache-compile-job"
+        }.map(\.element)
         if !uncachedCommandLine.contains(where: {
             $0.asString == "-module-import-from-cas"
         }) {
@@ -126,7 +130,8 @@ public struct SwiftDriverJob: Serializable, CustomDebugStringConvertible {
         }
         return Self(
             kind: kind, ruleInfoType: ruleInfoType, moduleName: moduleName,
-            inputs: inputs, displayInputs: displayInputs,
+            inputs: inputs, displayInputs: droppedPrimaries.isEmpty ? displayInputs
+                : displayInputs.filter { !droppedPrimaries.contains($0.str) },
             descriptionForLifecycle: descriptionForLifecycle, outputs: outputs,
             cacheOutputKindGroups: [], commandLine: uncachedCommandLine,
             commandLineSignature: signatureContext.signature, cacheKeys: []
@@ -327,13 +332,23 @@ extension LibSwiftDriver {
             }
 
             #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
-            fileprivate func invalidatingCompilationCacheKeys() -> Self {
-                Self(
+            fileprivate func invalidatingCompilationCacheKeys(
+                narrowingTo selected: Set<String>? = nil, canonicalize: ((String) -> String?)? = nil,
+                isRegularFile: ((String) -> Bool)? = nil
+            ) -> (job: Self, droppedPrimaries: Int) {
+                var narrowed: (removed: Set<Int>, dropped: [String])?
+                if let selected, let canonicalize, let isRegularFile {
+                    narrowed = SwiftDriverPrimaryInputOwnership.narrowedBatch(
+                        arguments: driverJob.commandLine.map { $0.asString }, keeping: selected,
+                        canonicalize: canonicalize, isRegularFile: isRegularFile)
+                }
+                return (Self(
                     key: key,
-                    driverJob: driverJob.invalidatingCompilationCacheKeys(),
+                    driverJob: driverJob.invalidatingCompilationCacheKeys(
+                        removing: narrowed?.removed ?? [], droppedPrimaries: narrowed?.dropped ?? []),
                     dependencies: dependencies,
                     workingDirectory: workingDirectory
-                )
+                ), narrowed?.dropped.count ?? 0)
             }
             #endif
 
@@ -481,8 +496,9 @@ extension LibSwiftDriver {
                 forSources sources: [Path], canonicalize: ((String) -> String?)? = nil,
                 isRegularFile: ((String) -> Bool)? = nil,
                 readFileList: ((String) -> [String]?)? = nil
-            ) -> (snapshot: Self, invalidatedJobCount: Int, ownership: [Int]) {
+            ) -> (snapshot: Self, invalidatedJobCount: Int, ownership: [Int], droppedPrimaries: Int) {
                 var invalidatedJobCount = 0
+                var droppedPrimaries = 0
                 var ownership = Array(repeating: 0, count: sources.count)
                 let selected = Self.selectedPaths(sources, canonicalize: canonicalize, isRegularFile: isRegularFile)
                 let jobs = plannedTargetJobs.map { job in
@@ -508,7 +524,11 @@ extension LibSwiftDriver {
                     }
                     guard owned else { return job }
                     invalidatedJobCount += 1
-                    return job.invalidatingCompilationCacheKeys()
+                    let invalidated = job.invalidatingCompilationCacheKeys(
+                        narrowingTo: canonicalize != nil && isRegularFile != nil ? selected : nil,
+                        canonicalize: canonicalize, isRegularFile: isRegularFile)
+                    droppedPrimaries += invalidated.droppedPrimaries
+                    return invalidated.job
                 }
                 return (
                     Self(
@@ -520,7 +540,7 @@ extension LibSwiftDriver {
                         verificationIndices: verificationIndices,
                         workingDirectory: workingDirectory
                     ),
-                    invalidatedJobCount, ownership
+                    invalidatedJobCount, ownership, droppedPrimaries
                 )
             }
 
@@ -530,6 +550,7 @@ extension LibSwiftDriver {
                 readFileList: ((String) -> [String]?)? = nil
             ) -> (snapshot: Self, invalidatedJobCount: Int) {
                 var invalidatedJobCount = 0
+                var droppedPrimaries = 0
                 let selected = Self.selectedPaths([source], canonicalize: canonicalize, isRegularFile: isRegularFile)
                 let jobs = plannedTargetJobs.map { job in
                     guard job.driverJob.ruleInfoType == "Compile" else { return job }
@@ -550,7 +571,11 @@ extension LibSwiftDriver {
                     }
                     guard owns else { return job }
                     invalidatedJobCount += 1
-                    return job.invalidatingCompilationCacheKeys()
+                    let invalidated = job.invalidatingCompilationCacheKeys(
+                        narrowingTo: canonicalize != nil && isRegularFile != nil ? selected : nil,
+                        canonicalize: canonicalize, isRegularFile: isRegularFile)
+                    droppedPrimaries += invalidated.droppedPrimaries
+                    return invalidated.job
                 }
                 return (
                     Self(

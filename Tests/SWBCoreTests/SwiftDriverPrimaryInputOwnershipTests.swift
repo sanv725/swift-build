@@ -250,4 +250,40 @@ struct SwiftDriverPrimaryInputOwnershipTests {
         #expect(!absent(base + ["-load-resolved-plugin", p1 + "##MacroA", "-load-resolved-plugin", source + "##MacroB"]))
         #expect(!absent(base + ["-load-resolved-plugin", p1 + "##Bad-Name"]))
     }
+
+    @Test
+    func narrowsInvalidatedBatchToOwnedPrimaries() {
+        let source = "/tmp/App/Changed.swift"
+        let other = "/tmp/App/Other.swift", third = "/tmp/App/Third.swift"
+        let arguments = ["swift-frontend", "-frontend", "-c", other, "-primary-file", source,
+                         "-primary-file", third, "/tmp/App/Last.swift", "-o", "/tmp/O/Changed.o",
+                         "-o", "/tmp/O/Third.o", "-index-unit-output-path", "/tmp/O/Changed.o",
+                         "-index-unit-output-path", "/tmp/O/Third.o"]
+        func narrow(_ arguments: [String], keeping: Set<String> = ["/tmp/App/Changed.swift"],
+                    existing: (String) -> Bool = { _ in true }) -> [String]? {
+            SwiftDriverPrimaryInputOwnership.narrowedBatch(
+                arguments: arguments, keeping: keeping, canonicalize: { $0 }, isRegularFile: existing
+            ).map { result in arguments.indices.filter { !result.removed.contains($0) }.map { arguments[$0] } }
+        }
+        // The dropped primary stays in place as an ordinary input; its outputs are no longer requested.
+        #expect(narrow(arguments) == ["swift-frontend", "-frontend", "-c", other, "-primary-file", source,
+                                      third, "/tmp/App/Last.swift", "-o", "/tmp/O/Changed.o",
+                                      "-index-unit-output-path", "/tmp/O/Changed.o"])
+        // With a source filelist (which lists every input) the dropped primary's pair is removed.
+        #expect(narrow(["swift-frontend", "-filelist", "/tmp/list", "-primary-file", third, "-primary-file", source,
+                        "-o", "/tmp/O/Third.o", "-o", "/tmp/O/Changed.o"])
+                == ["swift-frontend", "-filelist", "/tmp/list", "-primary-file", source, "-o", "/tmp/O/Changed.o"])
+        // Nothing to narrow, nothing owned, or a dropped output missing: keep the whole batch.
+        #expect(narrow(arguments, keeping: [source, third]) == nil)
+        #expect(narrow(arguments, keeping: ["/tmp/App/Elsewhere.swift"]) == nil)
+        #expect(narrow(arguments, existing: { $0 != "/tmp/O/Third.o" }) == nil)
+        #expect(narrow(["swift-frontend", "-primary-file", source, "-o", "/tmp/O/Changed.o"]) == nil)
+        // Unsupported shapes keep the whole batch.
+        for extra in [["@/tmp/args.rsp"], ["-output-filelist", "/tmp/outputs"], ["-emit-module-path", "/tmp/M.swiftmodule"],
+                      ["-wmo"], ["-o", "/tmp/O/Extra.o"], ["-index-unit-output-path", "/tmp/O/Extra.o"]] {
+            #expect(narrow(arguments + extra) == nil)
+        }
+        #expect(narrow(["swift-frontend", "-primary-file", source, "-primary-file", third,
+                        "-o", "O/Changed.o", "-o", "/tmp/O/Third.o"]) == nil)
+    }
 }

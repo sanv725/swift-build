@@ -639,6 +639,7 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
             var planCacheBytes = 0
             var directPlanBytes = 0
             var planCacheInvalidatedJobCount = 0
+            var planCacheNarrowedPrimaryCount = 0
             var pendingUnaffectedNativePlanning = false
             var allowUnaffectedNativePlanning = false
             #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
@@ -806,6 +807,7 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                                 _ = source
                                 snapshot = invalidation.snapshot
                                 planCacheInvalidatedJobCount = invalidation.invalidatedJobCount
+                                planCacheNarrowedPrimaryCount = invalidation.droppedPrimaries
                             }
                         }
                         endPlanReplayPhase("invalidate")
@@ -1202,7 +1204,7 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
             if planCacheConfiguration != nil {
                 let unaffectedProof = planCacheOutcome == "unaffected_native_planned" ? " source_owned_jobs=0 absence_proof=validated-v1" : ""
                 outputDelegate.note(
-                    "SWIFT_DRIVER_PLAN_CACHE outcome=\(planCacheOutcome) key=\(planCacheConfiguration?.key ?? "none") base_key=\(planCacheConfiguration?.baseKey ?? "none") key_scope=\(planCacheConfiguration?.keyScope.rawValue ?? "none") cas_mode=\(planCacheConfiguration?.useLiveCAS == true ? "live" : "snapshot") invalidated_jobs=\(planCacheInvalidatedJobCount) bytes=\(planCacheBytes) direct_plan_bytes=\(directPlanBytes) duration_ns=\(planCacheTimer.elapsedTime().nanoseconds) read_ns=\(planCacheReadDurationNS) apple_plan_ns=\(planCachePlanDurationNS) write_ns=\(planCacheWriteDurationNS)\(unaffectedProof)\(planReplayPhaseNS.isEmpty ? "" : " read_phases=" + planReplayPhaseNS.map { "\($0.0):\($0.1)" }.joined(separator: ","))"
+                    "SWIFT_DRIVER_PLAN_CACHE outcome=\(planCacheOutcome) key=\(planCacheConfiguration?.key ?? "none") base_key=\(planCacheConfiguration?.baseKey ?? "none") key_scope=\(planCacheConfiguration?.keyScope.rawValue ?? "none") cas_mode=\(planCacheConfiguration?.useLiveCAS == true ? "live" : "snapshot") invalidated_jobs=\(planCacheInvalidatedJobCount) narrowed_primaries=\(planCacheNarrowedPrimaryCount) bytes=\(planCacheBytes) direct_plan_bytes=\(directPlanBytes) duration_ns=\(planCacheTimer.elapsedTime().nanoseconds) read_ns=\(planCacheReadDurationNS) apple_plan_ns=\(planCachePlanDurationNS) write_ns=\(planCacheWriteDurationNS)\(unaffectedProof)\(planReplayPhaseNS.isEmpty ? "" : " read_phases=" + planReplayPhaseNS.map { "\($0.0):\($0.1)" }.joined(separator: ","))"
                 )
                 #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
                 if planCacheConfiguration?.dependencyObservation != nil

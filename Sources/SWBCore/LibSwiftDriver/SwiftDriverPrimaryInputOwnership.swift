@@ -72,6 +72,51 @@ public enum SwiftDriverPrimaryInputOwnership {
         return !primaries.isEmpty && primaries.isSubset(of: canonicalInputs) && primaries.contains(selected)
     }
 
+    /// Narrows an invalidated batch compile to the primaries that own an edited source
+    /// (SwiftBuildOptimizer C971). The recorded batch partition otherwise recompiles every
+    /// batch-mate of an edited file; stock incremental builds compile only the edited one.
+    /// A dropped primary's source is unchanged since the record, so its outputs from the
+    /// last build stand, as they do for every other replayed job of the module.
+    ///
+    /// Returns the argument indices to remove and the dropped primaries (as written), or
+    /// nil to keep the whole batch. Only explicit `-primary-file` primaries with one `-o`
+    /// each (and optionally one `-index-unit-output-path` each), in the same order, are
+    /// narrowed; response files, output filelists, module emission and whole-module builds
+    /// are not. Every dropped primary's object output must be an existing regular file.
+    /// Without `-filelist` a dropped primary stays in place as an ordinary input; with one
+    /// (whose entries include the primaries) its `-primary-file` pair is removed.
+    public static func narrowedBatch(arguments: [String], keeping selected: Set<String>,
+                                     canonicalize: (String) -> String?,
+                                     isRegularFile: (String) -> Bool) -> (removed: Set<Int>, dropped: [String])? {
+        guard !arguments.contains(where: {
+                  $0.hasPrefix("@") || $0.hasPrefix("-primary-filelist") || $0.hasPrefix("-output-filelist") ||
+                  $0.hasPrefix("-index-unit-output-path-filelist") || $0.hasPrefix("-emit-module") ||
+                  $0 == "-wmo" || $0 == "-whole-module-optimization"
+              }) else { return nil }
+        let primaries = arguments.indices.filter { arguments[$0] == "-primary-file" }
+        let objects = arguments.indices.filter { arguments[$0] == "-o" }
+        let units = arguments.indices.filter { arguments[$0] == "-index-unit-output-path" }
+        guard primaries.count > 1, objects.count == primaries.count,
+              units.isEmpty || units.count == primaries.count,
+              (primaries + objects + units).allSatisfy({ $0 + 1 < arguments.count && arguments[$0 + 1].hasPrefix("/") })
+        else { return nil }
+        var kept = 0
+        var removed = Set<Int>()
+        var dropped: [String] = []
+        let fileList = arguments.contains("-filelist")
+        for (position, index) in primaries.enumerated() {
+            guard let path = canonicalize(arguments[index + 1]) else { return nil }
+            if selected.contains(path) { kept += 1; continue }
+            guard isRegularFile(arguments[objects[position] + 1]) else { return nil }
+            removed.insert(index)
+            if fileList { removed.insert(index + 1) }
+            removed.formUnion([objects[position], objects[position] + 1])
+            if !units.isEmpty { removed.formUnion([units[position], units[position] + 1]) }
+            dropped.append(arguments[index + 1])
+        }
+        return kept > 0 && !dropped.isEmpty ? (removed, dropped) : nil
+    }
+
     /// Parses a driver response file written with `spm_shellEscaped` (one argument per line;
     /// single-quoted when needed, with embedded quotes written as '\\''). Callers must verify the
     /// result against the planned command-line signature.
