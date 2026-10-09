@@ -510,6 +510,35 @@ public final class SwiftModuleDependencyGraph: SwiftGlobalExplicitDependencyGrap
         return result
     }
 
+    /// Reserves an explicit module job's outputs. Two explicit jobs for the same module, rule, working
+    /// directory and inputs may name one output when only their target triples differ: IceCubesApp's
+    /// packages plan `simd` for iOS 15.0 and 16.0, and Clang's module hash omits the version
+    /// (SwiftBuildOptimizer C969). Stock swift-build runs both jobs; the first reservation is kept here.
+    /// Any other collision is rejected with the differing action fields.
+    private func reservingExplicit(_ job: LibSwiftDriver.PlannedBuild.PlannedSwiftDriverJob,
+                                   jobs: (LibSwiftDriver.JobKey) -> LibSwiftDriver.PlannedBuild.PlannedSwiftDriverJob?,
+                                   in reservations: [Path: OutputOwner]) throws -> [Path: OutputOwner] {
+        var result = reservations
+        for output in job.driverJob.outputs {
+            if let existing = result[output], existing != .explicit(job.key) {
+                guard case .explicit(let previousKey) = existing, let previous = jobs(previousKey) else {
+                    throw StubError.error("Swift Driver output reservation collision: \(output).")
+                }
+                guard previous.driverJob.moduleName == job.driverJob.moduleName,
+                      previous.driverJob.ruleInfoType == job.driverJob.ruleInfoType,
+                      previous.workingDirectory == job.workingDirectory,
+                      Set(previous.driverJob.inputs) == Set(job.driverJob.inputs) else {
+                    throw StubError.error("Swift Driver output reservation collision: \(output). " +
+                        previous.driverJob.explicitActionDifferences(from: job.driverJob,
+                            workingDirectory: previous.workingDirectory, other: job.workingDirectory))
+                }
+                continue
+            }
+            result[output] = .explicit(job.key)
+        }
+        return result
+    }
+
     internal func reserveTargetOutputs(_ outputs: [Path], token: UUID) throws {
         try registryQueue.blocking_sync {
             guard issuedTargetTokens.contains(token) else { throw StubError.error("Unknown target reservation token.") }
@@ -766,7 +795,8 @@ public final class SwiftModuleDependencyGraph: SwiftGlobalExplicitDependencyGrap
             }
             var reservations = captured.2
             for job in tracker.plannedExplicitDependencyJobs {
-                reservations = try reserving(job.driverJob.outputs, for: .explicit(job.key), in: reservations)
+                reservations = try reservingExplicit(job, jobs: { tracker.getExplicitDependencyBuildJobs(for: [$0]).first },
+                                                     in: reservations)
             }
             let cachedDriver = try LibSwiftDriver(
                 cachedPlan: staged,
@@ -902,17 +932,8 @@ public final class SwiftModuleDependencyGraph: SwiftGlobalExplicitDependencyGrap
             let keys = try tracker.addExplicitDependencyBuildJobs(jobs, workingDirectory: workingDirectory, producerMap: &producers)
             var reservations = outputOwners
             for job in tracker.getExplicitDependencyBuildJobs(for: Array(keys).sorted()) {
-                // Diagnostic (SwiftBuildOptimizer C969): name what differs when two explicit module jobs
-                // claim one output, e.g. the same Clang module planned by package targets.
-                for output in job.driverJob.outputs {
-                    if case .explicit(let previousKey)? = reservations[output], previousKey != job.key,
-                       let previous = tracker.getExplicitDependencyBuildJobs(for: [previousKey]).first {
-                        throw StubError.error("Swift Driver output reservation collision: \(output). " +
-                            previous.driverJob.explicitActionDifferences(from: job.driverJob,
-                                workingDirectory: previous.workingDirectory, other: job.workingDirectory))
-                    }
-                }
-                reservations = try reserving(job.driverJob.outputs, for: .explicit(job.key), in: reservations)
+                reservations = try reservingExplicit(job, jobs: { tracker.getExplicitDependencyBuildJobs(for: [$0]).first },
+                                                     in: reservations)
             }
             globalExplicitDependencyTracker = tracker
             outputOwners = reservations
