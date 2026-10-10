@@ -24,6 +24,11 @@ private struct Options {
     let service: String
     let developerDirectory: String
     let compilationCAS: String?
+    /// Exact command-line build-setting overrides (a JSON object); replaces the built-in table.
+    let settings: [String: String]?
+    /// Provisioning answers by bundle identifier, as the stock client gave them (a JSON object of
+    /// `{"identity": String, "signed": {...}, "simulated": {...}}`).
+    let provisioning: [String: ProvisioningAnswer]?
 
     private static func selectedDeveloperDirectory() throws -> String {
         if let developerDirectory = ProcessInfo.processInfo.environment["DEVELOPER_DIR"],
@@ -73,11 +78,64 @@ private struct Options {
         developerDirectory = try values.removeValue(forKey: "--developer-dir")
             ?? Self.selectedDeveloperDirectory()
         compilationCAS = values.removeValue(forKey: "--compilation-cas")
+        if let path = values.removeValue(forKey: "--settings") {
+            let data = try Data(contentsOf: URL(fileURLWithPath: path))
+            settings = try JSONDecoder().decode([String: String].self, from: data)
+        } else {
+            settings = nil
+        }
+        if let path = values.removeValue(forKey: "--provisioning") {
+            let data = try Data(contentsOf: URL(fileURLWithPath: path))
+            provisioning = try JSONDecoder().decode([String: ProvisioningAnswer].self, from: data)
+        } else {
+            provisioning = nil
+        }
         guard values.isEmpty else {
             throw SessionClientError.usage(
                 "unsupported arguments: \(values.keys.sorted().joined(separator: ", "))"
             )
         }
+    }
+}
+
+struct ProvisioningAnswer: Decodable, Sendable {
+    let identity: String
+    let signed: PropertyListValue
+    let simulated: PropertyListValue
+}
+
+/// The JSON subset of property lists that entitlements use.
+indirect enum PropertyListValue: Decodable, Sendable {
+    case bool(Bool)
+    case string(String)
+    case array([PropertyListValue])
+    case dictionary([String: PropertyListValue])
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let value = try? container.decode(Bool.self) {
+            self = .bool(value)
+        } else if let value = try? container.decode(String.self) {
+            self = .string(value)
+        } else if let value = try? container.decode([PropertyListValue].self) {
+            self = .array(value)
+        } else {
+            self = .dictionary(try container.decode([String: PropertyListValue].self))
+        }
+    }
+
+    var item: SWBPropertyListItem {
+        switch self {
+        case .bool(let value): return .plBool(value)
+        case .string(let value): return .plString(value)
+        case .array(let values): return .plArray(values.map(\.item))
+        case .dictionary(let values): return .plDict(values.mapValues(\.item))
+        }
+    }
+
+    var dictionary: [String: SWBPropertyListItem] {
+        guard case .plDict(let values) = item else { return [:] }
+        return values
     }
 }
 
@@ -120,11 +178,25 @@ private struct Response: Encodable {
 }
 
 private final class PlanningDelegate: SWBPlanningOperationDelegate, Sendable {
+    let provisioning: [String: ProvisioningAnswer]?
+
+    init(provisioning: [String: ProvisioningAnswer]?) {
+        self.provisioning = provisioning
+    }
+
     func provisioningTaskInputs(
         targetGUID: String,
         provisioningSourceData: SWBProvisioningTaskInputsSourceData
     ) async -> SWBProvisioningTaskInputs {
-        SWBProvisioningTaskInputs()
+        guard let answer = provisioning?[provisioningSourceData.bundleIdentifier] else {
+            return SWBProvisioningTaskInputs()
+        }
+        return SWBProvisioningTaskInputs(
+            identityHash: answer.identity,
+            identityName: answer.identity,
+            signedEntitlements: answer.signed.dictionary,
+            simulatedEntitlements: answer.simulated.dictionary
+        )
     }
 
     func executeExternalTool(
@@ -245,16 +317,22 @@ private final class PersistentSession {
             disableOnlyActiveArch: false
         )
         var settings = SWBSettingsTable()
-        settings.set(value: "NO", for: "CODE_SIGNING_ALLOWED")
-        settings.set(value: "arm64", for: "ARCHS")
-        settings.set(value: "YES", for: "ONLY_ACTIVE_ARCH")
-        settings.set(value: "NO", for: "SWIFT_ENABLE_BATCH_MODE")
-        settings.set(value: "NO", for: "ENABLE_DEBUG_DYLIB")
-        if let compilationCAS = options.compilationCAS {
-            settings.set(value: "YES", for: "SWIFT_ENABLE_COMPILE_CACHE")
-            settings.set(value: compilationCAS, for: "COMPILATION_CACHE_CAS_PATH")
-            settings.set(value: "YES", for: "COMPILATION_CACHE_KEEP_CAS_DIRECTORY")
-            settings.set(value: "10G", for: "COMPILATION_CACHE_LIMIT_SIZE")
+        if let exact = options.settings {
+            for (key, value) in exact.sorted(by: { $0.key < $1.key }) {
+                settings.set(value: value, for: key)
+            }
+        } else {
+            settings.set(value: "NO", for: "CODE_SIGNING_ALLOWED")
+            settings.set(value: "arm64", for: "ARCHS")
+            settings.set(value: "YES", for: "ONLY_ACTIVE_ARCH")
+            settings.set(value: "NO", for: "SWIFT_ENABLE_BATCH_MODE")
+            settings.set(value: "NO", for: "ENABLE_DEBUG_DYLIB")
+            if let compilationCAS = options.compilationCAS {
+                settings.set(value: "YES", for: "SWIFT_ENABLE_COMPILE_CACHE")
+                settings.set(value: compilationCAS, for: "COMPILATION_CACHE_CAS_PATH")
+                settings.set(value: "YES", for: "COMPILATION_CACHE_KEEP_CAS_DIRECTORY")
+                settings.set(value: "10G", for: "COMPILATION_CACHE_LIMIT_SIZE")
+            }
         }
         parameters.overrides.commandLine = settings
         var synthesizedSettings = SWBSettingsTable()
@@ -291,7 +369,7 @@ private final class PersistentSession {
         let started = DispatchTime.now().uptimeNanoseconds
         let operation = try await session.createBuildOperation(
             request: request,
-            delegate: PlanningDelegate(),
+            delegate: PlanningDelegate(provisioning: options.provisioning),
             retainBuildDescription: descriptionID == nil
         )
         var planningOperations = 0
