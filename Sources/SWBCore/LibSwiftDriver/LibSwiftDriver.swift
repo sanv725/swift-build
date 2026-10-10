@@ -937,7 +937,7 @@ public final class SwiftModuleDependencyGraph: SwiftGlobalExplicitDependencyGrap
         try getAcceleratorReplayCASDatabases(
             casOptions: casOptions,
             compilerLocation: compilerLocation,
-            environment: ProcessInfo.processInfo.environment
+            environment: ServiceEnvironment.snapshot
         )
     }
 

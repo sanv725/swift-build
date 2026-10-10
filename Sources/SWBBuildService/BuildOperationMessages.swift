@@ -1080,7 +1080,7 @@ final class OperationDelegate: BuildOperationDelegate {
     private var skippedParentTasks: [String: any ExecutableTask] = [:]
     private var skippedDiagnosticCount = 0
     private func skippedDiagnostic(_ reason: String) {
-        guard ProcessInfo.processInfo.environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_ALLOW_UNAFFECTED_NATIVE_PLANNING"] == "1",
+        guard ServiceEnvironment.snapshot["SWIFT_BUILD_DRIVER_PLAN_CACHE_ALLOW_UNAFFECTED_NATIVE_PLANNING"] == "1",
               skippedDiagnosticCount < 64 else { return }
         skippedDiagnosticCount += 1
         request.send(BuildOperationConsoleOutputEmitted(data: Array((
@@ -1090,7 +1090,7 @@ final class OperationDelegate: BuildOperationDelegate {
         guard (task.ruleInfo.first ?? "").hasPrefix("SwiftDriver") else { return }
         do {
             guard let value = try SwiftDriverTaskAction.skippedPlanningIdentity(task,
-                environment: ProcessInfo.processInfo.environment) else {
+                environment: ServiceEnvironment.snapshot) else {
                 skippedParentCoverage.rejectUncorrelatableRequester()
                 skippedDiagnostic("identity-policy-rejected"); return
             }
@@ -1222,7 +1222,7 @@ final class OperationDelegate: BuildOperationDelegate {
             }
         }
         let realStatus = status ?? taskCompletionBasedStatus
-        if ProcessInfo.processInfo.environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_ALLOW_UNAFFECTED_NATIVE_PLANNING"] == "1" {
+        if ServiceEnvironment.snapshot["SWIFT_BUILD_DRIVER_PLAN_CACHE_ALLOW_UNAFFECTED_NATIVE_PLANNING"] == "1" {
             request.send(BuildOperationConsoleOutputEmitted(data: Array((
                 skippedParentCoverage.coverageSummary(operationSucceeded: realStatus == .succeeded) + "\n").utf8)))
         }
@@ -1232,10 +1232,10 @@ final class OperationDelegate: BuildOperationDelegate {
             do {
                 var reason = "identity"
                 guard let value = try SwiftDriverTaskAction.skippedPlanningIdentity(task,
-                    environment: ProcessInfo.processInfo.environment), value.key == key,
+                    environment: ServiceEnvironment.snapshot), value.key == key,
                       skippedParentCoverage.terminalIdentityMatches(key: key, identity: value.identity),
                       let proof = try SwiftDriverTaskAction.cachedUpToDateProof(task,
-                        fs: localFS, environment: ProcessInfo.processInfo.environment,
+                        fs: localFS, environment: ServiceEnvironment.snapshot,
                         rejection: { reason = $0 }) else {
                     proofTally[reason, default: 0] += 1
                     skippedDiagnostic("terminal-snapshot-proof-rejected"); continue
@@ -1247,7 +1247,7 @@ final class OperationDelegate: BuildOperationDelegate {
                 skippedDiagnostic("terminal-snapshot-validation-failed")
             }
         }
-        if ProcessInfo.processInfo.environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_ALLOW_UNAFFECTED_NATIVE_PLANNING"] == "1" {
+        if ServiceEnvironment.snapshot["SWIFT_BUILD_DRIVER_PLAN_CACHE_ALLOW_UNAFFECTED_NATIVE_PLANNING"] == "1" {
             let tally = proofTally.sorted(by: { $0.key < $1.key }).map { "\($0.key)=\($0.value)" }.joined(separator: "; ")
             request.send(BuildOperationConsoleOutputEmitted(data: Array(("SWIFT_DRIVER_SKIPPED_PROOFS " + tally + "\n").utf8)))
         }
@@ -1491,7 +1491,7 @@ final class OperationDelegate: BuildOperationDelegate {
         acceleratorTraceWriter?.taskRequestedDynamicTask(requestingTask: requestingTask, dynamicTaskIdentifier: dynamicTaskIdentifier)
         if (requestingTask.ruleInfo.first ?? "").hasPrefix("SwiftDriver") {
             if let value = try? SwiftDriverTaskAction.skippedPlanningIdentity(requestingTask,
-                environment: ProcessInfo.processInfo.environment) {
+                environment: ServiceEnvironment.snapshot) {
                 skippedParentCoverage.requestedDynamicTask(key: value.key)
             } else { skippedParentCoverage.rejectUncorrelatableRequester() }
             skippedDiagnostic("dynamic-request-disqualifies")
@@ -1503,7 +1503,7 @@ final class OperationDelegate: BuildOperationDelegate {
         acceleratorTraceWriter?.registeredDynamicTask(task: task, dynamicTaskIdentifier: dynamicTaskIdentifier)
         if task.ruleInfo.first == "SwiftDriver" {
             if let value = try? SwiftDriverTaskAction.skippedPlanningIdentity(task,
-                environment: ProcessInfo.processInfo.environment) {
+                environment: ServiceEnvironment.snapshot) {
                 skippedParentCoverage.requestedDynamicTask(key: value.key)
             } else { skippedParentCoverage.rejectUncorrelatableRequester() }
             skippedDiagnostic("dynamic-registration-disqualifies")

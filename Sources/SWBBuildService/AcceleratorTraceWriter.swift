@@ -215,7 +215,7 @@ package final class AcceleratorTraceWriter: @unchecked Sendable {
         buildID: UUID,
         activeBuildID: Int,
         parameters: BuildParameters,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ServiceEnvironment.snapshot
     ) -> AcceleratorTraceWriter? {
         guard let configuration = Configuration(environment: environment) else { return nil }
 
