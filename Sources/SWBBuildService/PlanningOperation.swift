@@ -490,6 +490,10 @@ enum StockRequestStore {
             }
         }
         guard let replayDirectory, isNormalBuild else { return request }
+        // The session client writes this build's controls before each request; none means none.
+        let controls = (try? localFS.read(replayDirectory.join("controls.json")))
+            .flatMap { try? JSONDecoder().decode([String: String].self, from: Data($0.bytes)) }
+        ServiceEnvironment.setRequestControls(controls ?? [:])
         guard let data = try? localFS.read(replayDirectory.join("request.json")),
               let recorded = try? JSONDecoder().decode(BuildRequestMessagePayload.self, from: Data(data.bytes)) else {
             throw StubError.error("SWIFT_BUILD_STOCK_REQUEST_REPLAY outcome=miss request")

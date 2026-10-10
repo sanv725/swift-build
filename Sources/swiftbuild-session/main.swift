@@ -108,11 +108,14 @@ private struct Request: Decodable {
     let schema: String
     let command: String
     let reuseBuildDescription: Bool?
+    /// Service controls for this build (C979); see `ServiceEnvironment` in the fork service.
+    let controls: [String: String]?
 
     enum CodingKeys: String, CodingKey {
         case schema
         case command
         case reuseBuildDescription = "reuse_build_description"
+        case controls
     }
 }
 
@@ -130,6 +133,8 @@ private struct Response: Encodable {
     /// For a failed build: tasks that failed (compile errors) and the error diagnostics, located.
     var failedTasks: Int? = nil
     var errors: [String]? = nil
+    /// Streamed build output (outcome "output"), sent before the final response in socket mode.
+    var text: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case schema
@@ -144,6 +149,7 @@ private struct Response: Encodable {
         case message
         case failedTasks = "failed_tasks"
         case errors
+        case text
     }
 }
 
@@ -283,7 +289,16 @@ private final class PersistentSession {
         )
     }
 
-    func build(reuseBuildDescription: Bool) async throws -> Response {
+    func build(
+        reuseBuildDescription: Bool,
+        controls: [String: String]? = nil,
+        output: ((String) -> Void)? = nil
+    ) async throws -> Response {
+        // The replaying service reads this build's controls when the request is created.
+        if let replay = ProcessInfo.processInfo.environment["SWIFT_BUILD_STOCK_REQUEST_REPLAY"], !replay.isEmpty {
+            let data = try JSONSerialization.data(withJSONObject: controls ?? [:], options: [.sortedKeys])
+            try data.write(to: URL(fileURLWithPath: replay).appendingPathComponent("controls.json"), options: .atomic)
+        }
         var parameters = SWBBuildParameters()
         parameters.action = "build"
         parameters.configurationName = options.configuration
@@ -395,7 +410,21 @@ private final class PersistentSession {
                 diagnostics.append(info.message)
             case .taskComplete(let info):
                 if info.result == .failed { failedTasks += 1 }
+            case .taskOutput(let info):
+                output?(info.data)
+            case .output(let info):
+                output?(String(decoding: info.data, as: UTF8.self))
             case .diagnostic(let info):
+                if let output {
+                    switch info.location {
+                    case .path(let path, fileLocation: .textual(let line, let column)?):
+                        output("\(path):\(line):\(column ?? 0): \(info.kind.rawValue): \(info.message)\n")
+                    case .path(let path, _):
+                        output("\(path): \(info.kind.rawValue): \(info.message)\n")
+                    default:
+                        output("\(info.kind.rawValue): \(info.message)\n")
+                    }
+                }
                 if info.kind == .error, errors.count < 200 {
                     switch info.location {
                     case .path(let path, fileLocation: .textual(let line, let column)?):
@@ -479,7 +508,11 @@ private func errorResponse(_ command: String, _ error: any Error) -> Response {
 }
 
 /// Handle one request line. Returns the response and whether the client asked to quit.
-private func handle(_ line: String, _ active: PersistentSession) async -> (Response, Bool) {
+private func handle(
+    _ line: String,
+    _ active: PersistentSession,
+    output: ((String) -> Void)? = nil
+) async -> (Response, Bool) {
     do {
         let request = try JSONDecoder().decode(Request.self, from: Data(line.utf8))
         guard request.schema == protocolSchema else {
@@ -487,7 +520,11 @@ private func handle(_ line: String, _ active: PersistentSession) async -> (Respo
         }
         switch request.command {
         case "build":
-            return (try await active.build(reuseBuildDescription: request.reuseBuildDescription ?? false), false)
+            return (try await active.build(
+                reuseBuildDescription: request.reuseBuildDescription ?? false,
+                controls: request.controls,
+                output: output
+            ), false)
         case "reload":
             return (try await active.reload(), false)
         case "quit":
@@ -553,7 +590,14 @@ private func serve(socketPath: String, idleSeconds: Int, active: PersistentSessi
             while let newline = buffer.firstIndex(of: 0x0A) {
                 let line = String(decoding: buffer[buffer.startIndex..<newline], as: UTF8.self)
                 buffer.removeSubrange(buffer.startIndex...newline)
-                let (response, wantsQuit) = await handle(line, active)
+                let (response, wantsQuit) = await handle(line, active) { text in
+                    let chunk = Response(
+                        outcome: "output", command: "build", durationNS: nil, planningOperations: nil,
+                        taskStarts: nil, buildDescriptionID: nil, reusedBuildDescription: nil,
+                        productPath: nil, message: nil, text: text
+                    )
+                    try? stream.write(contentsOf: try encodedLine(chunk))
+                }
                 try? stream.write(contentsOf: try encodedLine(response))
                 if wantsQuit { quit = true; break }
             }
