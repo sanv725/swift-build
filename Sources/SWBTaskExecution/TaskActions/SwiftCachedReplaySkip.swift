@@ -68,6 +68,37 @@ struct SwiftCachedReplaySkip: Sendable {
                               size: Int64(info.st_size), mtimeNS: mtime)
     }
 
+    /// Keys for a compile job that plan replay invalidated (SwiftBuildOptimizer C978). A file stays in the
+    /// cumulative edit set until the next recording, so every replay invalidates its job again although
+    /// the file may be unchanged since its last compile. These keys bind the plan key (one generation),
+    /// the full command line and each primary's content, so `reusable` keeps that compile's outputs only
+    /// for byte-identical primaries under the same plan. Other sources can only have changed inside
+    /// bodies within one generation, which no other file's outputs depend on (the replay premise).
+    /// Nil when this is not a plan replay, or primaries come from a file list or response file.
+    static func uncachedCompileKeys(commandLine: [String], environment: [String: String]) -> [String]? {
+        guard environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_MODE"] == "replay",
+              let planKey = environment["SWIFT_BUILD_DRIVER_PLAN_CACHE_KEY"], !planKey.isEmpty,
+              !commandLine.contains("-primary-filelist"),
+              !commandLine.dropFirst().contains(where: { $0.hasPrefix("@") }) else { return nil }
+        let command = SHA256Context()
+        for argument in commandLine {
+            let bytes = Array(argument.utf8)
+            command.add(number: UInt64(bytes.count))
+            command.add(bytes: bytes)
+        }
+        var keys = [uncachedSchema, planKey, command.signature.asString]
+        for (index, argument) in commandLine.enumerated() where argument == "-primary-file" {
+            guard index + 1 < commandLine.count, commandLine[index + 1].hasPrefix("/"),
+                  let data = try? Data(contentsOf: URL(fileURLWithPath: commandLine[index + 1])) else { return nil }
+            let content = SHA256Context()
+            content.add(bytes: data)
+            keys += [commandLine[index + 1], content.signature.asString]
+        }
+        return keys.count > 3 ? keys : nil
+    }
+
+    static let uncachedSchema = "swift-build-retained-compile-v1"
+
     func recordURL(cacheKeys: [String], outputs: [Path]) -> URL {
         let context = SHA256Context()
         for field in [Self.schema] + cacheKeys + ["--"] + outputs.map(\.str) {

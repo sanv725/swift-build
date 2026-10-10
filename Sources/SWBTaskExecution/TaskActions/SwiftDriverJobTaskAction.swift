@@ -2185,7 +2185,10 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                         productType: (task.forTarget?.target as? SWBCore.StandardTarget)?.productTypeIdentifier,
                         commandLine: compilerCommandLine
                     ) {
-                        outputDelegate.note("SWIFT_DEFER_EMIT_MODULE outcome=ran module=\(module) reason=\(reason)")
+                        // Libraries and extensions are never deferred; only report ineligible applications.
+                        if reason != "not_application" {
+                            outputDelegate.note("SWIFT_DEFER_EMIT_MODULE outcome=ran module=\(module) reason=\(reason)")
+                        }
                     } else if let record = deferral.enqueue(
                         moduleName: module, commandLine: compilerCommandLine, environment: environment,
                         workingDirectory: task.workingDirectory, outputs: plannedOutputs, cacheKeys: cacheKeys
@@ -2218,6 +2221,28 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
             }
             #endif
 
+            #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT && canImport(Darwin)
+            // C978: a compile that plan replay invalidated keeps the outputs of its last successful run in
+            // this plan generation when its primaries are byte-identical (`uncachedCompileKeys`).
+            var retainedCompile: (skip: SwiftCachedReplaySkip, keys: [String], controls: [String: String])?
+            if driverJob.driverJob.ruleInfoType == "Compile", cacheKeys.isEmpty, !plannedOutputs.isEmpty,
+               let skip = replaySkipHandle.value {
+                let controls = ServiceEnvironment.snapshot.merging(environment, uniquingKeysWith: { _, taskValue in taskValue })
+                if controls["SWIFT_BUILD_RETAINED_COMPILE"] != "0",
+                   let keys = SwiftCachedReplaySkip.uncachedCompileKeys(commandLine: compilerCommandLine, environment: controls) {
+                    if let streams = skip.reusable(cacheKeys: keys, outputs: plannedOutputs) {
+                        outputDelegate.emitOutput(ByteString(encodingAsUTF8: streams.standardOutput))
+                        outputDelegate.note("SWIFT_RETAINED_COMPILE outcome=reused outputs=\(plannedOutputs.count)")
+                        try plannedBuild?.jobStarted(job: driverJob, arguments: options.commandLine, pid: 0)
+                        try plannedBuild?.jobFinished(job: driverJob, arguments: options.commandLine, pid: 0, environment: environment, exitStatus: .exit(0), output: "")
+                        return .succeeded
+                    }
+                    skip.invalidate(cacheKeys: keys, outputs: plannedOutputs)
+                    retainedCompile = (skip, keys, controls)
+                }
+            }
+            #endif
+
             let compilerTimer = ElapsedTimer()
             do {
                 try await spawn(commandLine: compilerCommandLine, environment: environment, workingDirectory: task.workingDirectory, dynamicExecutionDelegate: dynamicExecutionDelegate, clientDelegate: clientDelegate, processDelegate: delegate)
@@ -2226,6 +2251,19 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                 compilerDurationNS = compilerTimer.elapsedTime().nanoseconds
                 throw error
             }
+
+            #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT && canImport(Darwin)
+            // Record only a clean run whose primaries did not change while it compiled.
+            if let retainedCompile, delegate.commandResult == .succeeded, delegate.executionError == nil,
+               SwiftCachedReplaySkip.uncachedCompileKeys(commandLine: compilerCommandLine,
+                                                         environment: retainedCompile.controls) == retainedCompile.keys {
+                let text = String(decoding: delegate.output.bytes, as: UTF8.self)
+                if ByteString(encodingAsUTF8: text) == delegate.output {
+                    retainedCompile.skip.record(cacheKeys: retainedCompile.keys, outputs: plannedOutputs,
+                                                streams: .init(standardOutput: text, standardError: ""))
+                }
+            }
+            #endif
 
             #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
             if driverJob.driverJob.ruleInfoType == "Compile",

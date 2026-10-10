@@ -66,6 +66,40 @@ fileprivate struct SwiftCachedReplaySkipTests {
     }
 
     @Test
+    func uncachedCompileKeysBindPlanCommandLineAndPrimaryContent() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("retained-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let primary = directory.appendingPathComponent("A.swift"), other = directory.appendingPathComponent("B.swift")
+        try Data("let a = 1".utf8).write(to: primary)
+        try Data("let b = 1".utf8).write(to: other)
+        let replay = ["SWIFT_BUILD_DRIVER_PLAN_CACHE_MODE": "replay", "SWIFT_BUILD_DRIVER_PLAN_CACHE_KEY": "plan-1"]
+        let command = ["swift-frontend", "-c", other.path, "-primary-file", primary.path, "-o", "A.o"]
+        let keys = try #require(SwiftCachedReplaySkip.uncachedCompileKeys(commandLine: command, environment: replay))
+        #expect(SwiftCachedReplaySkip.uncachedCompileKeys(commandLine: command, environment: replay) == keys)
+
+        // A non-primary source does not take part: within one generation it can change only inside bodies.
+        try Data("let b = 2".utf8).write(to: other)
+        #expect(SwiftCachedReplaySkip.uncachedCompileKeys(commandLine: command, environment: replay) == keys)
+        // Primary content, plan key and command line each change the keys.
+        var plan2 = replay
+        plan2["SWIFT_BUILD_DRIVER_PLAN_CACHE_KEY"] = "plan-2"
+        #expect(SwiftCachedReplaySkip.uncachedCompileKeys(commandLine: command, environment: plan2) != keys)
+        #expect(SwiftCachedReplaySkip.uncachedCompileKeys(commandLine: command + ["-g"], environment: replay) != keys)
+        try Data("let a = 2".utf8).write(to: primary)
+        #expect(SwiftCachedReplaySkip.uncachedCompileKeys(commandLine: command, environment: replay) != keys)
+
+        // Ineligible: not a replay, no plan key, no inline primary, file lists, response files, relative or missing primaries.
+        #expect(SwiftCachedReplaySkip.uncachedCompileKeys(commandLine: command, environment: ["SWIFT_BUILD_DRIVER_PLAN_CACHE_MODE": "record", "SWIFT_BUILD_DRIVER_PLAN_CACHE_KEY": "plan-1"]) == nil)
+        #expect(SwiftCachedReplaySkip.uncachedCompileKeys(commandLine: command, environment: ["SWIFT_BUILD_DRIVER_PLAN_CACHE_MODE": "replay"]) == nil)
+        #expect(SwiftCachedReplaySkip.uncachedCompileKeys(commandLine: ["swift-frontend", "-c", primary.path], environment: replay) == nil)
+        #expect(SwiftCachedReplaySkip.uncachedCompileKeys(commandLine: command + ["-primary-filelist", "list"], environment: replay) == nil)
+        #expect(SwiftCachedReplaySkip.uncachedCompileKeys(commandLine: command + ["@args.resp"], environment: replay) == nil)
+        #expect(SwiftCachedReplaySkip.uncachedCompileKeys(commandLine: ["swift-frontend", "-primary-file", "A.swift"], environment: replay) == nil)
+        #expect(SwiftCachedReplaySkip.uncachedCompileKeys(commandLine: ["swift-frontend", "-primary-file", directory.appendingPathComponent("missing.swift").path], environment: replay) == nil)
+    }
+
+    @Test
     func disabledWithoutAnAbsoluteRoot() {
         #expect(SwiftCachedReplaySkip(environment: [:]) == nil)
         #expect(SwiftCachedReplaySkip(environment: [SwiftCachedReplaySkip.rootVariable: "relative"]) == nil)
