@@ -19,7 +19,17 @@ private enum SessionClientError: Error, CustomStringConvertible {
 
 private struct Options {
     let project: String
-    let target: String
+    /// Comma-separated target names: the scheme's build entries (built with implicit dependencies).
+    let targets: [String]
+    let configuration: String
+    /// When set, the client dumps the PIF itself with this package checkout, as the stock row's
+    /// `-clonedSourcePackagesDirPath` does; the service's own dump would resolve packages elsewhere.
+    let clonedSourcePackages: String?
+    /// Resident mode: serve JSON lines on this Unix socket, one connection at a time, instead of stdin.
+    let socket: String?
+    let idleExitSeconds: Int
+    /// When set, each build appends one JSON line per started task (rule, signature, command line).
+    let taskLog: String?
     let derivedData: String
     let service: String
     let developerDirectory: String
@@ -69,7 +79,12 @@ private struct Options {
             return value
         }
         project = try required("--project")
-        target = try required("--target")
+        targets = try required("--target").split(separator: ",").map(String.init)
+        configuration = values.removeValue(forKey: "--configuration") ?? "Debug"
+        clonedSourcePackages = values.removeValue(forKey: "--cloned-source-packages")
+        socket = values.removeValue(forKey: "--socket")
+        idleExitSeconds = Int(values.removeValue(forKey: "--idle-exit") ?? "900") ?? 900
+        taskLog = values.removeValue(forKey: "--task-log")
         derivedData = try required("--derived-data")
         service = try required("--service")
         developerDirectory = try values.removeValue(forKey: "--developer-dir")
@@ -112,6 +127,9 @@ private struct Response: Encodable {
     let reusedBuildDescription: Bool?
     let productPath: String?
     let message: String?
+    /// For a failed build: tasks that failed (compile errors) and the error diagnostics, located.
+    var failedTasks: Int? = nil
+    var errors: [String]? = nil
 
     enum CodingKeys: String, CodingKey {
         case schema
@@ -124,6 +142,8 @@ private struct Response: Encodable {
         case reusedBuildDescription = "reused_build_description"
         case productPath = "product_path"
         case message
+        case failedTasks = "failed_tasks"
+        case errors
     }
 }
 
@@ -149,7 +169,7 @@ private final class PersistentSession {
     private let options: Options
     private let service: SWBBuildService
     private let session: SWBBuildServiceSession
-    private var configuredTarget: SWBConfiguredTarget
+    private var configuredTargets: [SWBConfiguredTarget]
     private var retainedBuildDescriptionID: String?
 
     init(options: Options) async throws {
@@ -180,25 +200,58 @@ private final class PersistentSession {
             )
         }
         do {
-            try await createdSession.loadWorkspace(containerPath: options.project)
-            try await createdSession.setSystemInfo(.default())
-            try await createdSession.setUserInfo(.default)
-            let matches = try await createdSession.workspaceInfo().targetInfos.filter {
-                $0.targetName == options.target
-            }
-            guard matches.count == 1, let match = matches.first else {
-                throw SessionClientError.invalid(
-                    "expected one target named \(options.target), found \(matches.count)"
-                )
-            }
+            configuredTargets = try await Self.loadWorkspace(createdSession, options: options)
             self.options = options
             service = createdService
             session = createdSession
-            configuredTarget = SWBConfiguredTarget(guid: match.guid, parameters: nil)
         } catch {
             try? await createdSession.close()
             await createdService.close()
             throw error
+        }
+    }
+
+    /// Load the workspace (dumping the PIF with the stock package checkout when given) and resolve
+    /// each target name to exactly one target.
+    private static func loadWorkspace(
+        _ session: SWBBuildServiceSession,
+        options: Options
+    ) async throws -> [SWBConfiguredTarget] {
+        if let packages = options.clonedSourcePackages {
+            let pif = FileManager.default.temporaryDirectory
+                .appendingPathComponent("swiftbuild-session-\(getpid())-\(UUID().uuidString).json")
+            defer { try? FileManager.default.removeItem(at: pif) }
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: options.developerDirectory + "/usr/bin/xcodebuild")
+            process.arguments = [
+                "-dumpPIF", pif.path,
+                options.project.hasSuffix(".xcodeproj") ? "-project" : "-workspace", options.project,
+                "-clonedSourcePackagesDirPath", packages,
+            ]
+            process.standardOutput = FileHandle.nullDevice
+            let errors = Pipe()
+            process.standardError = errors
+            try process.run()
+            let detail = errors.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                throw SessionClientError.invalid(
+                    "cannot dump PIF: \(String(decoding: detail.prefix(4_000), as: UTF8.self))"
+                )
+            }
+            try await session.loadWorkspace(containerPath: pif.path)
+        } else {
+            try await session.loadWorkspace(containerPath: options.project)
+        }
+        try await session.setSystemInfo(.default())
+        try await session.setUserInfo(.default)
+        let infos = try await session.workspaceInfo().targetInfos
+        return try options.targets.map { name in
+            let matches = infos.filter { $0.targetName == name }
+            guard matches.count == 1, let match = matches.first else {
+                throw SessionClientError.invalid("expected one target named \(name), found \(matches.count)")
+            }
+            return SWBConfiguredTarget(guid: match.guid, parameters: nil)
         }
     }
 
@@ -216,18 +269,7 @@ private final class PersistentSession {
             self.retainedBuildDescriptionID = nil
         }
         let started = DispatchTime.now().uptimeNanoseconds
-        try await session.loadWorkspace(containerPath: options.project)
-        try await session.setSystemInfo(.default())
-        try await session.setUserInfo(.default)
-        let matches = try await session.workspaceInfo().targetInfos.filter {
-            $0.targetName == options.target
-        }
-        guard matches.count == 1, let match = matches.first else {
-            throw SessionClientError.invalid(
-                "expected one target named \(options.target), found \(matches.count)"
-            )
-        }
-        configuredTarget = SWBConfiguredTarget(guid: match.guid, parameters: nil)
+        configuredTargets = try await Self.loadWorkspace(session, options: options)
         return Response(
             outcome: "reloaded",
             command: "reload",
@@ -244,7 +286,7 @@ private final class PersistentSession {
     func build(reuseBuildDescription: Bool) async throws -> Response {
         var parameters = SWBBuildParameters()
         parameters.action = "build"
-        parameters.configurationName = "Debug"
+        parameters.configurationName = options.configuration
         parameters.activeRunDestination = SWBRunDestinationInfo(
             platform: "iphonesimulator",
             sdk: "iphonesimulator",
@@ -294,7 +336,7 @@ private final class PersistentSession {
 
         var request = SWBBuildRequest()
         request.parameters = parameters
-        request.configuredTargets = [configuredTarget]
+        request.configuredTargets = configuredTargets
         request.useParallelTargets = true
         request.useImplicitDependencies = true
         request.hideShellScriptEnvironment = false
@@ -311,29 +353,78 @@ private final class PersistentSession {
         )
         var planningOperations = 0
         var taskStarts = 0
+        var startedTasks = Data()
+        defer {
+            if let taskLog = options.taskLog, !startedTasks.isEmpty {
+                if !FileManager.default.fileExists(atPath: taskLog) {
+                    FileManager.default.createFile(atPath: taskLog, contents: nil)
+                }
+                if let handle = FileHandle(forWritingAtPath: taskLog) {
+                    handle.seekToEndOfFile()
+                    handle.write(startedTasks)
+                    try? handle.close()
+                }
+            }
+        }
         var reportedBuildDescriptionID: String?
         var diagnostics: [String] = []
+        var failedTasks = 0
+        var errors: [String] = []
         for await event in try await operation.start() {
             switch event {
             case .planningOperationStarted:
                 planningOperations += 1
-            case .taskStarted:
+            case .taskStarted(let info):
                 taskStarts += 1
+                if options.taskLog != nil {
+                    let entry: [String: String] = [
+                        "rule": info.ruleInfo,
+                        "signature": info.taskSignature,
+                        "command": info.commandLineDisplayString ?? "",
+                    ]
+                    if var line = try? JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys]) {
+                        line.append(0x0A)
+                        startedTasks.append(line)
+                    }
+                }
             case .reportBuildDescription(let info):
                 reportedBuildDescriptionID = info.buildDescriptionID
             case .buildDiagnostic(let info):
                 diagnostics.append(info.message)
             case .taskDiagnostic(let info):
                 diagnostics.append(info.message)
+            case .taskComplete(let info):
+                if info.result == .failed { failedTasks += 1 }
+            case .diagnostic(let info):
+                if info.kind == .error, errors.count < 200 {
+                    switch info.location {
+                    case .path(let path, fileLocation: .textual(let line, let column)?):
+                        errors.append("\(path):\(line):\(column ?? 0): error: \(info.message)")
+                    case .path(let path, _):
+                        errors.append("\(path): error: \(info.message)")
+                    default:
+                        errors.append("error: \(info.message)")
+                    }
+                }
             default:
                 break
             }
         }
         guard operation.state == .succeeded else {
             let detail = diagnostics.suffix(20).joined(separator: "; ")
-            throw SessionClientError.build(
-                "build ended in state \(operation.state)"
-                    + (detail.isEmpty ? "" : ": \(detail.prefix(4_000))")
+            return Response(
+                outcome: "failed",
+                command: "build",
+                durationNS: DispatchTime.now().uptimeNanoseconds - started,
+                planningOperations: planningOperations,
+                taskStarts: taskStarts,
+                buildDescriptionID: nil,
+                reusedBuildDescription: nil,
+                productPath: nil,
+                message: "build ended in state \(operation.state)"
+                    + (detail.isEmpty ? "" : ": \(detail.prefix(4_000))"),
+                failedTasks: failedTasks,
+                errors: errors
             )
         }
         if descriptionID == nil {
@@ -347,10 +438,6 @@ private final class PersistentSession {
         } else if reportedBuildDescriptionID != descriptionID {
             throw SessionClientError.build("reused build reported a different description")
         }
-        let product = buildRoot + "/Products/Debug-iphonesimulator/\(options.target).app"
-        guard FileManager.default.fileExists(atPath: product) else {
-            throw SessionClientError.build("expected app product is missing: \(product)")
-        }
         return Response(
             outcome: "built",
             command: "build",
@@ -359,7 +446,7 @@ private final class PersistentSession {
             taskStarts: taskStarts,
             buildDescriptionID: retainedBuildDescriptionID,
             reusedBuildDescription: descriptionID != nil,
-            productPath: product,
+            productPath: nil,
             message: nil
         )
     }
@@ -369,6 +456,110 @@ private func emit(_ response: Response) throws {
     let data = try JSONEncoder().encode(response)
     FileHandle.standardOutput.write(data)
     FileHandle.standardOutput.write(Data([0x0A]))
+}
+
+private func encodedLine(_ response: Response) throws -> Data {
+    var data = try JSONEncoder().encode(response)
+    data.append(0x0A)
+    return data
+}
+
+private func errorResponse(_ command: String, _ error: any Error) -> Response {
+    Response(
+        outcome: "error",
+        command: command,
+        durationNS: nil,
+        planningOperations: nil,
+        taskStarts: nil,
+        buildDescriptionID: nil,
+        reusedBuildDescription: nil,
+        productPath: nil,
+        message: "\(error)"
+    )
+}
+
+/// Handle one request line. Returns the response and whether the client asked to quit.
+private func handle(_ line: String, _ active: PersistentSession) async -> (Response, Bool) {
+    do {
+        let request = try JSONDecoder().decode(Request.self, from: Data(line.utf8))
+        guard request.schema == protocolSchema else {
+            throw SessionClientError.invalid("incompatible request schema")
+        }
+        switch request.command {
+        case "build":
+            return (try await active.build(reuseBuildDescription: request.reuseBuildDescription ?? false), false)
+        case "reload":
+            return (try await active.reload(), false)
+        case "quit":
+            return (Response(
+                outcome: "closing",
+                command: "quit",
+                durationNS: nil,
+                planningOperations: nil,
+                taskStarts: nil,
+                buildDescriptionID: nil,
+                reusedBuildDescription: nil,
+                productPath: nil,
+                message: nil
+            ), true)
+        default:
+            throw SessionClientError.invalid("unsupported command: \(request.command)")
+        }
+    } catch {
+        return (errorResponse("request", error), false)
+    }
+}
+
+/// Resident mode: accept one connection at a time on a Unix socket and exit after `idleSeconds`
+/// without a connection. The socket exists only while the session is ready.
+private func serve(socketPath: String, idleSeconds: Int, active: PersistentSession) async throws {
+    let listener = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+    guard listener >= 0 else { throw SessionClientError.invalid("cannot create socket") }
+    defer { Darwin.close(listener) }
+    var address = sockaddr_un()
+    address.sun_family = sa_family_t(AF_UNIX)
+    let pathBytes = Array(socketPath.utf8)
+    guard pathBytes.count < MemoryLayout.size(ofValue: address.sun_path) else {
+        throw SessionClientError.invalid("socket path is too long")
+    }
+    withUnsafeMutableBytes(of: &address.sun_path) { buffer in
+        buffer.copyBytes(from: pathBytes)
+        buffer[pathBytes.count] = 0
+    }
+    unlink(socketPath)
+    let bound = withUnsafePointer(to: &address) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            Darwin.bind(listener, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        }
+    }
+    guard bound == 0, chmod(socketPath, 0o600) == 0, Darwin.listen(listener, 4) == 0 else {
+        throw SessionClientError.invalid("cannot listen on \(socketPath)")
+    }
+    defer { unlink(socketPath) }
+    while true {
+        var poll = pollfd(fd: listener, events: Int16(POLLIN), revents: 0)
+        let ready = Darwin.poll(&poll, 1, Int32(min(idleSeconds, Int(Int32.max / 1000)) * 1000))
+        if ready == 0 { return }
+        if ready < 0 { if errno == EINTR { continue } else { return } }
+        let connection = Darwin.accept(listener, nil, nil)
+        guard connection >= 0 else { continue }
+        let stream = FileHandle(fileDescriptor: connection, closeOnDealloc: true)
+        var buffer = Data()
+        var quit = false
+        while !quit {
+            let chunk = stream.availableData
+            if chunk.isEmpty { break }
+            buffer.append(chunk)
+            while let newline = buffer.firstIndex(of: 0x0A) {
+                let line = String(decoding: buffer[buffer.startIndex..<newline], as: UTF8.self)
+                buffer.removeSubrange(buffer.startIndex...newline)
+                let (response, wantsQuit) = await handle(line, active)
+                try? stream.write(contentsOf: try encodedLine(response))
+                if wantsQuit { quit = true; break }
+            }
+        }
+        if quit { return }
+    }
 }
 
 @main
@@ -390,51 +581,13 @@ private struct Main {
                 productPath: nil,
                 message: nil
             ))
-            let decoder = JSONDecoder()
-            while let line = readLine() {
-                do {
-                    let request = try decoder.decode(Request.self, from: Data(line.utf8))
-                    guard request.schema == protocolSchema else {
-                        throw SessionClientError.invalid("incompatible request schema")
-                    }
-                    switch request.command {
-                    case "build":
-                        try emit(try await active.build(
-                            reuseBuildDescription: request.reuseBuildDescription ?? true
-                        ))
-                    case "reload":
-                        try emit(try await active.reload())
-                    case "quit":
-                        try emit(Response(
-                            outcome: "closing",
-                            command: "quit",
-                            durationNS: nil,
-                            planningOperations: nil,
-                            taskStarts: nil,
-                            buildDescriptionID: nil,
-                            reusedBuildDescription: nil,
-                            productPath: nil,
-                            message: nil
-                        ))
-                        try await active.close()
-                        return
-                    default:
-                        throw SessionClientError.invalid(
-                            "unsupported command: \(request.command)"
-                        )
-                    }
-                } catch {
-                    try emit(Response(
-                        outcome: "error",
-                        command: "request",
-                        durationNS: nil,
-                        planningOperations: nil,
-                        taskStarts: nil,
-                        buildDescriptionID: nil,
-                        reusedBuildDescription: nil,
-                        productPath: nil,
-                        message: "\(error)"
-                    ))
+            if let socketPath = options.socket {
+                try await serve(socketPath: socketPath, idleSeconds: options.idleExitSeconds, active: active)
+            } else {
+                while let line = readLine() {
+                    let (response, quit) = await handle(line, active)
+                    try emit(response)
+                    if quit { break }
                 }
             }
             try await active.close()

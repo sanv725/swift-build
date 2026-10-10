@@ -18,6 +18,9 @@ package import SWBTaskConstruction
 import SWBTaskExecution
 package import SWBUtil
 package import struct Foundation.UUID
+import struct Foundation.Data
+import class Foundation.JSONDecoder
+import class Foundation.JSONEncoder
 import SWBMacro
 
 /// The delegate for planning the build operation
@@ -119,8 +122,8 @@ package final class PlanningOperation: Sendable {
             return nil // CancellationError
         }
 
-        // A replayed provisioning answer that does not match ends planning, like a graph error.
-        if ProvisioningAnswerStore.replayDirectory != nil && delegate.hadErrors {
+        // A replayed stock answer that does not match ends planning, like a graph error.
+        if StockRequestStore.replayDirectory != nil && delegate.hadErrors {
             return nil
         }
 
@@ -290,9 +293,9 @@ package final class PlanningOperation: Sendable {
 
             let sourceData = ProvisioningTaskInputsSourceData(configurationName: configurationName, sourceData: targetSourceData, provisioningProfileSupport: provisioningProfileSupport, provisioningProfileSpecifier: provisioningProfileSpecifier, provisioningProfileUUID: provisioningProfileUUID, bundleIdentifier: bundleIdentifier, productTypeEntitlements: productTypeEntitlements, productTypeIdentifier: productTypeIdentifier, projectEntitlementsFile: entitlementsFilePath?.str, projectEntitlements: entitlements, signingCertificateIdentifier: signingCertificateIdentifier, signingRequiresTeam: signingRequiresTeam, teamID: teamID, sdkRoot: sdkCanonicalName, sdkVariant: sdkVariant, supportsEntitlements: supportsEntitlements, wantsBaseEntitlementInjection: wantsBaseEntitlementInjection, entitlementsDestination: entitlementsDestination.rawValue, localSigningStyle: localSigningStyle, enableCloudSigning: enableCloudSigning)
 
-            if let replayDirectory = ProvisioningAnswerStore.replayDirectory {
-                guard let response = ProvisioningAnswerStore.lookup(replayDirectory, targetGUID: configuredTarget.target.guid, sourceData: sourceData) else {
-                    delegate.emit(.default, .init(behavior: .error, location: .unknown, data: .init("SWIFT_BUILD_PROVISIONING_REPLAY outcome=miss target=\(configuredTarget.target.name)")))
+            if let replayDirectory = StockRequestStore.replayDirectory {
+                guard let response = StockRequestStore.lookup(replayDirectory, targetGUID: configuredTarget.target.guid, sourceData: sourceData) else {
+                    delegate.emit(.default, .init(behavior: .error, location: .unknown, data: .init("SWIFT_BUILD_STOCK_REQUEST_REPLAY outcome=miss target=\(configuredTarget.target.name)")))
                     return ProvisioningTaskInputs()
                 }
                 return Self.provisioningInputs(from: response, settings: settings, bundleIdentifier: bundleIdentifier)
@@ -374,8 +377,8 @@ package final class PlanningOperation: Sendable {
                 fatalError("no settings in session for handle '\(subrequest.settingsHandle)': Unknown error")
             }
             let inputs = Self.provisioningInputs(from: response, settings: settings, bundleIdentifier: subrequest.bundleIdentifier)
-            if let captureDirectory = ProvisioningAnswerStore.captureDirectory {
-                ProvisioningAnswerStore.record(captureDirectory, targetGUID: subrequest.targetGUID, sourceData: subrequest.sourceData, response: response)
+            if let captureDirectory = StockRequestStore.captureDirectory {
+                StockRequestStore.record(captureDirectory, targetGUID: subrequest.targetGUID, sourceData: subrequest.sourceData, response: response)
             }
             subrequest.completion(inputs)
 
@@ -464,15 +467,38 @@ fileprivate final class ActivityReportingForwardingDelegate: TargetDependencyRes
     }
 }
 
-/// Provisioning answers recorded from a stock client and replayed by a warm session (C979).
+/// The stock client's build request and provisioning answers, recorded on a stock `xcodebuild`
+/// request and replayed by a warm session (C979).
 ///
 /// A warm session has no Xcode to ask: the team, identity and entitlements Xcode derives come from
-/// private provisioning logic. `SWIFT_BUILD_PROVISIONING_CAPTURE=<dir>` records each target's answer
-/// next to the source data it answered; `SWIFT_BUILD_PROVISIONING_REPLAY=<dir>` answers only when the
-/// new source data is exactly equal, and fails the target otherwise.
-enum ProvisioningAnswerStore {
-    static let captureDirectory = ServiceEnvironment.snapshot["SWIFT_BUILD_PROVISIONING_CAPTURE"].flatMap { $0.isEmpty ? nil : Path($0) }
-    static let replayDirectory = ServiceEnvironment.snapshot["SWIFT_BUILD_PROVISIONING_REPLAY"].flatMap { $0.isEmpty ? nil : Path($0) }
+/// private provisioning logic, and xcodebuild's request (run destination, synthesized settings, lane
+/// width) changes task signatures, so an approximation reruns tasks after every switch between the
+/// two clients. `SWIFT_BUILD_STOCK_REQUEST_CAPTURE=<dir>` records the request and each target's answer
+/// next to the source data it answered. `SWIFT_BUILD_STOCK_REQUEST_REPLAY=<dir>` builds the recorded
+/// request instead of the client's and answers provisioning only when the new source data is exactly
+/// equal; anything missing or different fails the build.
+enum StockRequestStore {
+    /// The request a build operation runs: recorded when capturing, the recorded one when replaying.
+    static func effectiveRequest(_ request: BuildRequestMessagePayload) throws -> BuildRequestMessagePayload {
+        let isNormalBuild = request.parameters.action == "build" && !request.useDryRun
+        if let captureDirectory, isNormalBuild {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
+            if let data = try? encoder.encode(request) {
+                try? localFS.createDirectory(captureDirectory, recursive: true)
+                try? localFS.write(captureDirectory.join("request.json"), contents: ByteString(data), atomically: true)
+            }
+        }
+        guard let replayDirectory, isNormalBuild else { return request }
+        guard let data = try? localFS.read(replayDirectory.join("request.json")),
+              let recorded = try? JSONDecoder().decode(BuildRequestMessagePayload.self, from: Data(data.bytes)) else {
+            throw StubError.error("SWIFT_BUILD_STOCK_REQUEST_REPLAY outcome=miss request")
+        }
+        return recorded
+    }
+
+    static let captureDirectory = ServiceEnvironment.snapshot["SWIFT_BUILD_STOCK_REQUEST_CAPTURE"].flatMap { $0.isEmpty ? nil : Path($0) }
+    static let replayDirectory = ServiceEnvironment.snapshot["SWIFT_BUILD_STOCK_REQUEST_REPLAY"].flatMap { $0.isEmpty ? nil : Path($0) }
 
     private static func path(_ directory: Path, targetGUID: String) -> Path {
         directory.join(targetGUID.utf8.map { ($0 < 16 ? "0" : "") + String($0, radix: 16) }.joined() + ".provisioning")
