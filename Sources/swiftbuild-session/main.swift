@@ -26,9 +26,6 @@ private struct Options {
     let compilationCAS: String?
     /// Exact command-line build-setting overrides (a JSON object); replaces the built-in table.
     let settings: [String: String]?
-    /// Provisioning answers by bundle identifier, as the stock client gave them (a JSON object of
-    /// `{"identity": String, "signed": {...}, "simulated": {...}}`).
-    let provisioning: [String: ProvisioningAnswer]?
 
     private static func selectedDeveloperDirectory() throws -> String {
         if let developerDirectory = ProcessInfo.processInfo.environment["DEVELOPER_DIR"],
@@ -84,58 +81,11 @@ private struct Options {
         } else {
             settings = nil
         }
-        if let path = values.removeValue(forKey: "--provisioning") {
-            let data = try Data(contentsOf: URL(fileURLWithPath: path))
-            provisioning = try JSONDecoder().decode([String: ProvisioningAnswer].self, from: data)
-        } else {
-            provisioning = nil
-        }
         guard values.isEmpty else {
             throw SessionClientError.usage(
                 "unsupported arguments: \(values.keys.sorted().joined(separator: ", "))"
             )
         }
-    }
-}
-
-struct ProvisioningAnswer: Decodable, Sendable {
-    let identity: String
-    let signed: PropertyListValue
-    let simulated: PropertyListValue
-}
-
-/// The JSON subset of property lists that entitlements use.
-indirect enum PropertyListValue: Decodable, Sendable {
-    case bool(Bool)
-    case string(String)
-    case array([PropertyListValue])
-    case dictionary([String: PropertyListValue])
-
-    init(from decoder: any Decoder) throws {
-        let container = try decoder.singleValueContainer()
-        if let value = try? container.decode(Bool.self) {
-            self = .bool(value)
-        } else if let value = try? container.decode(String.self) {
-            self = .string(value)
-        } else if let value = try? container.decode([PropertyListValue].self) {
-            self = .array(value)
-        } else {
-            self = .dictionary(try container.decode([String: PropertyListValue].self))
-        }
-    }
-
-    var item: SWBPropertyListItem {
-        switch self {
-        case .bool(let value): return .plBool(value)
-        case .string(let value): return .plString(value)
-        case .array(let values): return .plArray(values.map(\.item))
-        case .dictionary(let values): return .plDict(values.mapValues(\.item))
-        }
-    }
-
-    var dictionary: [String: SWBPropertyListItem] {
-        guard case .plDict(let values) = item else { return [:] }
-        return values
     }
 }
 
@@ -178,25 +128,12 @@ private struct Response: Encodable {
 }
 
 private final class PlanningDelegate: SWBPlanningOperationDelegate, Sendable {
-    let provisioning: [String: ProvisioningAnswer]?
-
-    init(provisioning: [String: ProvisioningAnswer]?) {
-        self.provisioning = provisioning
-    }
-
     func provisioningTaskInputs(
         targetGUID: String,
         provisioningSourceData: SWBProvisioningTaskInputsSourceData
     ) async -> SWBProvisioningTaskInputs {
-        guard let answer = provisioning?[provisioningSourceData.bundleIdentifier] else {
-            return SWBProvisioningTaskInputs()
-        }
-        return SWBProvisioningTaskInputs(
-            identityHash: answer.identity,
-            identityName: answer.identity,
-            signedEntitlements: answer.signed.dictionary,
-            simulatedEntitlements: answer.simulated.dictionary
-        )
+        // Signing answers come from the service's recorded stock answers (SWIFT_BUILD_PROVISIONING_REPLAY).
+        SWBProvisioningTaskInputs()
     }
 
     func executeExternalTool(
@@ -369,7 +306,7 @@ private final class PersistentSession {
         let started = DispatchTime.now().uptimeNanoseconds
         let operation = try await session.createBuildOperation(
             request: request,
-            delegate: PlanningDelegate(provisioning: options.provisioning),
+            delegate: PlanningDelegate(),
             retainBuildDescription: descriptionID == nil
         )
         var planningOperations = 0

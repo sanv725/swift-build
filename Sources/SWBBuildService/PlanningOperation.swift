@@ -119,6 +119,11 @@ package final class PlanningOperation: Sendable {
             return nil // CancellationError
         }
 
+        // A replayed provisioning answer that does not match ends planning, like a graph error.
+        if ProvisioningAnswerStore.replayDirectory != nil && delegate.hadErrors {
+            return nil
+        }
+
         if messageShortening != .full || self.workspaceContext.userPreferences.enableDebugActivityLogs {
             self.delegate.updateProgress(statusMessage: "Creating build plan request", showInLog: false)
         }
@@ -138,6 +143,10 @@ package final class PlanningOperation: Sendable {
 
         /// The bundle identifier computed to pass to the client, also needed to evaluate settings in the entitlements plists in the response.
         let bundleIdentifier: String
+
+        /// The target and the source data sent to the client, recorded with its answer when capture is on.
+        let targetGUID: String
+        let sourceData: ProvisioningTaskInputsSourceData
 
         /// The completion block.
         let completion: @Sendable (ProvisioningTaskInputs) -> Void
@@ -279,19 +288,27 @@ package final class PlanningOperation: Sendable {
                 }
             }()
 
+            let sourceData = ProvisioningTaskInputsSourceData(configurationName: configurationName, sourceData: targetSourceData, provisioningProfileSupport: provisioningProfileSupport, provisioningProfileSpecifier: provisioningProfileSpecifier, provisioningProfileUUID: provisioningProfileUUID, bundleIdentifier: bundleIdentifier, productTypeEntitlements: productTypeEntitlements, productTypeIdentifier: productTypeIdentifier, projectEntitlementsFile: entitlementsFilePath?.str, projectEntitlements: entitlements, signingCertificateIdentifier: signingCertificateIdentifier, signingRequiresTeam: signingRequiresTeam, teamID: teamID, sdkRoot: sdkCanonicalName, sdkVariant: sdkVariant, supportsEntitlements: supportsEntitlements, wantsBaseEntitlementInjection: wantsBaseEntitlementInjection, entitlementsDestination: entitlementsDestination.rawValue, localSigningStyle: localSigningStyle, enableCloudSigning: enableCloudSigning)
+
+            if let replayDirectory = ProvisioningAnswerStore.replayDirectory {
+                guard let response = ProvisioningAnswerStore.lookup(replayDirectory, targetGUID: configuredTarget.target.guid, sourceData: sourceData) else {
+                    delegate.emit(.default, .init(behavior: .error, location: .unknown, data: .init("SWIFT_BUILD_PROVISIONING_REPLAY outcome=miss target=\(configuredTarget.target.name)")))
+                    return ProvisioningTaskInputs()
+                }
+                return Self.provisioningInputs(from: response, settings: settings, bundleIdentifier: bundleIdentifier)
+            }
+
             // Create and remember a request record for this data.
             let settingsHandle = session.registerSettings(settings)
             let configuredTargetHandle = UUID().description
 
             // Create a message and send to the client.
-            let sourceData = ProvisioningTaskInputsSourceData(configurationName: configurationName, sourceData: targetSourceData, provisioningProfileSupport: provisioningProfileSupport, provisioningProfileSpecifier: provisioningProfileSpecifier, provisioningProfileUUID: provisioningProfileUUID, bundleIdentifier: bundleIdentifier, productTypeEntitlements: productTypeEntitlements, productTypeIdentifier: productTypeIdentifier, projectEntitlementsFile: entitlementsFilePath?.str, projectEntitlements: entitlements, signingCertificateIdentifier: signingCertificateIdentifier, signingRequiresTeam: signingRequiresTeam, teamID: teamID, sdkRoot: sdkCanonicalName, sdkVariant: sdkVariant, supportsEntitlements: supportsEntitlements, wantsBaseEntitlementInjection: wantsBaseEntitlementInjection, entitlementsDestination: entitlementsDestination.rawValue, localSigningStyle: localSigningStyle, enableCloudSigning: enableCloudSigning)
-
             let message = GetProvisioningTaskInputsRequest(sessionHandle: session.UID, planningOperationHandle: uuid.description, targetGUID: configuredTarget.target.guid, configuredTargetHandle: configuredTargetHandle, sourceData: sourceData)
 
             // Create the outstanding request entry.
             return await withCheckedContinuation { continuation in
                 workQueue.async {
-                    self.provisioningTaskInputRequests[configuredTargetHandle] = ProvisioningTaskInputRequest(configuredTarget: configuredTarget, settingsHandle: settingsHandle, bundleIdentifier: bundleIdentifier, completion: { inputs in
+                    self.provisioningTaskInputRequests[configuredTargetHandle] = ProvisioningTaskInputRequest(configuredTarget: configuredTarget, settingsHandle: settingsHandle, bundleIdentifier: bundleIdentifier, targetGUID: configuredTarget.target.guid, sourceData: sourceData, completion: { inputs in
                         continuation.resume(returning: inputs)
                     })
 
@@ -304,6 +321,29 @@ package final class PlanningOperation: Sendable {
             // Other target classes get an empty provisioning object.
             return ProvisioningTaskInputs()
         }
+    }
+
+    /// Evaluate settings in the entitlements plists of a provisioning answer.
+    private static func provisioningInputs(from response: ProvisioningTaskInputsResponse, settings: Settings, bundleIdentifier: String) -> ProvisioningTaskInputs {
+        // Now evaluate settings in the entitlements plists we got back from the client.  This includes some settings we evaluated before sending the request because the provisioning inputs generation may add content referring to those settings beyond what we passed to it.
+        let parsedBundleIdentifier = settings.userNamespace.parseLiteralString(bundleIdentifier)
+        let parsedAppIdentifierPrefix = settings.userNamespace.parseLiteralString(response.appIdentifierPrefix ?? "")
+        let parsedTeamIdentifierPrefix = settings.userNamespace.parseLiteralString(response.teamIdentifierPrefix ?? "")
+        let lookup: ((MacroDeclaration) -> MacroExpression?) = { macro in
+            switch macro {
+            case BuiltinMacros.CFBundleIdentifier:
+                return parsedBundleIdentifier
+            case BuiltinMacros.AppIdentifierPrefix:
+                return parsedAppIdentifierPrefix
+            case BuiltinMacros.TeamIdentifierPrefix:
+                return parsedTeamIdentifierPrefix
+            default:
+                return nil
+            }
+        }
+        let signedEntitlements = (response.signedEntitlements ?? .plDict([:])).byEvaluatingMacros(withScope: settings.globalScope, andDictionaryKeys: true, lookup: lookup)
+        let simulatedEntitlements = (response.simulatedEntitlements ?? .plDict([:])).byEvaluatingMacros(withScope: settings.globalScope, andDictionaryKeys: true, lookup: lookup)
+        return ProvisioningTaskInputs(identityHash: response.identityHash, identitySerialNumber: response.identitySerialNumber, identityName: response.identityName, profileName: response.profileName, profileUUID: response.profileUUID, profilePath: (response.profilePath != nil ? Path(response.profilePath!) : nil), designatedRequirements: response.designatedRequirements, signedEntitlements: signedEntitlements, simulatedEntitlements: simulatedEntitlements, appIdentifierPrefix: response.appIdentifierPrefix, teamIdentifierPrefix: response.teamIdentifierPrefix, isEnterpriseTeam: response.isEnterpriseTeam, useSigningTool: response.useSigningTool, signingToolKeyPath: response.signingToolKeyPath, signingToolKeyID: response.signingToolKeyID, signingToolKeyIssuerID: response.signingToolKeyIssuerID, keychainPath: response.keychainPath, errors: response.errors, warnings: response.warnings)
     }
 
     /// Handle a response from the client providing provisioning task inputs for a configured target.
@@ -333,26 +373,10 @@ package final class PlanningOperation: Sendable {
             catch {
                 fatalError("no settings in session for handle '\(subrequest.settingsHandle)': Unknown error")
             }
-            // Now evaluate settings in the entitlements plists we got back from the client.  This includes some settings we evaluated before sending the request because the provisioning inputs generation may add content referring to those settings beyond what we passed to it.
-            let parsedBundleIdentifier = settings.userNamespace.parseLiteralString(subrequest.bundleIdentifier)
-            let parsedAppIdentifierPrefix = settings.userNamespace.parseLiteralString(response.appIdentifierPrefix ?? "")
-            let parsedTeamIdentifierPrefix = settings.userNamespace.parseLiteralString(response.teamIdentifierPrefix ?? "")
-            let lookup: ((MacroDeclaration) -> MacroExpression?) = { macro in
-                switch macro {
-                case BuiltinMacros.CFBundleIdentifier:
-                    return parsedBundleIdentifier
-                case BuiltinMacros.AppIdentifierPrefix:
-                    return parsedAppIdentifierPrefix
-                case BuiltinMacros.TeamIdentifierPrefix:
-                    return parsedTeamIdentifierPrefix
-                default:
-                    return nil
-                }
+            let inputs = Self.provisioningInputs(from: response, settings: settings, bundleIdentifier: subrequest.bundleIdentifier)
+            if let captureDirectory = ProvisioningAnswerStore.captureDirectory {
+                ProvisioningAnswerStore.record(captureDirectory, targetGUID: subrequest.targetGUID, sourceData: subrequest.sourceData, response: response)
             }
-            let signedEntitlements = (response.signedEntitlements ?? .plDict([:])).byEvaluatingMacros(withScope: settings.globalScope, andDictionaryKeys: true, lookup: lookup)
-            let simulatedEntitlements = (response.simulatedEntitlements ?? .plDict([:])).byEvaluatingMacros(withScope: settings.globalScope, andDictionaryKeys: true, lookup: lookup)
-            // Finally create the inputs and pass them to the completion block.
-            let inputs = ProvisioningTaskInputs(identityHash: response.identityHash, identitySerialNumber: response.identitySerialNumber, identityName: response.identityName, profileName: response.profileName, profileUUID: response.profileUUID, profilePath: (response.profilePath != nil ? Path(response.profilePath!) : nil), designatedRequirements: response.designatedRequirements, signedEntitlements: signedEntitlements, simulatedEntitlements: simulatedEntitlements, appIdentifierPrefix: response.appIdentifierPrefix, teamIdentifierPrefix: response.teamIdentifierPrefix, isEnterpriseTeam: response.isEnterpriseTeam, useSigningTool: response.useSigningTool, signingToolKeyPath: response.signingToolKeyPath, signingToolKeyID: response.signingToolKeyID, signingToolKeyIssuerID: response.signingToolKeyIssuerID, keychainPath: response.keychainPath, errors: response.errors, warnings: response.warnings)
             subrequest.completion(inputs)
 
             // Clean up.
@@ -437,5 +461,42 @@ fileprivate final class ActivityReportingForwardingDelegate: TargetDependencyRes
         } else {
             delegate.emit(context, diagnostic)
         }
+    }
+}
+
+/// Provisioning answers recorded from a stock client and replayed by a warm session (C979).
+///
+/// A warm session has no Xcode to ask: the team, identity and entitlements Xcode derives come from
+/// private provisioning logic. `SWIFT_BUILD_PROVISIONING_CAPTURE=<dir>` records each target's answer
+/// next to the source data it answered; `SWIFT_BUILD_PROVISIONING_REPLAY=<dir>` answers only when the
+/// new source data is exactly equal, and fails the target otherwise.
+enum ProvisioningAnswerStore {
+    static let captureDirectory = ServiceEnvironment.snapshot["SWIFT_BUILD_PROVISIONING_CAPTURE"].flatMap { $0.isEmpty ? nil : Path($0) }
+    static let replayDirectory = ServiceEnvironment.snapshot["SWIFT_BUILD_PROVISIONING_REPLAY"].flatMap { $0.isEmpty ? nil : Path($0) }
+
+    private static func path(_ directory: Path, targetGUID: String) -> Path {
+        directory.join(targetGUID.utf8.map { ($0 < 16 ? "0" : "") + String($0, radix: 16) }.joined() + ".provisioning")
+    }
+
+    static func record(_ directory: Path, targetGUID: String, sourceData: ProvisioningTaskInputsSourceData, response: ProvisioningTaskInputsResponse) {
+        let serializer = MsgPackSerializer()
+        serializer.serializeAggregate(3) {
+            serializer.serialize(targetGUID)
+            serializer.serialize(sourceData)
+            serializer.serialize(response)
+        }
+        try? localFS.createDirectory(directory, recursive: true)
+        try? localFS.write(path(directory, targetGUID: targetGUID), contents: serializer.byteString, atomically: true)
+    }
+
+    static func lookup(_ directory: Path, targetGUID: String, sourceData: ProvisioningTaskInputsSourceData) -> ProvisioningTaskInputsResponse? {
+        guard let data = try? localFS.read(path(directory, targetGUID: targetGUID)) else { return nil }
+        let deserializer = MsgPackDeserializer(data)
+        guard (try? deserializer.beginAggregate(3)) != nil,
+              let recordedGUID: String = try? deserializer.deserialize(), recordedGUID == targetGUID,
+              let recordedSource: ProvisioningTaskInputsSourceData = try? deserializer.deserialize(), recordedSource == sourceData,
+              let response: ProvisioningTaskInputsResponse = try? deserializer.deserialize()
+        else { return nil }
+        return response
     }
 }
