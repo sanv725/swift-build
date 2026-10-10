@@ -417,7 +417,12 @@ private struct GlobalExplicitDependencyTracker {
                 // Approved by the owner on 2026-10-07.
                 guard Set(dependencies).isSubset(of: Set(plannedExplicitDependencyJobs[index].dependencies)) else {
                     let previous = Set(plannedExplicitDependencyJobs[index].dependencies), current = Set(dependencies)
-                    throw StubError.error("Explicit module action has incompatible dependencies. module \(job.moduleName); first \(previous.count) new \(current.count); only-first \(previous.subtracting(current).count); only-new \(current.subtracting(previous).count); first-was-in-earlier-batch \(index < initialCount)")
+                    let extra = current.subtracting(previous).sorted().map { key -> String in
+                        guard case .explicitDependencyJob(let producer) = key, plannedExplicitDependencyJobs.indices.contains(producer) else { return "\(key)" }
+                        let inputs = job.inputs.filter { producerMap[$0] == key }.map(\.str)
+                        return "\(plannedExplicitDependencyJobs[producer].driverJob.moduleName) (producer index \(producer) earlier-batch \(producer < initialCount); inputs \(inputs))"
+                    }
+                    throw StubError.error("Explicit module action has incompatible dependencies. module \(job.moduleName); first \(previous.count) new \(current.count); only-first \(previous.subtracting(current).count); only-new \(current.subtracting(previous).count); first-was-in-earlier-batch \(index < initialCount); extra \(extra.joined(separator: ", "))")
                 }
             } else {
                 plannedExplicitDependencyJobs[index] = Planned(key: .explicitDependencyJob(index), driverJob: job, dependencies: dependencies, workingDirectory: workingDirectory)
