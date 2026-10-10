@@ -609,6 +609,10 @@ private func serve(socketPath: String, idleSeconds: Int, active: PersistentSessi
 @main
 private struct Main {
     static func main() async {
+        // A spawner that ignores these (ignored dispositions survive exec) must not make a resident
+        // session unstoppable; its service exits when this process does.
+        signal(SIGTERM, SIG_DFL)
+        signal(SIGINT, SIG_DFL)
         var client: PersistentSession?
         do {
             let options = try Options(arguments: CommandLine.arguments)
