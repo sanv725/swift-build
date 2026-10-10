@@ -281,11 +281,12 @@ public struct SwiftDriverPlanCacheSnapshot: Serializable {
     public func invalidatingCompilationCacheKeys(
         forSources sources: [Path], canonicalize: ((String) -> String?)? = nil,
         isRegularFile: ((String) -> Bool)? = nil,
-        readFileList: ((String) -> [String]?)? = nil
-    ) -> (snapshot: Self, invalidatedJobCount: Int, ownership: [Int], droppedPrimaries: Int, promotedSkipped: Int) {
+        readFileList: ((String) -> [String]?)? = nil,
+        retained: ((String, String) -> Bool)? = nil
+    ) -> (snapshot: Self, invalidatedJobCount: Int, ownership: [Int], droppedPrimaries: Int, retainedPrimaries: Int, promotedSkipped: Int) {
         let result = plannedBuild.invalidatingCompilationCacheKeys(forSources: sources,
             canonicalize: canonicalize, isRegularFile: isRegularFile, readFileList: readFileList,
-            skipped: skippedCompileJobs)
+            skipped: skippedCompileJobs, retained: retained)
         return (
             Self(
                 plannedBuild: result.snapshot,
@@ -295,7 +296,8 @@ public struct SwiftDriverPlanCacheSnapshot: Serializable {
                 transitiveDependencyModuleNames: transitiveDependencyModuleNames,
                 skippedCompileJobs: skippedCompileJobs
             ),
-            result.invalidatedJobCount, result.ownership, result.droppedPrimaries, result.promotedSkipped
+            result.invalidatedJobCount, result.ownership, result.droppedPrimaries, result.retainedPrimaries,
+            result.promotedSkipped
         )
     }
 

@@ -350,13 +350,14 @@ extension LibSwiftDriver {
             #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT
             fileprivate func invalidatingCompilationCacheKeys(
                 narrowingTo selected: Set<String>? = nil, canonicalize: ((String) -> String?)? = nil,
-                isRegularFile: ((String) -> Bool)? = nil
-            ) -> (job: Self, droppedPrimaries: Int) {
-                var narrowed: (removed: Set<Int>, dropped: [String])?
+                isRegularFile: ((String) -> Bool)? = nil,
+                retained: ((String, String) -> Bool)? = nil
+            ) -> (job: Self, droppedPrimaries: Int, retainedPrimaries: Int) {
+                var narrowed: (removed: Set<Int>, dropped: [String], retained: Int)?
                 if let selected, let canonicalize, let isRegularFile {
                     narrowed = SwiftDriverPrimaryInputOwnership.narrowedBatch(
                         arguments: driverJob.commandLine.map { $0.asString }, keeping: selected,
-                        canonicalize: canonicalize, isRegularFile: isRegularFile)
+                        canonicalize: canonicalize, isRegularFile: isRegularFile, retained: retained)
                 }
                 return (Self(
                     key: key,
@@ -364,7 +365,7 @@ extension LibSwiftDriver {
                         removing: narrowed?.removed ?? [], droppedPrimaries: narrowed?.dropped ?? []),
                     dependencies: dependencies,
                     workingDirectory: workingDirectory
-                ), narrowed?.dropped.count ?? 0)
+                ), narrowed?.dropped.count ?? 0, narrowed?.retained ?? 0)
             }
             #endif
 
@@ -507,15 +508,18 @@ extension LibSwiftDriver {
             }
 
             /// Multi-file replay v1: invalidates every compile job that owns any of `sources`, and
-            /// reports how many jobs own each source (callers require at most one).
+            /// reports how many jobs own each source (callers require at most one). `retained` is
+            /// passed to batch narrowing (see `SwiftDriverPrimaryInputOwnership.narrowedBatch`).
             public func invalidatingCompilationCacheKeys(
                 forSources sources: [Path], canonicalize: ((String) -> String?)? = nil,
                 isRegularFile: ((String) -> Bool)? = nil,
                 readFileList: ((String) -> [String]?)? = nil,
-                skipped: SwiftDriverSkippedCompileJobs = .empty
-            ) -> (snapshot: Self, invalidatedJobCount: Int, ownership: [Int], droppedPrimaries: Int, promotedSkipped: Int) {
+                skipped: SwiftDriverSkippedCompileJobs = .empty,
+                retained: ((String, String) -> Bool)? = nil
+            ) -> (snapshot: Self, invalidatedJobCount: Int, ownership: [Int], droppedPrimaries: Int, retainedPrimaries: Int, promotedSkipped: Int) {
                 var invalidatedJobCount = 0
                 var droppedPrimaries = 0
+                var retainedPrimaries = 0
                 var ownership = Array(repeating: 0, count: sources.count)
                 let selected = Self.selectedPaths(sources, canonicalize: canonicalize, isRegularFile: isRegularFile)
                 let jobs = plannedTargetJobs.map { job in
@@ -543,8 +547,9 @@ extension LibSwiftDriver {
                     invalidatedJobCount += 1
                     let invalidated = job.invalidatingCompilationCacheKeys(
                         narrowingTo: canonicalize != nil && isRegularFile != nil ? selected : nil,
-                        canonicalize: canonicalize, isRegularFile: isRegularFile)
+                        canonicalize: canonicalize, isRegularFile: isRegularFile, retained: retained)
                     droppedPrimaries += invalidated.droppedPrimaries
+                    retainedPrimaries += invalidated.retainedPrimaries
                     return invalidated.job
                 }
                 let plannedOwnership = ownership
@@ -561,13 +566,13 @@ extension LibSwiftDriver {
                     workingDirectory: workingDirectory
                 )
                 guard !promotion.isEmpty else {
-                    return (snapshot, invalidatedJobCount, ownership, droppedPrimaries, 0)
+                    return (snapshot, invalidatedJobCount, ownership, droppedPrimaries, retainedPrimaries, 0)
                 }
                 guard let promoted = snapshot.inserting(compileJobs: promotion) else {
                     // An output already has a producer: leave the sources unowned, so replay refuses.
-                    return (snapshot, invalidatedJobCount, plannedOwnership, droppedPrimaries, 0)
+                    return (snapshot, invalidatedJobCount, plannedOwnership, droppedPrimaries, retainedPrimaries, 0)
                 }
-                return (promoted, invalidatedJobCount + promotion.count, ownership, droppedPrimaries, promotion.count)
+                return (promoted, invalidatedJobCount + promotion.count, ownership, droppedPrimaries, retainedPrimaries, promotion.count)
             }
 
             /// For each source no planned job owns, the uncached skipped compile job that owns it

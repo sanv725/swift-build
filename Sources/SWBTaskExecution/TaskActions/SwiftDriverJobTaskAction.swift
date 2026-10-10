@@ -2237,7 +2237,18 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                         try plannedBuild?.jobFinished(job: driverJob, arguments: options.commandLine, pid: 0, environment: environment, exitStatus: .exit(0), output: "")
                         return .succeeded
                     }
+                    // C990: every primary's last compile in this generation still stands (narrowing kept
+                    // them all because none was edited since). Stock incremental skips these files too.
+                    if let pairs = SwiftCachedReplaySkip.primaryObjects(commandLine: compilerCommandLine),
+                       pairs.allSatisfy({ skip.primaryRetained(planKey: keys[1], primary: $0.primary, object: $0.object) }),
+                       plannedOutputs.allSatisfy({ SwiftCachedReplaySkip.identity($0) != nil }) {
+                        outputDelegate.note("SWIFT_RETAINED_COMPILE outcome=reused_primaries primaries=\(pairs.count) outputs=\(plannedOutputs.count)")
+                        try plannedBuild?.jobStarted(job: driverJob, arguments: options.commandLine, pid: 0)
+                        try plannedBuild?.jobFinished(job: driverJob, arguments: options.commandLine, pid: 0, environment: environment, exitStatus: .exit(0), output: "")
+                        return .succeeded
+                    }
                     skip.invalidate(cacheKeys: keys, outputs: plannedOutputs)
+                    skip.invalidatePrimaries(keys: keys, commandLine: compilerCommandLine)
                     retainedCompile = (skip, keys, controls)
                 }
             }
@@ -2262,6 +2273,7 @@ public final class SwiftDriverJobTaskAction: TaskAction, BuildValueValidatingTas
                     retainedCompile.skip.record(cacheKeys: retainedCompile.keys, outputs: plannedOutputs,
                                                 streams: .init(standardOutput: text, standardError: ""))
                 }
+                retainedCompile.skip.recordPrimaries(keys: retainedCompile.keys, commandLine: compilerCommandLine)
             }
             #endif
 

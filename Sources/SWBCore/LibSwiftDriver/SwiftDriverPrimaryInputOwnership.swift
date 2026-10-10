@@ -85,9 +85,18 @@ public enum SwiftDriverPrimaryInputOwnership {
     /// are not. Every dropped primary's object output must be an existing regular file.
     /// Without `-filelist` a dropped primary stays in place as an ordinary input; with one
     /// (whose entries include the primaries) its `-primary-file` pair is removed.
+    ///
+    /// `retained` (SwiftBuildOptimizer C990) receives a selected primary and its object path (as
+    /// written) and returns true when that primary's last compile in this plan generation still
+    /// stands: same content, same object file. Such a primary is dropped like an unselected one,
+    /// but only while another selected primary is kept; when every selected primary is retained,
+    /// all of them are kept (the compile task may then reuse them as a whole). `retained` in the
+    /// result counts the dropped retained primaries.
     public static func narrowedBatch(arguments: [String], keeping selected: Set<String>,
                                      canonicalize: (String) -> String?,
-                                     isRegularFile: (String) -> Bool) -> (removed: Set<Int>, dropped: [String])? {
+                                     isRegularFile: (String) -> Bool,
+                                     retained: ((_ primary: String, _ object: String) -> Bool)? = nil)
+        -> (removed: Set<Int>, dropped: [String], retained: Int)? {
         guard !arguments.contains(where: {
                   $0.hasPrefix("@") || $0.hasPrefix("-primary-filelist") || $0.hasPrefix("-output-filelist") ||
                   $0.hasPrefix("-index-unit-output-path-filelist") || $0.hasPrefix("-emit-module") ||
@@ -103,18 +112,36 @@ public enum SwiftDriverPrimaryInputOwnership {
         var kept = 0
         var removed = Set<Int>()
         var dropped: [String] = []
+        var retainedPositions: [Int] = []
         let fileList = arguments.contains("-filelist")
-        for (position, index) in primaries.enumerated() {
-            guard let path = canonicalize(arguments[index + 1]) else { return nil }
-            if selected.contains(path) { kept += 1; continue }
-            guard isRegularFile(arguments[objects[position] + 1]) else { return nil }
+        func drop(_ position: Int) {
+            let index = primaries[position]
             removed.insert(index)
             if fileList { removed.insert(index + 1) }
             removed.formUnion([objects[position], objects[position] + 1])
             if !units.isEmpty { removed.formUnion([units[position], units[position] + 1]) }
             dropped.append(arguments[index + 1])
         }
-        return kept > 0 && !dropped.isEmpty ? (removed, dropped) : nil
+        for (position, index) in primaries.enumerated() {
+            guard let path = canonicalize(arguments[index + 1]) else { return nil }
+            if selected.contains(path) {
+                if let retained, retained(arguments[index + 1], arguments[objects[position] + 1]) {
+                    retainedPositions.append(position)
+                } else {
+                    kept += 1
+                }
+                continue
+            }
+            guard isRegularFile(arguments[objects[position] + 1]) else { return nil }
+            drop(position)
+        }
+        if kept > 0 {
+            retainedPositions.forEach(drop)
+        } else {
+            kept = retainedPositions.count
+            retainedPositions = []
+        }
+        return kept > 0 && !dropped.isEmpty ? (removed, dropped, retainedPositions.count) : nil
     }
 
     /// Parses a driver response file written with `spm_shellEscaped` (one argument per line;

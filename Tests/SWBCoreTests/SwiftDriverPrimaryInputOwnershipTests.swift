@@ -3,6 +3,7 @@
 // with Runtime Library Exception. See https://swift.org/LICENSE.txt.
 //===----------------------------------------------------------------------===//
 
+import Foundation
 import Testing
 import SWBCore
 
@@ -285,5 +286,38 @@ struct SwiftDriverPrimaryInputOwnershipTests {
         }
         #expect(narrow(["swift-frontend", "-primary-file", source, "-primary-file", third,
                         "-o", "O/Changed.o", "-o", "/tmp/O/Third.o"]) == nil)
+    }
+
+    @Test
+    func narrowingDropsRetainedPrimariesWhileAnotherIsKept() throws {
+        let edited = "/tmp/App/Edited.swift", stale = "/tmp/App/Stale.swift", other = "/tmp/App/Other.swift"
+        let arguments = ["swift-frontend", "-frontend", "-c", "-primary-file", stale, "-primary-file", edited,
+                         "-primary-file", other, "-o", "/tmp/O/Stale.o", "-o", "/tmp/O/Edited.o", "-o", "/tmp/O/Other.o"]
+        func narrow(retained: Set<String>) -> (arguments: [String], retained: Int)? {
+            SwiftDriverPrimaryInputOwnership.narrowedBatch(
+                arguments: arguments, keeping: [edited, stale], canonicalize: { $0 }, isRegularFile: { _ in true },
+                retained: { primary, object in
+                    #expect(object == primary.replacingOccurrences(of: "/tmp/App/", with: "/tmp/O/")
+                                              .replacingOccurrences(of: ".swift", with: ".o"))
+                    return retained.contains(primary)
+                }
+            ).map { result in (arguments.indices.filter { !result.removed.contains($0) }.map { arguments[$0] }, result.retained) }
+        }
+        // The stale primary's last compile stands: only the edited one compiles.
+        let narrowed = try #require(narrow(retained: [stale]))
+        #expect(narrowed.arguments == ["swift-frontend", "-frontend", "-c", stale, "-primary-file", edited, other,
+                                       "-o", "/tmp/O/Edited.o"])
+        #expect(narrowed.retained == 1)
+        // Nothing retained: as before, every selected primary is kept.
+        #expect(try #require(narrow(retained: [])).arguments == ["swift-frontend", "-frontend", "-c", "-primary-file", stale,
+                                                                  "-primary-file", edited, other,
+                                                                  "-o", "/tmp/O/Stale.o", "-o", "/tmp/O/Edited.o"])
+        // Every selected primary retained: keep them all, so the job stays and may be reused whole.
+        let all = try #require(narrow(retained: [stale, edited]))
+        #expect(all.arguments == ["swift-frontend", "-frontend", "-c", "-primary-file", stale, "-primary-file", edited,
+                                  other, "-o", "/tmp/O/Stale.o", "-o", "/tmp/O/Edited.o"])
+        #expect(all.retained == 0)
+        // The predicate is only asked about selected primaries.
+        #expect(try #require(narrow(retained: [other])).retained == 0)
     }
 }

@@ -149,6 +149,93 @@ struct SwiftCachedReplaySkip: Sendable {
     func invalidate(cacheKeys: [String], outputs: [Path]) {
         _ = unlink(recordURL(cacheKeys: cacheKeys, outputs: outputs).path)
     }
+
+    // MARK: Per-primary records (SwiftBuildOptimizer C990)
+    //
+    // The records above are per job, keyed by every primary's content, so a narrowed batch that keeps
+    // an edited primary E and a stale edit-set primary S recompiles both. After each clean compile of an
+    // invalidated job this also records, per primary, the plan key, the primary's content SHA-256 and its
+    // `-o` object's identity. Narrowing then drops S when its record still matches (same validity argument
+    // as batch narrowing: within one generation other sources change only inside bodies), and a job whose
+    // every primary still matches keeps its outputs.
+
+    static let primarySchema = "swift-build-retained-primary-v1"
+
+    struct PrimaryRecord: Codable {
+        let schema: String
+        let planKey: String
+        let primary: String
+        let contentSHA256: String
+        let object: OutputIdentity
+    }
+
+    /// Each `-primary-file` paired with its `-o` (same order), or nil when the counts differ.
+    static func primaryObjects(commandLine: [String]) -> [(primary: String, object: String)]? {
+        let primaries = commandLine.indices.filter { commandLine[$0] == "-primary-file" && $0 + 1 < commandLine.count }
+        let objects = commandLine.indices.filter { commandLine[$0] == "-o" && $0 + 1 < commandLine.count }
+        guard !primaries.isEmpty, primaries.count == objects.count else { return nil }
+        return zip(primaries, objects).map { (commandLine[$0 + 1], commandLine[$1 + 1]) }
+    }
+
+    func primaryRecordURL(planKey: String, primary: String) -> URL {
+        let context = SHA256Context()
+        for field in [Self.primarySchema, planKey, primary] {
+            let bytes = Array(field.utf8)
+            context.add(number: UInt64(bytes.count))
+            context.add(bytes: bytes)
+        }
+        return URL(fileURLWithPath: root.join("primaries").join(context.signature.asString + ".json").str)
+    }
+
+    static func contentDigest(_ path: String) -> String? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
+        let content = SHA256Context()
+        content.add(bytes: data)
+        return content.signature.asString
+    }
+
+    /// True when `primary`'s last clean compile under `planKey` saw its current content and wrote the
+    /// object that is still at `object`.
+    func primaryRetained(planKey: String, primary: String, object: String) -> Bool {
+        guard primary.hasPrefix("/"), object.hasPrefix("/"),
+              let data = try? Data(contentsOf: primaryRecordURL(planKey: planKey, primary: primary)),
+              data.count <= 64 * 1024,
+              let record = try? JSONDecoder().decode(PrimaryRecord.self, from: data),
+              record.schema == Self.primarySchema, record.planKey == planKey, record.primary == primary,
+              record.object.path == object, Self.identity(Path(object)) == record.object,
+              Self.contentDigest(primary) == record.contentSHA256 else { return false }
+        return true
+    }
+
+    /// Forgets the primaries' records before a compile so an interrupted compile never leaves a stale match.
+    func invalidatePrimaries(keys: [String], commandLine: [String]) {
+        guard keys.count > 3, let pairs = Self.primaryObjects(commandLine: commandLine) else { return }
+        for pair in pairs { _ = unlink(primaryRecordURL(planKey: keys[1], primary: pair.primary).path) }
+    }
+
+    /// Records each primary of a clean compile. `keys` are the `uncachedCompileKeys` that held before and
+    /// after the compile (plan key, command digest, then each primary with its content digest).
+    func recordPrimaries(keys: [String], commandLine: [String]) {
+        guard keys.count > 3, keys[0] == Self.uncachedSchema, (keys.count - 3) % 2 == 0,
+              let pairs = Self.primaryObjects(commandLine: commandLine), pairs.count == (keys.count - 3) / 2 else { return }
+        for (offset, pair) in pairs.enumerated() {
+            let index = 3 + 2 * offset
+            guard keys[index] == pair.primary, pair.object.hasPrefix("/"),
+                  let object = Self.identity(Path(pair.object)) else { continue }
+            let record = PrimaryRecord(schema: Self.primarySchema, planKey: keys[1], primary: pair.primary,
+                                       contentSHA256: keys[index + 1], object: object)
+            guard let data = try? JSONEncoder().encode(record) else { continue }
+            let url = primaryRecordURL(planKey: keys[1], primary: pair.primary)
+            let staging = url.deletingLastPathComponent().appendingPathComponent(".\(UUID().uuidString).tmp")
+            do {
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try data.write(to: staging)
+                guard rename(staging.path, url.path) == 0 else { throw POSIXError(.EIO) }
+            } catch {
+                try? FileManager.default.removeItem(at: staging)
+            }
+        }
+    }
 }
 #endif
 

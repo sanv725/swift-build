@@ -704,6 +704,7 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
             var directPlanBytes = 0
             var planCacheInvalidatedJobCount = 0
             var planCacheNarrowedPrimaryCount = 0
+            var planCacheRetainedPrimaryCount = 0
             // C977: skipped compile jobs recorded with the plan, and those promoted on replay.
             var planCacheSkippedCompileJobCount = 0
             var planCachePromotedSkippedCount = 0
@@ -820,11 +821,24 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                         let sources = planCacheConfiguration.invalidateSources
                         if let source = sources.first {
                             let queries = PlanFilesystemQueries(fs: executionDelegate.fs)
+                            // C990: narrowing also drops edit-set primaries whose last compile in this
+                            // generation still stands (the compile tasks' per-primary records).
+                            var retained: ((String, String) -> Bool)?
+                            #if SWIFT_BUILD_ACCELERATOR_DRIVER_PLAN_CACHE_EXPERIMENT && canImport(Darwin)
+                            let retainedControls = ServiceEnvironment.snapshot.merging(environment, uniquingKeysWith: { _, taskValue in taskValue })
+                            if allowUnaffectedNativePlanning, retainedControls["SWIFT_BUILD_RETAINED_COMPILE"] != "0",
+                               retainedControls[SwiftDriverPlanCacheConfiguration.modeVariable] == "replay",
+                               let planKey = retainedControls[SwiftDriverPlanCacheConfiguration.keyVariable], !planKey.isEmpty,
+                               let skip = SwiftCachedReplaySkip(environment: retainedControls) {
+                                retained = { skip.primaryRetained(planKey: planKey, primary: $0, object: $1) }
+                            }
+                            #endif
                             let invalidation = snapshot.invalidatingCompilationCacheKeys(
                                 forSources: sources,
                                 canonicalize: allowUnaffectedNativePlanning ? queries.canonical : nil,
                                 isRegularFile: allowUnaffectedNativePlanning ? queries.isRegularFile : nil,
-                                readFileList: allowUnaffectedNativePlanning ? queries.fileList : nil
+                                readFileList: allowUnaffectedNativePlanning ? queries.fileList : nil,
+                                retained: retained
                             )
                             if invalidation.invalidatedJobCount == 0, allowUnaffectedNativePlanning,
                                !planCacheConfiguration.mode.canWrite,
@@ -875,6 +889,7 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
                                 snapshot = invalidation.snapshot
                                 planCacheInvalidatedJobCount = invalidation.invalidatedJobCount
                                 planCacheNarrowedPrimaryCount = invalidation.droppedPrimaries
+                                planCacheRetainedPrimaryCount = invalidation.retainedPrimaries
                                 planCachePromotedSkippedCount = invalidation.promotedSkipped
                             }
                         }
@@ -1273,7 +1288,7 @@ final public class SwiftDriverTaskAction: TaskAction, BuildValueValidatingTaskAc
             if planCacheConfiguration != nil {
                 let unaffectedProof = planCacheOutcome == "unaffected_native_planned" ? " source_owned_jobs=0 absence_proof=validated-v1" : ""
                 outputDelegate.note(
-                    "SWIFT_DRIVER_PLAN_CACHE outcome=\(planCacheOutcome) key=\(planCacheConfiguration?.key ?? "none") base_key=\(planCacheConfiguration?.baseKey ?? "none") key_scope=\(planCacheConfiguration?.keyScope.rawValue ?? "none") cas_mode=\(planCacheConfiguration?.useLiveCAS == true ? "live" : "snapshot") invalidated_jobs=\(planCacheInvalidatedJobCount) narrowed_primaries=\(planCacheNarrowedPrimaryCount) skipped_compile_jobs=\(planCacheSkippedCompileJobCount) promoted_skipped=\(planCachePromotedSkippedCount) bytes=\(planCacheBytes) direct_plan_bytes=\(directPlanBytes) duration_ns=\(planCacheTimer.elapsedTime().nanoseconds) read_ns=\(planCacheReadDurationNS) apple_plan_ns=\(planCachePlanDurationNS) write_ns=\(planCacheWriteDurationNS)\(unaffectedProof)\(planReplayPhaseNS.isEmpty ? "" : " read_phases=" + planReplayPhaseNS.map { "\($0.0):\($0.1)" }.joined(separator: ","))"
+                    "SWIFT_DRIVER_PLAN_CACHE outcome=\(planCacheOutcome) key=\(planCacheConfiguration?.key ?? "none") base_key=\(planCacheConfiguration?.baseKey ?? "none") key_scope=\(planCacheConfiguration?.keyScope.rawValue ?? "none") cas_mode=\(planCacheConfiguration?.useLiveCAS == true ? "live" : "snapshot") invalidated_jobs=\(planCacheInvalidatedJobCount) narrowed_primaries=\(planCacheNarrowedPrimaryCount) retained_primaries=\(planCacheRetainedPrimaryCount) skipped_compile_jobs=\(planCacheSkippedCompileJobCount) promoted_skipped=\(planCachePromotedSkippedCount) bytes=\(planCacheBytes) direct_plan_bytes=\(directPlanBytes) duration_ns=\(planCacheTimer.elapsedTime().nanoseconds) read_ns=\(planCacheReadDurationNS) apple_plan_ns=\(planCachePlanDurationNS) write_ns=\(planCacheWriteDurationNS)\(unaffectedProof)\(planReplayPhaseNS.isEmpty ? "" : " read_phases=" + planReplayPhaseNS.map { "\($0.0):\($0.1)" }.joined(separator: ","))"
                 )
                 #if SWIFT_BUILD_ACCELERATOR_JOB_CAS_EXPERIMENT
                 if planCacheConfiguration?.dependencyObservation != nil

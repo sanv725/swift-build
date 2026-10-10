@@ -65,6 +65,48 @@ fileprivate struct SwiftCachedReplaySkipTests {
         #expect(skip.reusable(cacheKeys: keys, outputs: outputs) == nil)
     }
 
+    @Test(arguments: ["kept", "edited", "object-rewritten", "object-deleted", "other-plan", "invalidated"])
+    func primaryRecordsHoldOnlyForUnchangedContentAndObject(_ variant: String) throws {
+        let (skip, _, directory) = try fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sources = ["A", "B"].map { directory.appendingPathComponent("\($0).swift") }
+        let objects = ["A", "B"].map { directory.appendingPathComponent("\($0).o") }
+        for (source, object) in zip(sources, objects) {
+            try Data("let \(source.lastPathComponent.prefix(1)) = 1".utf8).write(to: source)
+            try Data("object".utf8).write(to: object)
+        }
+        let command = ["swift-frontend", "-frontend", "-c", "-primary-file", sources[0].path, "-primary-file", sources[1].path,
+                       "-o", objects[0].path, "-o", objects[1].path]
+        let replay = ["SWIFT_BUILD_DRIVER_PLAN_CACHE_MODE": "replay", "SWIFT_BUILD_DRIVER_PLAN_CACHE_KEY": "plan-1"]
+        let keys = try #require(SwiftCachedReplaySkip.uncachedCompileKeys(commandLine: command, environment: replay))
+        #expect(!skip.primaryRetained(planKey: "plan-1", primary: sources[0].path, object: objects[0].path))
+        skip.recordPrimaries(keys: keys, commandLine: command)
+        var planKey = "plan-1"
+        switch variant {
+        case "edited":
+            try Data("let A = 2".utf8).write(to: sources[0])
+        case "object-rewritten":
+            let staging = directory.appendingPathComponent("staging")
+            try Data("object".utf8).write(to: staging)
+            _ = rename(staging.path, objects[0].path)
+        case "object-deleted":
+            try FileManager.default.removeItem(at: objects[0])
+        case "other-plan":
+            planKey = "plan-2"
+        case "invalidated":
+            skip.invalidatePrimaries(keys: keys, commandLine: command)
+        default:
+            break
+        }
+        #expect(skip.primaryRetained(planKey: planKey, primary: sources[0].path, object: objects[0].path) == (variant == "kept"))
+        // B is untouched in every variant except a plan change or invalidation.
+        #expect(skip.primaryRetained(planKey: planKey, primary: sources[1].path, object: objects[1].path)
+                == !["other-plan", "invalidated"].contains(variant))
+        // A record names its object: another object path never matches.
+        #expect(!skip.primaryRetained(planKey: "plan-1", primary: sources[1].path, object: objects[0].path))
+        #expect(SwiftCachedReplaySkip.primaryObjects(commandLine: Array(command.dropLast(2))) == nil)
+    }
+
     @Test
     func uncachedCompileKeysBindPlanCommandLineAndPrimaryContent() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("retained-\(UUID().uuidString)")
