@@ -354,6 +354,14 @@ private struct GlobalExplicitDependencyTracker {
     /// The collection of *all* explicit module dependency build jobs found so far
     fileprivate private(set) var plannedExplicitDependencyJobs: [LibSwiftDriver.PlannedBuild.PlannedSwiftDriverJob] = []
 
+    /// Edges merged into established jobs since the last drain, reported as planning notes.
+    private var mergedDependencyNotes: [String] = []
+
+    mutating func drainMergedDependencyNotes() -> [String] {
+        defer { mergedDependencyNotes = [] }
+        return mergedDependencyNotes
+    }
+
     /// Stage both tracker and caller map: a collision must not publish half a
     /// batch or corrupt the caller's Apple planning state.
     mutating func addExplicitDependencyBuildJobs(_ jobs: [SwiftDriverJob], workingDirectory: Path,
@@ -413,16 +421,26 @@ private struct GlobalExplicitDependencyTracker {
                 // subset of the dependencies of a job first planned in an earlier batch. Reframe
                 // (C959) showed this for CFNetwork, Darwin, Dispatch, Security and os_workgroup,
                 // all with only-new 0. The established superset already orders every edge this
-                // target can see. Any new dependency the established job lacks is still rejected.
-                // Approved by the owner on 2026-10-07.
-                guard Set(dependencies).isSubset(of: Set(plannedExplicitDependencyJobs[index].dependencies)) else {
-                    let previous = Set(plannedExplicitDependencyJobs[index].dependencies), current = Set(dependencies)
-                    let extra = current.subtracting(previous).sorted().map { key -> String in
+                // target can see. Approved by the owner on 2026-10-07.
+                //
+                // C987/C989: a later target can also see a producer the earlier batch did not plan
+                // (IceCubes, AVKit gaining one edge, intermittent). Stock keeps the first job's
+                // dependencies and drops the new edge. Merge it instead: dependencies are read when
+                // the job's dynamic task starts, so the edge orders a job that has not started yet,
+                // and a cycle is still rejected below.
+                let prior = Set(plannedExplicitDependencyJobs[index].dependencies)
+                let extra = Set(dependencies).subtracting(prior)
+                if !extra.isEmpty {
+                    let names = extra.sorted().map { key -> String in
                         guard case .explicitDependencyJob(let producer) = key, plannedExplicitDependencyJobs.indices.contains(producer) else { return "\(key)" }
                         let inputs = job.inputs.filter { producerMap[$0] == key }.map(\.str)
-                        return "\(plannedExplicitDependencyJobs[producer].driverJob.moduleName) (producer index \(producer) earlier-batch \(producer < initialCount); inputs \(inputs))"
+                        return "\(plannedExplicitDependencyJobs[producer].driverJob.moduleName) (earlier-batch \(producer < initialCount); inputs \(inputs))"
                     }
-                    throw StubError.error("Explicit module action has incompatible dependencies. module \(job.moduleName); first \(previous.count) new \(current.count); only-first \(previous.subtracting(current).count); only-new \(current.subtracting(previous).count); first-was-in-earlier-batch \(index < initialCount); extra \(extra.joined(separator: ", "))")
+                    mergedDependencyNotes.append("Explicit module job \(job.moduleName) gained \(extra.count) dependencies from a later target: \(names.joined(separator: ", "))")
+                    let established = plannedExplicitDependencyJobs[index]
+                    plannedExplicitDependencyJobs[index] = Planned(key: established.key, driverJob: established.driverJob,
+                                                                   dependencies: prior.union(extra).sorted(),
+                                                                   workingDirectory: established.workingDirectory)
                 }
             } else {
                 plannedExplicitDependencyJobs[index] = Planned(key: .explicitDependencyJob(index), driverJob: job, dependencies: dependencies, workingDirectory: workingDirectory)
@@ -620,10 +638,14 @@ public final class SwiftModuleDependencyGraph: SwiftGlobalExplicitDependencyGrap
     /// - Returns: A tuple containing a boolean indicating success and an array of diagnostics
     public func planBuild(key: String, compilerLocation: LibSwiftDriver.CompilerLocation, target: ConfiguredTarget, args: [String], workingDirectory: Path, tempDirPath: Path, explicitModulesTempDirPath: Path, environment: [String: String], eagerCompilationEnabled: Bool, casOptions: CASOptions?) -> (success: Bool, diagnostics: [SWBUtil.Diagnostic]) {
         let result = LibSwiftDriver.createAndPlan(for: self, compilerLocation: compilerLocation, target: target, workingDirectory: workingDirectory, tempDirPath: tempDirPath, explicitModulesTempDirPath: explicitModulesTempDirPath, commandLine: args, environment: environment, eagerCompilationEnabled: eagerCompilationEnabled, casOptions: casOptions)
+        // Concurrent plans may drain each other's notes; the message names the module either way.
+        let merged = registryQueue.blocking_sync { globalExplicitDependencyTracker.drainMergedDependencyNotes() }.map {
+            SWBUtil.Diagnostic(behavior: .note, location: .unknown, data: DiagnosticData($0, component: .swiftCompilerError))
+        }
         if let driver = result.driver {
             do {
                 try register(key: key, driver: driver)
-                return (true, result.diagnostics)
+                return (true, result.diagnostics + merged)
             } catch {
                 return (false, result.diagnostics + [SWBUtil.Diagnostic(behavior: .error, location: .unknown, data: DiagnosticData(String(describing: error), component: .swiftCompilerError))])
             }
